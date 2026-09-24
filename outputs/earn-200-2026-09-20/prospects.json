@@ -1,0 +1,116 @@
+{
+  "title": "$200 in one week",
+  "product": "Small coding and automation repairs",
+  "product_url": "https://github.com/CoWork-OS/CoWork-OS",
+  "target_customer": "Buyers with an existing broken workflow and a small paid scope",
+  "search_scope": "Public buyer posts checked 20 September 2026; Portugal-based delivery; PayPal required. Quotes below are proposed prices, not advertised rewards.",
+  "generated_at": "2026-09-20",
+  "verdict": "Direct paid repairs are the strongest route to try. Aim for two $125 jobs or one $250 job, before fees and any taxes. No buyer has agreed to hire or pay yet. No opportunity here has confirmed PayPal terms. Earned: $0.",
+  "prospects": [
+    {
+      "name": "Dorian56 — stuck automation workflow",
+      "type": "First outreach priority",
+      "stage": "High intent",
+      "score": 81,
+      "pain_signal": "Posted on 18 September that an urgent workflow is stuck and explicitly offered to pay for help.",
+      "evidence": "The original buyer post requests replies or DMs. The n8n public topic API contained 89 posts when checked; all buyer-authored posts were checked and no later buyer update was present. A similar Make post uses the same handle: treated as one lead, not two buyers.",
+      "why_fit": "A bounded repair can use our API, JavaScript and debugging work. Proposed price: $125 for one reproduced issue, test evidence and a short handover; confirm feasibility first.",
+      "why_now": "Two-day-old explicit paid request. Strong urgency signal, but heavy competition and no fresh buyer response.",
+      "source_title": "N8n Freelancer needed for workflow",
+      "source_url": "https://community.n8n.io/t/n8n-freelancer-needed-for-workflow/314417",
+      "source_type": "Original buyer post and public topic API",
+      "signal_date": "2026-09-18",
+      "suggested_channel": "User-authored n8n Community reply or invited DM. n8n prohibits copying AI output directly into threads; research notes are for preparation only.",
+      "opener": "Internal preparation notes, not text to paste: ask whether the repair is still available; describe your actual relevant experience; establish the apps and failure; propose $125 only for a bounded, reproducible defect; confirm PayPal and AI-assisted implementation. Write your own reply after reading the post.",
+      "caution": "Availability, exact requirements, AI assistance and PayPal payment must be agreed. The forum being open does not establish that the buyer is still hiring. Do not promise a fix before seeing the failure.",
+      "dimensions": {
+        "pain_strength": 5,
+        "product_fit": 4,
+        "timing": 3,
+        "reachability": 4,
+        "evidence_quality": 4
+      }
+    },
+    {
+      "name": "Carlos_Gomez1 — WhatsApp to Google Sheets",
+      "type": "Second outreach priority",
+      "stage": "High intent",
+      "score": 76,
+      "pain_signal": "Posted in Make's Hire Help category on 14 September requesting a WhatsApp Cloud API and Google Sheets connection.",
+      "evidence": "Original post identifies the two services. Other respondents quote prices, but those are competing offers, not the buyer's approved budget. The source does not specify incoming vs outgoing messages.",
+      "why_fit": "Propose $125 for one inbound text-message flow if Meta and Make accounts are already ready: map fields, prevent duplicates, test output and document handover.",
+      "why_now": "Six-day-old specific integration request; no verified hiring decision or budget.",
+      "source_title": "I need help with a scenario to connect the WhatsApp Cloud API with Google Sheets",
+      "source_url": "https://community.make.com/t/i-need-help-with-a-scenario-to-connect-the-whatsapp-cloud-api-with-google-sheets/115156",
+      "source_type": "Original public Hire Help post",
+      "signal_date": "2026-09-14",
+      "suggested_channel": "User-authored reply in Make Hire Help. Make guidelines prohibit AI-generated responses; do not paste an assistant draft.",
+      "opener": "Internal preparation notes, not text to paste: ask whether hiring remains open, incoming vs outgoing messages, whether the Meta number is active, budget and deadline. A one-direction inbound flow could be proposed at $125 after review. The user must author the Make response independently.",
+      "caution": "PayPal, budget and availability unconfirmed. Account approval, outbound templates, historical imports and a second direction are outside the proposed small scope. Do not use another applicant's price as evidence of a funded budget.",
+      "dimensions": {
+        "pain_strength": 4,
+        "product_fit": 4,
+        "timing": 3,
+        "reachability": 4,
+        "evidence_quality": 4
+      }
+    },
+    {
+      "name": "OSQUARED — automation work in Porto",
+      "type": "Local longer-term backup",
+      "stage": "High intent",
+      "score": 72,
+      "pain_signal": "Porto company posted an automation contract on 16 September covering finance, contracts, sales and site workflows.",
+      "evidence": "Buyer requests Portugal-based availability, production automation evidence and 2–3 weeks initially on site. Compensation is hourly or per phase, to be negotiated. Public business application address: office@osquared.pt.",
+      "why_fit": "Portugal is a geographic match. Ask whether a separately paid, small workflow diagnostic is useful before a larger engagement. Proposed $250 diagnostic is our offer, not their advertised budget.",
+      "why_now": "Recent local hiring signal, but the requested engagement is much larger than a one-week cash task.",
+      "source_title": "Automation and Business Systems Lead — Real Estate Developer, Porto",
+      "source_url": "https://community.n8n.io/t/automation-and-business-systems-lead-real-estate-developer-porto-2-3-weeks-on-site-then-remote/314127",
+      "source_type": "Original employer post",
+      "signal_date": "2026-09-16",
+      "suggested_channel": "Employer's published business application email, with a truthful CV and portfolio; user sends.",
+      "opener": "Hello, I saw your Porto automation role and am based in Portugal. My relevant project is CoWork OS: https://github.com/CoWork-OS/CoWork-OS. Would you consider a separately scoped $250 first milestone mapping one workflow, documenting its failure points and producing an implementation plan? I would confirm the scope and delivery date before committing. Please let me know whether that fits your process and whether PayPal payment on delivery is possible.",
+      "caution": "Do not claim production n8n/Make credentials, on-site availability or case studies that are not true. Hiring timeline and PayPal are unknown; exclude from the one-week income forecast.",
+      "dimensions": {
+        "pain_strength": 4,
+        "product_fit": 3,
+        "timing": 4,
+        "reachability": 4,
+        "evidence_quality": 3
+      }
+    }
+  ],
+  "patterns": [
+    {
+      "title": "Small scope can shorten delivery",
+      "count": 2,
+      "insight": "The first two requests can potentially be reduced to one repair or integration direction, after reviewing the actual setup."
+    },
+    {
+      "title": "Payment is not yet confirmed",
+      "count": 3,
+      "insight": "All buyers need to agree a price, PayPal and acceptance/payment timing. None is guaranteed income."
+    },
+    {
+      "title": "Existing portfolio beats an invented case study",
+      "count": 3,
+      "insight": "Use relevant CoWork code and explain our actual contribution. Do not claim previous client results or platform certifications."
+    }
+  ],
+  "outreach_plan": {
+    "angle": "Two $125 repairs, or one $250 job",
+    "first_step": "Day 1: user reads the original requests and writes their own message to Dorian and Carlos, following each community's rules. The packet contains internal scoping notes, plus a general offer for suitable existing professional contacts. We prepare implementation from actual buyer replies.",
+    "follow_up": "Days 2–3: one polite follow-up if appropriate, then focus on responsive buyers. Confirm a sanitized reproducer, exact deliverable, acceptance test, AI permission, price and PayPal deadline. Days 3–6: implement, test, deliver and invoice each accepted job.",
+    "success": "By 27 September: at least $200 actually available after payment fees. $250 gross is a planning buffer, not a guarantee of net income. Deposits for undelivered work and pending payments do not count as earned cash. Day 7: verify settled payment, not just an invoice or accepted PR."
+  },
+  "limits": [
+    "All prospects are potential customers based on public signals, not confirmed buyers. Scores measure outreach fit, not probability of winning or being paid.",
+    "The user resides in Portugal, has no existing freelance/testing/bounty accounts, and reports that recent PayPal commercial payments were available without a hold. Future payments can still be held.",
+    "No outreach, account registration, proposal submission or security testing has been performed. No money has been earned or received.",
+    "Dorian's n8n and Make requests were deduplicated. Make API access returned 403; the public page was used, so later unseen replies may change status.",
+    "Discarded Bridge Builders $150–$250 trial: buyer said the role was filled. Older n8n posts were not treated as fresh merely because applicants bumped them.",
+    "Rami's RFQ prototype remains a scoping-stage backup, not commissioned work. NUBO's recent paid project opportunity requires fluent Spanish; eligibility is unknown.",
+    "Use the payment email privately after agreeing a job. Quotes are before any applicable taxes; do not publish sensitive payment or account details in a public service post.",
+    "Posting rules checked: Make bans AI-generated responses (https://community.make.com/guidelines). n8n prohibits copying AI output directly and requires personal understanding (https://community.n8n.io/t/this-forum-is-for-humans-by-humans/305091). The user should independently author community replies; this does not establish a ban on client-approved AI-assisted coding."
+  ]
+}
