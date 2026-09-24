@@ -1,0 +1,75 @@
+{
+  "checked_at": "2026-09-20T21:06:14.401927+00:00",
+  "mode": "unauthenticated GET only; no forms submitted; redirects restricted to sandbox",
+  "results": [
+    {
+      "path": "/users/sign_in",
+      "status": 200,
+      "final_host": "sandbox.reready.co",
+      "content_type": "text/html; charset=utf-8",
+      "headers": {
+        "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "base-uri 'none'; connect-src 'self' https://ad.doubleclick.net https://analytics.google.com https://www.google.com https://www.googletagmanager.com https://px.ads.linkedin.com; default-src 'self'; font-src 'self' https://fonts.gstatic.com; frame-src 'self'; img-src 'self' data: https://www.google.com https://www.googletagmanager.com https://px.ads.linkedin.com; object-src 'none'; script-src 'self' 'strict-dynamic' 'nonce-8nt52EvSmjMsc1TlZ9KIQg=='; style-src 'self' https://cdn.datatables.net https://fonts.googleapis.com",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Cache-Control": "max-age=0, private, must-revalidate"
+      },
+      "cookie_flags": [
+        {
+          "secure": true,
+          "httponly": true,
+          "samesite": true
+        }
+      ],
+      "body_sample_bytes": 4096
+    },
+    {
+      "path": "/users/sign_up",
+      "status": 200,
+      "final_host": "sandbox.reready.co",
+      "content_type": "text/html; charset=utf-8",
+      "headers": {
+        "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "base-uri 'none'; default-src 'self'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://www.google.com https://www.googletagmanager.com https://px.ads.linkedin.com; object-src 'none'; script-src 'self' 'strict-dynamic' 'nonce-+UltXzffe8zk9DGS8HuTpA=='; style-src 'self' https://cdn.datatables.net https://fonts.googleapis.com; connect-src 'self' https://ad.doubleclick.net https://analytics.google.com https://www.google.com https://www.googletagmanager.com https://px.ads.linkedin.com; frame-src 'self' https://www.google.com",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Cache-Control": "max-age=0, private, must-revalidate"
+      },
+      "cookie_flags": [
+        {
+          "secure": true,
+          "httponly": true,
+          "samesite": true
+        }
+      ],
+      "body_sample_bytes": 4096
+    },
+    {
+      "path": "/api/v1/device_transfers",
+      "status": 401,
+      "final_host": "sandbox.reready.co",
+      "content_type": "application/json; charset=utf-8",
+      "headers": {
+        "Strict-Transport-Security": "max-age=63072000; includeSubDomains",
+        "X-Frame-Options": "SAMEORIGIN",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "base-uri 'none'; connect-src 'self' https://ad.doubleclick.net https://analytics.google.com https://www.google.com https://www.googletagmanager.com https://px.ads.linkedin.com; default-src 'self'; font-src 'self' https://fonts.gstatic.com; frame-src 'self'; img-src 'self' data: https://www.google.com https://www.googletagmanager.com https://px.ads.linkedin.com; object-src 'none'; script-src 'self' 'strict-dynamic' 'nonce-yGsNjXlalevmPO6aBwD6Lw=='; style-src 'self' https://cdn.datatables.net https://fonts.googleapis.com",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+        "Cache-Control": "no-cache"
+      },
+      "cookie_flags": [
+        {
+          "secure": true,
+          "httponly": true,
+          "samesite": true
+        }
+      ],
+      "body_sample_bytes": 41,
+      "response_structure": [
+        "errors"
+      ]
+    }
+  ]
+}
