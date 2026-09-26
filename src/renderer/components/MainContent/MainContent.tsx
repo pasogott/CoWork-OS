@@ -117,6 +117,12 @@ import type {
 import { useVoiceInput } from "../../hooks/useVoiceInput";
 import { useVoiceTalkMode } from "../../hooks/useVoiceTalkMode";
 import { useAgentContext, type AgentContext } from "../../hooks/useAgentContext";
+import { useIsCalmTheme } from "../../hooks/useIsCalmTheme";
+import { CalmAccessMenu, type CalmAccessMenuProps } from "../calm/CalmTopBar";
+import { CalmModeToggle } from "../calm/CalmModeToggle";
+import { CalmBriefingCard } from "../calm/CalmBriefingCard";
+import { CalmAgentAvatar } from "../calm/CalmAgentAvatar";
+import { openCalmAgentSetup } from "../calm/CalmAgentSetup";
 import {
   hasTaskOutputs,
   resolveTaskOutputSummaryFromCompletionEvent,
@@ -214,7 +220,7 @@ import {
   TASK_FEED_MEASUREMENT_LAYOUT_VERSION,
   PermissionAccessMode,
 } from "./main-content-constants";
-import type { SettingsTab, CreateTaskOptions } from "./main-content-types";
+import type { SettingsTab, CreateTaskOptions, FocusedCard } from "./main-content-types";
 import {
   type WelcomeTaskSuggestion,
   type ActiveWelcomeSuggestionDraft,
@@ -3542,6 +3548,15 @@ const TypewriterPlaceholder = memo(function TypewriterPlaceholder({
   );
 });
 
+let calmSuggestionCardsCache: FocusedCard[] | null = null;
+function getCalmSuggestionCards(): FocusedCard[] {
+  calmSuggestionCardsCache ??= pickFocusedCards(
+    FOCUSED_CARD_POOL.filter((card) => card.action.type === "prompt"),
+    8,
+  );
+  return calmSuggestionCardsCache;
+}
+
 function MainContentComponent({
   task,
   selectedTaskId,
@@ -3931,6 +3946,10 @@ function MainContentComponent({
 
   // Focused mode card pool - pick random cards on mount
   const focusedCards = useMemo(() => pickFocusedCards(FOCUSED_CARD_POOL, CARDS_TO_SHOW), []);
+  const isCalm = useIsCalmTheme();
+  const [showAllCalmChips, setShowAllCalmChips] = useState(false);
+  // Picked once per app session so the chips don't reshuffle on every visit.
+  const calmSuggestionCards = useMemo(getCalmSuggestionCards, []);
 
   // ── Rotating placeholder prompts (persona-aware engine) ──────────────
   const [rotatingPlaceholders, setRotatingPlaceholders] = useState<string[]>([]);
@@ -6226,21 +6245,25 @@ function MainContentComponent({
   };
 
   // Handle workspace dropdown toggle - load workspaces when opening
+  const loadRecentWorkspaces = async () => {
+    try {
+      const workspaces = await window.electronAPI.listWorkspaces();
+      // Filter out temp workspace and sort by most recently used
+      const filteredWorkspaces = workspaces
+        .filter((w: Workspace) => !w.isTemp && !isTempWorkspaceId(w.id))
+        .sort(
+          (a: Workspace, b: Workspace) =>
+            (b.lastUsedAt ?? b.createdAt) - (a.lastUsedAt ?? a.createdAt),
+        );
+      setWorkspacesList(filteredWorkspaces);
+    } catch (error) {
+      console.error("Failed to load workspaces:", error);
+    }
+  };
+
   const handleWorkspaceDropdownToggle = async () => {
     if (!showWorkspaceDropdown) {
-      try {
-        const workspaces = await window.electronAPI.listWorkspaces();
-        // Filter out temp workspace and sort by most recently used
-        const filteredWorkspaces = workspaces
-          .filter((w: Workspace) => !w.isTemp && !isTempWorkspaceId(w.id))
-          .sort(
-            (a: Workspace, b: Workspace) =>
-              (b.lastUsedAt ?? b.createdAt) - (a.lastUsedAt ?? a.createdAt),
-          );
-        setWorkspacesList(filteredWorkspaces);
-      } catch (error) {
-        console.error("Failed to load workspaces:", error);
-      }
+      await loadRecentWorkspaces();
     }
     setShowWorkspaceDropdown(!showWorkspaceDropdown);
   };
@@ -6874,16 +6897,14 @@ function MainContentComponent({
             attachment.draftRefId &&
             !draftSnapshot.attachments.some((ref) => ref.refId === attachment.draftRefId),
         )
-        .map(
-          (attachment): DraftAttachmentRef => ({
-            refId: attachment.draftRefId as string,
-            name: attachment.name,
-            ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
-            size: attachment.size,
-            sha256: attachment.draftSha256 ?? "",
-            status: attachment.status ?? "available",
-          }),
-        ),
+        .map((attachment): DraftAttachmentRef => ({
+          refId: attachment.draftRefId as string,
+          name: attachment.name,
+          ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+          size: attachment.size,
+          sha256: attachment.draftSha256 ?? "",
+          status: attachment.status ?? "available",
+        })),
     ];
     const deduped = [
       ...new Map(nextRefs.map((attachment) => [attachment.refId, attachment])).values(),
@@ -9178,15 +9199,72 @@ function MainContentComponent({
   );
 
   // Welcome/Empty state
+  const calmAccess: CalmAccessMenuProps = {
+    label: selectedAccessProfileLabel,
+    selectedId: selectedProfileId,
+    isFullAccess: selectedProfileId === BUILTIN_ACCESS_PROFILE_IDS.fullAccess,
+    options: [...BUILTIN_ACCESS_PROFILES, ...accessProfiles].map((profile) => ({
+      id: profile.id,
+      label: profile.label || getAccessProfileLabel(profile.id),
+      description: getAccessProfilePresentation(profile, approvalPromptsEnabled).description,
+      danger: profile.id === BUILTIN_ACCESS_PROFILE_IDS.fullAccess,
+    })),
+    onSelect: (id) => handlePermissionProfileSelect(id as AccessProfileId),
+    onConfigure: () => onOpenSettings?.("system"),
+  };
+
+  const calmGreeting = agentContext.userName
+    ? `Hi ${agentContext.userName}, how can I help?`
+    : agentContext.getMessage("welcomeSubtitle");
+
+  const renderCalmSuggestionChips = () => {
+    const visible = showAllCalmChips ? calmSuggestionCards : calmSuggestionCards.slice(0, 3);
+    return (
+      <div className="calm-chips" aria-label="Suggestions">
+        {visible.map((card) => (
+          <button
+            key={card.id}
+            type="button"
+            className="calm-chip"
+            title={card.desc}
+            onClick={() => {
+              if (card.action.type === "prompt") handleQuickAction(card.action.prompt);
+              else onOpenSettings?.(card.action.tab);
+              promptInputRef.current?.focus();
+            }}
+          >
+            {card.title}
+          </button>
+        ))}
+        {calmSuggestionCards.length > 3 && (
+          <button
+            type="button"
+            className="calm-chip calm-chip-more"
+            onClick={() => setShowAllCalmChips((value) => !value)}
+            aria-label={showAllCalmChips ? "Show fewer suggestions" : "Show more suggestions"}
+            aria-expanded={showAllCalmChips}
+          >
+            {showAllCalmChips ? "Less" : "…"}
+          </button>
+        )}
+      </div>
+    );
+  };
+
   if (!task) {
     return (
-      <div className="main-content">
+      <div className={`main-content${isCalm ? " calm-main calm-welcome" : ""}`}>
         <div className="main-body welcome-view">
           <div
             className={`welcome-content cli-style${uiDensity === "focused" ? " welcome-content-focused" : ""}`}
           >
+            {isCalm && (
+              <div className="calm-hero">
+                <h1 className="calm-greeting">{calmGreeting}</h1>
+              </div>
+            )}
             {/* Logo */}
-            {uiDensity === "focused" ? (
+            {isCalm ? null : uiDensity === "focused" ? (
               <div className="welcome-header-focused modern-only">
                 <img
                   src="./cowork-os-sl-dark-logo.png"
@@ -9219,9 +9297,11 @@ function MainContentComponent({
               </div>
             )}
 
-            <p className="welcome-positioning modern-only">
-              Your AI super app, powered by the models you choose.
-            </p>
+            {!isCalm && (
+              <p className="welcome-positioning modern-only">
+                Your AI super app, powered by the models you choose.
+              </p>
+            )}
 
             <div className="terminal-only">
               <div className="welcome-logo">
@@ -9274,7 +9354,7 @@ function MainContentComponent({
             </div>
 
             {/* Quick Start */}
-            <div className="cli-commands">
+            <div className="cli-commands" hidden={isCalm}>
               {uiDensity !== "focused" && (
                 <div className="cli-commands-header">
                   <span className="cli-prompt">&gt;</span>
@@ -9548,6 +9628,15 @@ function MainContentComponent({
                   >
                     <Plus size={24} aria-hidden="true" />
                   </button>
+                  {isCalm && (
+                    <>
+                      <CalmModeToggle
+                        selection={displayedInteractionMode}
+                        onChange={setInteractionMode}
+                      />
+                      <CalmAccessMenu access={calmAccess} placement="up" />
+                    </>
+                  )}
                   <div className="permission-dropdown-container" ref={permissionDropdownRef}>
                     <button
                       type="button"
@@ -9660,64 +9749,53 @@ function MainContentComponent({
                       </div>
                     )}
                   </div>
-                  {uiDensity === "focused" ? null : (
+                  {uiDensity === "focused" && !isCalm ? null : (
                     <>
-                      <div className="workspace-dropdown-container" ref={workspaceDropdownRef}>
-                        <button className="folder-selector" onClick={handleWorkspaceDropdownToggle}>
-                          <svg
-                            width="14"
-                            height="14"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="2"
+                      {!isCalm && (
+                        <div className="workspace-dropdown-container" ref={workspaceDropdownRef}>
+                          <button
+                            className="folder-selector"
+                            onClick={handleWorkspaceDropdownToggle}
                           >
-                            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
-                          </svg>
-                          <span>
-                            {workspace?.isTemp || isTempWorkspaceId(workspace?.id)
-                              ? "Work in a folder"
-                              : workspace?.name || "Work in a folder"}
-                          </span>
-                          <svg
-                            width="12"
-                            height="12"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="2"
-                            className={showWorkspaceDropdown ? "chevron-up" : ""}
-                          >
-                            <path d="M6 9l6 6 6-6" />
-                          </svg>
-                        </button>
-                        {showWorkspaceDropdown && (
-                          <div className="workspace-dropdown">
-                            {workspacesList.length > 0 && (
-                              <>
-                                <div className="workspace-dropdown-header">Recent Folders</div>
-                                <div className="workspace-dropdown-list">
-                                  {workspacesList.slice(0, 10).map((w) => (
-                                    <button
-                                      key={w.id}
-                                      className={`workspace-dropdown-item ${workspace?.id === w.id ? "active" : ""}`}
-                                      onClick={() => handleWorkspaceSelect(w)}
-                                    >
-                                      <svg
-                                        width="14"
-                                        height="14"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        strokeWidth="2"
+                            <svg
+                              width="14"
+                              height="14"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                            >
+                              <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+                            </svg>
+                            <span>
+                              {workspace?.isTemp || isTempWorkspaceId(workspace?.id)
+                                ? "Work in a folder"
+                                : workspace?.name || "Work in a folder"}
+                            </span>
+                            <svg
+                              width="12"
+                              height="12"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              className={showWorkspaceDropdown ? "chevron-up" : ""}
+                            >
+                              <path d="M6 9l6 6 6-6" />
+                            </svg>
+                          </button>
+                          {showWorkspaceDropdown && (
+                            <div className="workspace-dropdown">
+                              {workspacesList.length > 0 && (
+                                <>
+                                  <div className="workspace-dropdown-header">Recent Folders</div>
+                                  <div className="workspace-dropdown-list">
+                                    {workspacesList.slice(0, 10).map((w) => (
+                                      <button
+                                        key={w.id}
+                                        className={`workspace-dropdown-item ${workspace?.id === w.id ? "active" : ""}`}
+                                        onClick={() => handleWorkspaceSelect(w)}
                                       >
-                                        <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
-                                      </svg>
-                                      <div className="workspace-item-info">
-                                        <span className="workspace-item-name">{w.name}</span>
-                                        <span className="workspace-item-path">{w.path}</span>
-                                      </div>
-                                      {workspace?.id === w.id && (
                                         <svg
                                           width="14"
                                           height="14"
@@ -9725,36 +9803,52 @@ function MainContentComponent({
                                           fill="none"
                                           stroke="currentColor"
                                           strokeWidth="2"
-                                          className="check-icon"
                                         >
-                                          <path d="M20 6L9 17l-5-5" />
+                                          <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
                                         </svg>
-                                      )}
-                                    </button>
-                                  ))}
-                                </div>
-                                <div className="workspace-dropdown-divider" />
-                              </>
-                            )}
-                            <button
-                              className="workspace-dropdown-item new-folder"
-                              onClick={handleSelectNewFolder}
-                            >
-                              <svg
-                                width="14"
-                                height="14"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                strokeWidth="2"
+                                        <div className="workspace-item-info">
+                                          <span className="workspace-item-name">{w.name}</span>
+                                          <span className="workspace-item-path">{w.path}</span>
+                                        </div>
+                                        {workspace?.id === w.id && (
+                                          <svg
+                                            width="14"
+                                            height="14"
+                                            viewBox="0 0 24 24"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            strokeWidth="2"
+                                            className="check-icon"
+                                          >
+                                            <path d="M20 6L9 17l-5-5" />
+                                          </svg>
+                                        )}
+                                      </button>
+                                    ))}
+                                  </div>
+                                  <div className="workspace-dropdown-divider" />
+                                </>
+                              )}
+                              <button
+                                className="workspace-dropdown-item new-folder"
+                                onClick={handleSelectNewFolder}
                               >
-                                <path d="M12 5v14M5 12h14" />
-                              </svg>
-                              <span>Work in another folder...</span>
-                            </button>
-                          </div>
-                        )}
-                      </div>
+                                <svg
+                                  width="14"
+                                  height="14"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                >
+                                  <path d="M12 5v14M5 12h14" />
+                                </svg>
+                                <span>Work in another folder...</span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
                       <div className="overflow-menu-container" ref={overflowMenuRef}>
                         <button
                           ref={overflowToggleBtnRef}
@@ -10202,7 +10296,7 @@ function MainContentComponent({
                 />
               )}
             </div>
-            {uiDensity === "focused" && (
+            {(uiDensity === "focused" || isCalm) && (
               <div className="input-status-text welcome-input-status">
                 <div className="input-status-left">
                   <div className="workspace-dropdown-container" ref={workspaceDropdownRef}>
@@ -10294,7 +10388,7 @@ function MainContentComponent({
                   </div>
                 </div>
                 <div className="input-status-right">
-                  <div className="input-status-mode-wrap" ref={modeDropdownRef}>
+                  <div className="input-status-mode-wrap" ref={modeDropdownRef} hidden={isCalm}>
                     <InteractionModePicker
                       selection={displayedInteractionMode}
                       open={showModeDropdown}
@@ -10443,12 +10537,27 @@ function MainContentComponent({
                 </div>
               </div>
             )}
+            {isCalm && renderCalmSuggestionChips()}
+            {isCalm && agentContext.agentName === "CoWork" && !agentContext.isLoading && (
+              <div className="calm-setup-row">
+                <button type="button" className="calm-setup-pill" onClick={openCalmAgentSetup}>
+                  <CalmAgentAvatar size={22} />
+                  <span>Set up your agent</span>
+                </button>
+              </div>
+            )}
+            {isCalm && (
+              <CalmBriefingCard
+                workspaceId={workspace?.id}
+                accessLabel={selectedAccessProfileLabel}
+              />
+            )}
             {renderWelcomeTaskSuggestions()}
           </div>
         </div>
 
         {/* Suggestion hint in focused mode */}
-        {uiDensity === "focused" && !task && (
+        {uiDensity === "focused" && !task && !isCalm && (
           <p className="welcome-hint">
             Try: &quot;Help me organize my project files&quot; or &quot;Write a summary report
             about...&quot;
@@ -10556,7 +10665,11 @@ function MainContentComponent({
 
   // Task view
   return (
-    <div className={`main-content${isBotConversation ? " bot-conversation" : ""}`}>
+    <div
+      className={`main-content${isBotConversation ? " bot-conversation" : ""}${
+        isCalm ? " calm-main calm-task" : ""
+      }`}
+    >
       {/* Header */}
       <div className="main-header">
         {!isBotConversation && (task?.parentTaskId || task?.branchFromTaskId) && onSelectTask && (
@@ -11419,6 +11532,17 @@ function MainContentComponent({
               markdownComponents={markdownComponents}
               replay={isReplayMode}
               telemetryEnabled={rendererPerfLoggingEnabled}
+              leading={
+                isCalm ? (
+                  <span className="calm-strip-agent">
+                    <CalmAgentAvatar
+                      size={22}
+                      animated={taskStatusStripModel.state === "working"}
+                    />
+                    <span className="calm-strip-agent-name">{agentContext.agentName}</span>
+                  </span>
+                ) : undefined
+              }
               onOpenOutput={(outputPath) => {
                 if (onViewTaskOutputs) {
                   onViewTaskOutputs(task.id, outputPath);
@@ -11469,6 +11593,15 @@ function MainContentComponent({
             >
               <Plus size={24} aria-hidden="true" />
             </button>
+            {isCalm && (
+              <>
+                <CalmModeToggle
+                  selection={displayedInteractionMode}
+                  onChange={setInteractionMode}
+                />
+                <CalmAccessMenu access={calmAccess} placement="up" />
+              </>
+            )}
             {uiDensity === "focused" && (
               <div className="workspace-dropdown-container" ref={workspaceDropdownRef}>
                 {showWorkspaceDropdown && (
@@ -11785,7 +11918,7 @@ function MainContentComponent({
             </button>
           </div>
           <div className="input-status-right">
-            <div className="input-status-mode-wrap" ref={modeDropdownRef}>
+            <div className="input-status-mode-wrap" ref={modeDropdownRef} hidden={isCalm}>
               <InteractionModePicker
                 selection={displayedInteractionMode}
                 open={showModeDropdown}
