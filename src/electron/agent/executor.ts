@@ -115,7 +115,12 @@ import type {
   TurnKernelPreparedResponse,
 } from "./runtime/turn-kernel";
 import { createVerificationRuntime } from "./runtime/VerificationRuntime";
-import { buildWorkerRolePrompt, resolveWorkerRoleKind } from "./runtime/worker-role-registry";
+import {
+  buildWorkerRolePrompt,
+  normalizeWorkerRoleTaskConfig,
+  resolveWorkerRoleKind,
+  stripTeamWorkItemLaneOverride,
+} from "./runtime/worker-role-registry";
 import { enrichToolEventPayload } from "./runtime/tool-event-enrichment";
 import { resolveSkillSlashAlias } from "./skill-slash-aliases";
 import { SandboxRunner } from "./sandbox/runner";
@@ -3699,15 +3704,11 @@ export class TaskExecutor {
         return;
       }
       case "needs_user_action": {
-        this.terminalStatus = "needs_user_action";
-        this.failureClass = undefined;
         const terminalState = createTerminalState("needs_user_action", { reason: outcome.reason });
         this.finalizeTaskBestEffort(assistantText || outcome.reason, outcome.reason, terminalState);
         return;
       }
       case "partial_success": {
-        this.terminalStatus = "partial_success";
-        this.failureClass = outcome.failureClass;
         this.emitEvent("log", { metric: "agent_budget_exhausted_total", value: 1 });
         const terminalState = createTerminalState("partial_success", {
           reason: outcome.reason,
@@ -3758,8 +3759,6 @@ export class TaskExecutor {
     this.stopProgressJournal();
     this.saveConversationSnapshot();
     this.taskCompleted = true;
-    this.terminalStatus = "failed";
-    this.failureClass = outcome.failureClass;
     this.persistBestKnownOutcome(
       assistantText || this.buildResultSummary() || "",
       "failed",
@@ -3779,7 +3778,6 @@ export class TaskExecutor {
     this.emitTerminalFailureOnce({
       message: outcome.reason,
       failureClass: outcome.failureClass,
-      acpStopReason: outcome.stopReason,
     });
     void this.closeAcpxRuntimeSession("failed turn");
   }
@@ -3796,7 +3794,6 @@ export class TaskExecutor {
     if (assistantText) {
       // Keep the partial answer reachable from the cancelled task.
       this.persistBestKnownOutcome(assistantText, undefined, undefined, reason);
-      this.daemon.updateTask(this.task.id, { bestKnownOutcome: this.bestKnownOutcome });
     }
     this.daemon.recordExternalTaskCancellation(this.task.id, reason);
     void this.closeAcpxRuntimeSession("external cancellation");
@@ -12451,22 +12448,40 @@ ${transcript}
     // Keep those negated clauses out of the direct-edit tool inference so a
     // shell write is not followed by a spurious required edit_file call.
     const positiveMutationDescription = description.replace(
-      /\b(?:do\s+not|don't|must\s+not|should\s+not|never|no\s+need\s+to|without)\b[^,.;!?\n]*/gi,
+      // Continue through dots inside filenames ("package.json") so the
+      // extension of a protected file does not leak into the positive text.
+      /\b(?:do\s+not|don't|must\s+not|should\s+not|never|no\s+need\s+to|without)\b(?:[^,.;!?\n]|\.(?=[A-Za-z0-9_/-]))*/gi,
       " ",
     );
     const directFileMutationIntent =
       !isReadOnlyConstraintOnlyStep(descriptionRaw) &&
       descriptionHasWriteIntent(positiveMutationDescription) &&
-      /\b(?:file|files|document|documents|workspace|folder|directory)\b/.test(
+      (/\b(?:file|files|document|documents|workspace|folder|directory)\b/.test(
         positiveMutationDescription,
-      ) &&
+      ) ||
+        hasArtifactExtensionMention(positiveMutationDescription)) &&
       /\b(?:edit|update|delete|remove|rename|move|modify|replace|fix|refactor)\b/.test(
         positiveMutationDescription,
       );
     if (directFileMutationIntent) {
-      if (/\b(?:delete|remove)\b/.test(description)) {
+      // Only require delete_file/rename_file when the verb targets a file or
+      // folder itself ("delete src/a.ts", "rename each file to ..."), not
+      // content inside one ("remove the unused import from src/a.ts").
+      const fileObjectTarget =
+        String.raw`\s+(?:(?:the|a|an|all|any|each|every|these|those|this|that)\s+)?` +
+        String.raw`(?:(?:(?!(?:from|in|inside|within|of|into|to|at|on|with)\b)[\w-]+\s+){0,2}` +
+        String.raw`(?:files?|folders?|director(?:y|ies))\b|[\x60'"]?[\w./-]*[\w-]\.[A-Za-z][A-Za-z0-9]{0,9}\b)`;
+      if (
+        new RegExp(String.raw`\b(?:delete|remove)` + fileObjectTarget, "i").test(
+          positiveMutationDescription,
+        )
+      ) {
         requiredTools.add("delete_file");
-      } else if (/\b(?:rename|move)\b/.test(description)) {
+      } else if (
+        new RegExp(String.raw`\b(?:rename|move)` + fileObjectTarget, "i").test(
+          positiveMutationDescription,
+        )
+      ) {
         requiredTools.add("rename_file");
       } else {
         requiredTools.add("edit_file");
@@ -14954,8 +14969,8 @@ ${transcript}
    * Capture a playbook entry recording what approach worked or didn't.
    *
    * Success is only captured from terminal-ok finalization (never from best-effort,
-   * companion or ACP completion). Nothing is reported as learned unless the memory and
-   * its evidence row were durably recorded.
+   * companion or ACP completion). Nothing is reported as learned unless the memory (and,
+   * for a success, its evidence row) was durably recorded.
    */
   private async capturePlaybookOutcome(
     outcome: "success" | "failure",
@@ -14967,9 +14982,6 @@ ${transcript}
       const planSummary = this.plan?.steps?.map((s) => s.description).join("; ") || "";
       const toolsUsed = [...new Set(this.toolResultMemory.map((t) => t.tool))].slice(0, 10);
       const destinationHints = this.deriveWorkflowDestinationHints(toolsUsed);
-      // Only an explicit verifier pass strengthens the grade; terminal ok alone is
-      // observed runtime success, not user-confirmed value.
-      const verifiedByContract = outcome === "success" && this.task.verificationVerdict === "PASS";
       const capture = await PlaybookService.captureOutcome(
         this.workspace.id,
         this.task.id,
@@ -14980,10 +14992,7 @@ ${transcript}
         toolsUsed,
         errorMessage,
         destinationHints,
-        {
-          allowExternalMirror: this.isExternalMemoryAccessAllowed(),
-          grade: verifiedByContract ? "contract_verified" : "observed_runtime_success",
-        },
+        { allowExternalMirror: this.isExternalMemoryAccessAllowed() },
       ).catch((error): PlaybookCaptureResult => ({
         status: "error",
         error: String((error as Any)?.message || error),
@@ -14992,7 +15001,6 @@ ${transcript}
         this.emitEvent("log", {
           message: `Playbook outcome not recorded (${capture.status === "skipped" ? capture.reason : capture.error}).`,
         });
-        return;
       }
 
       // Durable links to earlier independent successes with a compatible approach.
@@ -15006,11 +15014,13 @@ ${transcript}
           }
         | undefined;
       if (outcome === "success") {
-        const reinforcement = PlaybookService.reinforceFromEvidence(
-          this.workspace.id,
-          capture.evidenceId,
-        );
-        playbookReinforced = reinforcement.linkedEvidenceIds.length > 0;
+        if (capture.status === "recorded" && capture.evidenceId) {
+          const reinforcement = PlaybookService.reinforceFromEvidence(
+            this.workspace.id,
+            capture.evidenceId,
+          );
+          playbookReinforced = reinforcement.linkedEvidenceIds.length > 0;
+        }
 
         // Auto-propose skills only from durable evidence of repeated successes.
         if (playbookReinforced) {
@@ -15056,6 +15066,7 @@ ${transcript}
         }
       }
 
+      if (capture.status !== "recorded") return;
       const learningProgress = RuntimeVisibilityService.buildLearningProgress({
         task: this.task,
         outcome:
@@ -17900,10 +17911,10 @@ You are continuing a previous conversation. The context from the previous conver
   }
 
   updateTaskAgentConfig(agentConfig: AgentConfig | undefined): void {
-    this.task = {
+    this.task = normalizeWorkerRoleTaskConfig({
       ...this.task,
       agentConfig,
-    };
+    }).task;
     if (this._runtime) {
       this._runtime.setPermissionMode(this.getDefaultPermissionMode());
     }
@@ -17914,14 +17925,22 @@ You are continuing a previous conversation. The context from the previous conver
       this.clearQueuedAgentConfigOverride();
       return;
     }
-    this.daemon.setTransientTaskAgentConfig(this.task.id, agentConfigOverride);
-    this.transientQueuedConfigActive = true;
+    // Queued overrides must not grant the orchestrator-only team lane marker.
+    agentConfigOverride = stripTeamWorkItemLaneOverride(agentConfigOverride);
     const persistedAgentConfig =
       this.daemon.getTask(this.task.id)?.agentConfig || this.task.agentConfig;
-    this.updateTaskAgentConfig({
-      ...(persistedAgentConfig || {}),
-      ...agentConfigOverride,
-    });
+    const boundedTask = normalizeWorkerRoleTaskConfig({
+      ...this.task,
+      agentConfig: { ...(persistedAgentConfig || {}), ...agentConfigOverride },
+    }).task;
+    this.daemon.setTransientTaskAgentConfig(
+      this.task.id,
+      resolveWorkerRoleKind(this.task.workerRole) === "researcher"
+        ? boundedTask.agentConfig
+        : agentConfigOverride,
+    );
+    this.transientQueuedConfigActive = true;
+    this.updateTaskAgentConfig(boundedTask.agentConfig);
     const effectiveWorkspace = this.daemon.getEffectiveWorkspaceForTask(this.task.id);
     if (effectiveWorkspace) this.updateWorkspace(effectiveWorkspace);
   }
