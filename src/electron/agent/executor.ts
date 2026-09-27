@@ -147,7 +147,7 @@ import { loadPolicies } from "../admin/policies";
 import { resolveEffectiveAccessProfile } from "../security/access-profile-resolver";
 import { PersonalityManager } from "../settings/personality-manager";
 import { detectContextMode } from "./context-mode-detector";
-import { calculateCost, formatCost, getCacheTokenAccounting } from "./llm/pricing";
+import { calculateCost, formatCost, getCacheTokenAccounting, isModelPriced } from "./llm/pricing";
 import {
   getProviderImageCaps,
   loadImageFromFile,
@@ -170,8 +170,9 @@ import {
 import { assertNormalizedTurnTranscript } from "./runtime/turn-transcript-normalizer";
 import { getCustomSkillLoader } from "./custom-skill-loader";
 import { MemoryService } from "../memory/MemoryService";
+import { taskDisablesMemoryCapture } from "../memory/no-memory-directive";
 import { DurableContextService } from "../memory/DurableContextService";
-import { PlaybookService } from "../memory/PlaybookService";
+import { PlaybookService, type PlaybookCaptureResult } from "../memory/PlaybookService";
 import { SessionRecallService } from "../memory/SessionRecallService";
 import { RuntimeVisibilityService } from "./RuntimeVisibilityService";
 import { ExternalMemoryProviderRegistry } from "../memory/ExternalMemoryProvider";
@@ -218,11 +219,14 @@ import {
 import { createDecisionService, type DecisionService } from "./decisions";
 import { decideLoopActionWithJev } from "./jev/loop-decision";
 import {
+  ACPX_PINNED_VERSION,
   AcpxRuntimeRunner,
   AcpxRuntimeUnavailableError,
   assertAcpxExecutionAuthority,
   getAcpxAgentDisplayName,
+  type AcpxPromptResult,
 } from "./AcpxRuntimeRunner";
+import { classifyAcpPromptResult, type AcpPromptOutcome } from "./runtime/acp-prompt-outcome";
 
 import {
   AwaitingUserInputError,
@@ -3616,21 +3620,7 @@ export class TaskExecutor {
     }
 
     const result = await runner.prompt(initialPrompt || this.getContractPrompt() || "");
-    const assistantText = result.assistantText.trim();
-    if (assistantText) {
-      this.lastAssistantOutput = assistantText;
-      this.lastAssistantText = assistantText;
-      this.lastNonVerificationOutput = assistantText;
-    }
-    if (result.stopReason && result.stopReason !== "end_turn") {
-      this.emitEvent("log", {
-        message: `acpx runtime completed with stop reason: ${result.stopReason}`,
-      });
-    }
-    this.finalizeTaskBestEffort(
-      assistantText || `${runtimeAgentName} via ACP completed without a final assistant message.`,
-      "acpx runtime completed",
-    );
+    this.applyAcpPromptResult(result, "initial");
   }
 
   private async sendMessageWithAcpxRuntime(
@@ -3661,17 +3651,155 @@ export class TaskExecutor {
     await options?.onExecutionAccepted?.();
     await runner.ensureSession();
     const result = await runner.prompt(followUpConversationMessage);
+    this.applyAcpPromptResult(result, "follow_up");
+  }
+
+  /**
+   * The single place an ACP prompt result becomes a task outcome, shared by initial
+   * prompts and follow-ups. Each result is classified exactly once.
+   *
+   * ACP completion is best-effort finalization: it keeps verification requirements and
+   * never records Playbook success learning.
+   */
+  private applyAcpPromptResult(result: AcpxPromptResult, phase: "initial" | "follow_up"): void {
+    // A local cancellation that raced the prompt wins; a late external result must not
+    // replace it. The daemon's cancel path persists the cancelled state.
+    if (this.cancelled) return;
+
+    const runtimeAgentName = this.getAcpxRuntimeAgentDisplayName();
     const assistantText = result.assistantText.trim();
     if (assistantText) {
       this.lastAssistantOutput = assistantText;
       this.lastAssistantText = assistantText;
       this.lastNonVerificationOutput = assistantText;
     }
-    this.finalizeTaskBestEffort(
-      assistantText ||
-        `${runtimeAgentName} via ACP follow-up completed without a final assistant message.`,
-      "acpx follow-up completed",
+    const verifiedArtifactPaths = this.verifyAcpReportedArtifacts(result.changedPaths || []);
+    const outcome = classifyAcpPromptResult({
+      stopReason: result.stopReason,
+      assistantText,
+      verifiedArtifactPaths,
+    });
+    this.emitEvent("log", {
+      message: `${runtimeAgentName} via ACP ${phase === "initial" ? "turn" : "follow-up"} ended: ${outcome.kind}.`,
+      acpStopReason: result.stopReason ?? null,
+      acpOutcome: outcome.kind,
+      acpPhase: phase,
+      ...(verifiedArtifactPaths.length > 0 ? { verifiedArtifactPaths } : {}),
+      ...(outcome.kind !== "completed" ? { reason: outcome.reason } : {}),
+    });
+
+    const completionLabel =
+      phase === "initial" ? "acpx runtime completed" : "acpx follow-up completed";
+    switch (outcome.kind) {
+      case "completed": {
+        const summary =
+          assistantText ||
+          `${runtimeAgentName} via ACP finished without a final message. Changed files: ${verifiedArtifactPaths.join(", ")}`;
+        this.finalizeTaskBestEffort(summary, completionLabel);
+        return;
+      }
+      case "needs_user_action": {
+        this.terminalStatus = "needs_user_action";
+        this.failureClass = undefined;
+        const terminalState = createTerminalState("needs_user_action", { reason: outcome.reason });
+        this.finalizeTaskBestEffort(assistantText || outcome.reason, outcome.reason, terminalState);
+        return;
+      }
+      case "partial_success": {
+        this.terminalStatus = "partial_success";
+        this.failureClass = outcome.failureClass;
+        this.emitEvent("log", { metric: "agent_budget_exhausted_total", value: 1 });
+        const terminalState = createTerminalState("partial_success", {
+          reason: outcome.reason,
+          failureClass: outcome.failureClass,
+        });
+        this.finalizeTaskBestEffort(
+          assistantText
+            ? `${assistantText}\n\n${outcome.reason}`
+            : `${outcome.reason} Changed files: ${verifiedArtifactPaths.join(", ")}`,
+          outcome.reason,
+          terminalState,
+        );
+        return;
+      }
+      case "failed":
+        this.persistAcpPromptFailure(outcome, assistantText);
+        return;
+      case "cancelled":
+        this.persistAcpExternalCancellation(outcome.reason, assistantText);
+        return;
+    }
+  }
+
+  /** Paths the ACP agent reported editing that exist as files inside the workspace. */
+  private verifyAcpReportedArtifacts(paths: readonly string[]): string[] {
+    const root = path.resolve(this.workspace.path);
+    const verified: string[] = [];
+    for (const candidate of paths) {
+      const resolved = path.resolve(root, candidate);
+      const relative = path.relative(root, resolved);
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+      const access = evaluateWorkspaceFilesystemAccess(this.workspace, resolved, "read");
+      if (access.decision !== "allow") continue;
+      try {
+        if (fs.statSync(access.path).isFile()) verified.push(relative.split(path.sep).join("/"));
+      } catch {
+        // Reported but absent: not evidence.
+      }
+    }
+    return verified;
+  }
+
+  /** A refused or contract-violating ACP turn: failed, with output and raw reason kept. */
+  private persistAcpPromptFailure(
+    outcome: Extract<AcpPromptOutcome, { kind: "failed" }>,
+    assistantText: string,
+  ): void {
+    this.stopProgressJournal();
+    this.saveConversationSnapshot();
+    this.taskCompleted = true;
+    this.terminalStatus = "failed";
+    this.failureClass = outcome.failureClass;
+    this.persistBestKnownOutcome(
+      assistantText || this.buildResultSummary() || "",
+      "failed",
+      outcome.failureClass,
+      outcome.reason,
     );
+    this.daemon.updateTask(this.task.id, {
+      status: "failed",
+      error: outcome.reason,
+      completedAt: Date.now(),
+      terminalStatus: "failed",
+      failureClass: outcome.failureClass,
+      bestKnownOutcome: this.bestKnownOutcome,
+      ...this.applyRuntimeTaskProjectionToTask(),
+    });
+    this.emitRunSummary(outcome.reason, "failed");
+    this.emitTerminalFailureOnce({
+      message: outcome.reason,
+      failureClass: outcome.failureClass,
+      acpStopReason: outcome.stopReason,
+    });
+    void this.closeAcpxRuntimeSession("failed turn");
+  }
+
+  /**
+   * The external runtime reported the turn as cancelled without a local cancel. Persist
+   * the cancelled lifecycle state through the daemon's shared cleanup; this is not a
+   * user cancellation and must not re-enter executor cancellation.
+   */
+  private persistAcpExternalCancellation(reason: string, assistantText: string): void {
+    this.stopProgressJournal();
+    this.saveConversationSnapshot();
+    this.taskCompleted = true;
+    if (assistantText) {
+      // Keep the partial answer reachable from the cancelled task.
+      this.persistBestKnownOutcome(assistantText, undefined, undefined, reason);
+      this.daemon.updateTask(this.task.id, { bestKnownOutcome: this.bestKnownOutcome });
+    }
+    this.daemon.recordExternalTaskCancellation(this.task.id, reason);
+    void this.closeAcpxRuntimeSession("external cancellation");
   }
 
   private async closeAcpxRuntimeSession(reason: string): Promise<void> {
@@ -5870,7 +5998,7 @@ ${transcript}
     allowMemoryInjection: boolean;
     summaryBlock: string;
   }): Promise<void> {
-    if (!opts.allowMemoryInjection) return;
+    if (!opts.allowMemoryInjection || taskDisablesMemoryCapture(this.task)) return;
     const content = this.extractPinnedBlockContent(
       opts.summaryBlock,
       TaskExecutor.PINNED_COMPACTION_SUMMARY_TAG,
@@ -6001,7 +6129,7 @@ ${transcript}
     allowMemoryInjection: boolean;
     contextLabel: string;
   }): Promise<void> {
-    if (!opts.allowMemoryInjection) return;
+    if (!opts.allowMemoryInjection || taskDisablesMemoryCapture(this.task)) return;
 
     const now = Date.now();
     if (
@@ -6199,6 +6327,10 @@ ${transcript}
   private totalInputTokens: number = 0;
   private totalOutputTokens: number = 0;
   private totalCost: number = 0;
+  /** Models used by this task that have no known price, so totalCost is a lower bound. */
+  private unpricedModelIds = new Set<string>();
+  /** True when task.agentConfig.allowedTools was created by applied skills, not the caller. */
+  private allowedToolsFromSkills = false;
   private usageOffsetInputTokens: number = 0;
   private usageOffsetOutputTokens: number = 0;
   private usageOffsetCost: number = 0;
@@ -7926,6 +8058,8 @@ ${transcript}
     this.cachedLlmSettings = LLMProviderFactory.loadSettings();
     const llmSelection = LLMProviderFactory.resolveTaskModelSelection(task.agentConfig, {
       isVerificationTask,
+      allowProviderOverride: task.source === "sample",
+      allowModelOverride: task.source === "sample",
     });
     this.applyResolvedProviderSelection(llmSelection);
     this.rebuildProviderFailoverSelections(llmSelection, this.llmProfileUsed);
@@ -9196,20 +9330,31 @@ ${transcript}
 
     // Check token budget
     const totalTokens = this.getCumulativeInputTokens() + this.getCumulativeOutputTokens();
-    const tokenCheck = GuardrailManager.isTokenBudgetExceeded(totalTokens);
+    const tokenCheck = GuardrailManager.isTokenBudgetExceeded(totalTokens, {
+      taskBudget: this.task.budgetTokens,
+    });
     if (tokenCheck.exceeded) {
       throw new Error(
-        `Token budget exceeded: ${tokenCheck.used.toLocaleString()}/${tokenCheck.limit.toLocaleString()} tokens. ` +
+        `Token budget exceeded: ${tokenCheck.used.toLocaleString()}/${tokenCheck.limit.toLocaleString()} tokens ` +
+          `(${tokenCheck.source === "task" ? "this task's budget" : "Settings > Guardrails"}). ` +
           `Estimated cost: ${formatCost(this.getCumulativeCost())}`,
       );
     }
 
-    // Check cost budget
-    const costCheck = GuardrailManager.isCostBudgetExceeded(this.getCumulativeCost());
+    // Check cost budget: the task's own budgetCost, else the global guardrail.
+    const costCheck = GuardrailManager.isCostBudgetExceeded(this.getCumulativeCost(), {
+      taskBudget: this.task.budgetCost,
+      subscriptionBilled: LLMProviderFactory.isSubscriptionBilledRoute(this.provider?.type),
+    });
     if (costCheck.exceeded) {
+      const unpriced =
+        this.unpricedModelIds.size > 0
+          ? " Some models used have no known price, so actual cost is higher."
+          : "";
       throw new Error(
-        `Cost budget exceeded: ${formatCost(costCheck.cost)}/${formatCost(costCheck.limit)}. ` +
-          `Total tokens used: ${totalTokens.toLocaleString()}`,
+        `Cost budget exceeded: ${formatCost(costCheck.cost)}/${formatCost(costCheck.limit)} ` +
+          `(${costCheck.source === "task" ? "this task's budget" : "raise it in Settings > Guardrails"}). ` +
+          `Total tokens used: ${totalTokens.toLocaleString()}.${unpriced}`,
       );
     }
   }
@@ -10180,6 +10325,18 @@ ${transcript}
       },
     );
 
+    const costKnown = isModelPriced(this.modelId, this.provider?.type);
+    if (
+      !costKnown &&
+      (safeInput > 0 || safeOutput > 0) &&
+      !this.unpricedModelIds.has(this.modelId)
+    ) {
+      this.unpricedModelIds.add(this.modelId);
+      logger.warn(
+        `${this.logTag} No price for model "${this.modelId}"; its cost is unknown and cost budgets cannot account for it.`,
+      );
+    }
+
     this.totalInputTokens += safeInput;
     this.totalOutputTokens += safeOutput;
     this.totalCost += deltaCost;
@@ -10211,16 +10368,31 @@ ${transcript}
           ...(cacheWriteTtl ? { cacheWriteTtl } : {}),
           totalTokens: safeInput + safeOutput,
           cost: deltaCost,
+          costKnown,
         },
         totals: {
           inputTokens: cumulativeInput,
           outputTokens: cumulativeOutput,
           totalTokens: cumulativeInput + cumulativeOutput,
           cost: cumulativeCost,
+          costKnown: this.unpricedModelIds.size === 0,
+          ...this.describeCostCap(cumulativeCost),
         },
         updatedAt: Date.now(),
       });
     }
+  }
+
+  /** The cost cap that applies to this task, for display next to spend. */
+  private describeCostCap(cost: number): {
+    costLimit: number | null;
+    costLimitSource: "task" | "global" | "none";
+  } {
+    const cap = GuardrailManager.isCostBudgetExceeded(cost, {
+      taskBudget: this.task.budgetCost,
+      subscriptionBilled: LLMProviderFactory.isSubscriptionBilledRoute(this.provider?.type),
+    });
+    return { costLimit: cap.source === "none" ? null : cap.limit, costLimitSource: cap.source };
   }
 
   private getToolTimeoutMs(toolName: string, input: unknown): number {
@@ -13555,8 +13727,14 @@ ${transcript}
         toolRestrictions: Array.from(existing),
       };
     }
-    if (directives?.allowedTools?.length) {
-      const existing = new Set(this.task.agentConfig?.allowedTools || []);
+    // A task-level allowlist is an authority boundary. Skills can supply (and
+    // extend) an allowlist when the caller set none, but must never widen one
+    // set by the caller.
+    if (
+      directives?.allowedTools?.length &&
+      (!Array.isArray(this.task.agentConfig?.allowedTools) || this.allowedToolsFromSkills)
+    ) {
+      const existing = new Set<string>(this.task.agentConfig?.allowedTools || []);
       for (const toolName of directives.allowedTools) {
         existing.add(toolName);
       }
@@ -13564,6 +13742,7 @@ ${transcript}
         ...this.task.agentConfig,
         allowedTools: Array.from(existing),
       };
+      this.allowedToolsFromSkills = true;
     }
     this.availableToolsCacheKey = null;
     this.availableToolsCache = null;
@@ -14326,6 +14505,26 @@ ${transcript}
     return this.getFinalOutcomeGuardError();
   }
 
+  private selectFinalTaskSummary(requestedSummary?: string): string {
+    const validatedCandidate = this.getBestFinalResponseCandidate().trim();
+    const completionContract = this.buildCompletionContract();
+    if (
+      completionContract.requiresDirectAnswer &&
+      validatedCandidate &&
+      this.responseDirectlyAddressesPrompt(validatedCandidate, completionContract)
+    ) {
+      return validatedCandidate;
+    }
+
+    for (const candidate of [requestedSummary, this.buildResultSummary()]) {
+      const trimmed = String(candidate || "").trim();
+      if (!trimmed || this.isToolUnavailabilityClaimContradictedByEvidence(trimmed)) continue;
+      return trimmed;
+    }
+
+    return "";
+  }
+
   private finalizeTask(resultSummary?: string): void {
     if (this.getEffectiveExecutionMode() === "chat") {
       this.finalizeChatTurn();
@@ -14356,12 +14555,7 @@ ${transcript}
     );
     const terminalStatus: Task["terminalStatus"] = statusWithVerification.terminalStatus;
     const failureClass: Task["failureClass"] = statusWithVerification.failureClass;
-    const requestedSummary =
-      typeof resultSummary === "string" && resultSummary.trim() ? resultSummary.trim() : "";
-    const summaryCandidate =
-      requestedSummary && this.isToolUnavailabilityClaimContradictedByEvidence(requestedSummary)
-        ? this.buildResultSummary() || ""
-        : requestedSummary || this.buildResultSummary() || "";
+    const summaryCandidate = this.selectFinalTaskSummary(resultSummary);
     const summary = this.reconcileSummaryWithWorkspaceOutputs(summaryCandidate);
     const runtimeProjection = this.applyRuntimeTaskProjectionToTask();
     this.task.status = "completed";
@@ -14452,12 +14646,7 @@ ${transcript}
     const nonBlockingFailedStepIds = this.getNonBlockingFailedStepIdsAtCompletion();
     const failedMutationRequiredStepIds = this.getFailedMutationRequiredStepIdsAtCompletion();
     const waivedVerificationStepIds = this.getVerificationStepIds(waivableFailedStepIds);
-    const requestedSummary =
-      typeof resultSummary === "string" && resultSummary.trim() ? resultSummary.trim() : "";
-    const summaryCandidate =
-      requestedSummary && this.isToolUnavailabilityClaimContradictedByEvidence(requestedSummary)
-        ? this.buildResultSummary() || ""
-        : requestedSummary || this.buildResultSummary() || "";
+    const summaryCandidate = this.selectFinalTaskSummary(resultSummary);
     const summary = this.reconcileSummaryWithWorkspaceOutputs(summaryCandidate);
     this.task.status = "completed";
     this.task.completedAt = Date.now();
@@ -14763,16 +14952,25 @@ ${transcript}
 
   /**
    * Capture a playbook entry recording what approach worked or didn't.
+   *
+   * Success is only captured from terminal-ok finalization (never from best-effort,
+   * companion or ACP completion). Nothing is reported as learned unless the memory and
+   * its evidence row were durably recorded.
    */
   private async capturePlaybookOutcome(
     outcome: "success" | "failure",
     errorMessage?: string,
   ): Promise<void> {
+    if (taskDisablesMemoryCapture(this.task)) return;
+
     try {
       const planSummary = this.plan?.steps?.map((s) => s.description).join("; ") || "";
       const toolsUsed = [...new Set(this.toolResultMemory.map((t) => t.tool))].slice(0, 10);
       const destinationHints = this.deriveWorkflowDestinationHints(toolsUsed);
-      const captureResult = await PlaybookService.captureOutcome(
+      // Only an explicit verifier pass strengthens the grade; terminal ok alone is
+      // observed runtime success, not user-confirmed value.
+      const verifiedByContract = outcome === "success" && this.task.verificationVerdict === "PASS";
+      const capture = await PlaybookService.captureOutcome(
         this.workspace.id,
         this.task.id,
         this.task.title,
@@ -14782,13 +14980,22 @@ ${transcript}
         toolsUsed,
         errorMessage,
         destinationHints,
-        { allowExternalMirror: this.isExternalMemoryAccessAllowed() },
-      ).then(
-        () => true,
-        () => false,
-      );
+        {
+          allowExternalMirror: this.isExternalMemoryAccessAllowed(),
+          grade: verifiedByContract ? "contract_verified" : "observed_runtime_success",
+        },
+      ).catch((error): PlaybookCaptureResult => ({
+        status: "error",
+        error: String((error as Any)?.message || error),
+      }));
+      if (capture.status !== "recorded") {
+        this.emitEvent("log", {
+          message: `Playbook outcome not recorded (${capture.status === "skipped" ? capture.reason : capture.error}).`,
+        });
+        return;
+      }
 
-      // Reinforce matching playbook entries on success so proven patterns rank higher.
+      // Durable links to earlier independent successes with a compatible approach.
       let playbookReinforced = false;
       let skillProposal:
         | {
@@ -14799,26 +15006,20 @@ ${transcript}
           }
         | undefined;
       if (outcome === "success") {
-        await PlaybookService.reinforceEntry(
+        const reinforcement = PlaybookService.reinforceFromEvidence(
           this.workspace.id,
-          this.getExecutionTaskPrompt(),
-          toolsUsed,
-          destinationHints,
-          { allowExternalMirror: this.isExternalMemoryAccessAllowed() },
-        )
-          .then(() => {
-            playbookReinforced = true;
-          })
-          .catch(() => {
-            playbookReinforced = false;
-          });
+          capture.evidenceId,
+        );
+        playbookReinforced = reinforcement.linkedEvidenceIds.length > 0;
 
-        // Auto-propose skills from repeatedly reinforced playbook patterns.
-        skillProposal = await import("../memory/PlaybookSkillPromoter")
-          .then(({ PlaybookSkillPromoter }) =>
-            PlaybookSkillPromoter.maybePropose(this.workspace.id, this.workspace.path),
-          )
-          .catch(() => ({ proposed: false, reason: "error" }));
+        // Auto-propose skills only from durable evidence of repeated successes.
+        if (playbookReinforced) {
+          skillProposal = await import("../memory/PlaybookSkillPromoter")
+            .then(({ PlaybookSkillPromoter }) =>
+              PlaybookSkillPromoter.maybePropose(this.workspace.id, this.workspace.path),
+            )
+            .catch(() => ({ proposed: false, reason: "error" }));
+        }
 
         // Extract entities/relationships from task results into the knowledge graph.
         try {
@@ -14861,13 +15062,15 @@ ${transcript}
           outcome === "success"
             ? skillProposal?.proposed
               ? "pending_review"
-              : "reinforced"
+              : playbookReinforced
+                ? "reinforced"
+                : "success"
             : "failure",
         summary:
           outcome === "success"
             ? this.task.resultSummary || this.buildResultSummary() || "Task completed successfully."
             : errorMessage || this.task.error || this.buildResultSummary() || "Task failed.",
-        memoryCaptured: captureResult,
+        memoryCaptured: true,
         playbookReinforced,
         skillProposal: skillProposal?.proposed
           ? {
@@ -17561,7 +17764,7 @@ ${transcript}
     // same MCP subset is not permanently hidden across iterations.
     if (lowSignal && scored.length > 1) {
       const rotated: typeof scored = [];
-      for (let i = 0; i < scored.length; ) {
+      for (let i = 0; i < scored.length;) {
         let j = i + 1;
         while (j < scored.length && scored[j].score === scored[i].score) j++;
         const group = scored.slice(i, j);
@@ -26530,10 +26733,8 @@ You are continuing a previous conversation. The context from the previous conver
       // minimal token budget, so strict guard checks designed for full
       // task execution (verification evidence, artifact evidence, etc.)
       // are impossible to satisfy. Use best-effort finalization.
+      // Companion best-effort completion is not evidence of a successful execution.
       this.finalizeTaskBestEffort(resultSummary);
-      if (this.getEffectiveExecutionMode() !== "chat") {
-        this.capturePlaybookOutcome("success");
-      }
     } catch (error: Any) {
       const assistantText = isThinkMode
         ? "I wasn't able to process that right now. Could you try rephrasing, or let me know what specific aspect you'd like to think through?"
@@ -27020,7 +27221,7 @@ You are continuing a previous conversation. The context from the previous conver
             const runtimeAgentName = this.getAcpxRuntimeAgentDisplayName();
             if (this.getAcpxExternalRuntimeConfig()?.agent === "claude") {
               throw new Error(
-                `${runtimeAgentName} acpx runtime unavailable. This task explicitly requires ACP, so CoWork did not fall back. Ensure \`acpx\` is installed or that \`npx acpx@latest\` can run in this environment.`,
+                `${runtimeAgentName} acpx runtime unavailable. This task explicitly requires ACP, so CoWork did not fall back. Ensure \`acpx\` is installed or that \`npx acpx@${ACPX_PINNED_VERSION}\` can run in this environment.`,
               );
             }
             this.disableExternalRuntimeForFallback(
@@ -37357,6 +37558,12 @@ Return ONLY a JSON object:
     forceProfile?: LlmProfile,
     opts?: { requiresImageInput?: boolean },
   ): void {
+    if (this.task.source === "sample") {
+      this.providerFailoverSelections = [primarySelection];
+      this.providerFailoverIndex = 0;
+      this.providerFailoverPreserveUntil = 0;
+      return;
+    }
     this.providerFailoverRequiresImageInput = opts?.requiresImageInput === true;
     this.providerFailoverSelections = LLMProviderFactory.resolveProviderFailoverChain(
       primarySelection,
@@ -37721,7 +37928,7 @@ Return ONLY a JSON object:
           const runtimeAgentName = this.getAcpxRuntimeAgentDisplayName();
           if (this.getAcpxExternalRuntimeConfig()?.agent === "claude") {
             throw new Error(
-              `${runtimeAgentName} acpx runtime unavailable for follow-up. This task explicitly requires ACP, so CoWork did not fall back. Ensure \`acpx\` is installed or that \`npx acpx@latest\` can run in this environment.`,
+              `${runtimeAgentName} acpx runtime unavailable for follow-up. This task explicitly requires ACP, so CoWork did not fall back. Ensure \`acpx\` is installed or that \`npx acpx@${ACPX_PINNED_VERSION}\` can run in this environment.`,
             );
           }
           this.disableExternalRuntimeForFallback(

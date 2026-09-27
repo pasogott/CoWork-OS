@@ -37,7 +37,11 @@ interface MigrationRepository {
     category: SettingsCategory,
     options?: { logErrors?: boolean },
   ): { status: string; data?: T };
-  save<T extends object>(category: SettingsCategory, settings: T): void;
+  save<T extends object>(
+    category: SettingsCategory,
+    settings: T,
+    options?: { allowUnreadableOverwrite?: boolean },
+  ): void;
 }
 
 interface MigrationLogger {
@@ -101,9 +105,9 @@ function runLegacyKeychainWorker(
         executable,
         [appPath, MAC_SAFE_STORAGE_MIGRATION_WORKER_FLAG, legacyAppName],
         {
-        env: workerEnv,
-        stdio: ["pipe", "pipe", "ignore"],
-        windowsHide: true,
+          env: workerEnv,
+          stdio: ["pipe", "pipe", "ignore"],
+          windowsHide: true,
         },
       );
     } catch (error) {
@@ -193,11 +197,20 @@ export async function migrateLegacyMacSafeStorageSettings(options: {
 }): Promise<number> {
   if (options.platform !== "darwin") return 0;
 
-  const rows = options.database
-    .prepare(
-      "SELECT category, encrypted_data, checksum FROM secure_settings WHERE encrypted_data LIKE 'os:%'",
-    )
-    .all() as EncryptedSecureSettingRow[];
+  // Only rows the current identity cannot read need a legacy worker; skipping
+  // readable rows avoids launching one helper process per identity on every start.
+  const rows = (
+    options.database
+      .prepare(
+        "SELECT category, encrypted_data, checksum FROM secure_settings WHERE encrypted_data LIKE 'os:%'",
+      )
+      .all() as EncryptedSecureSettingRow[]
+  ).filter((row) => {
+    const status = options.repository.loadWithStatus(row.category as SettingsCategory, {
+      logErrors: false,
+    }).status;
+    return status !== "success" && status !== "not_found";
+  });
   if (rows.length === 0) return 0;
 
   let migratedCount = 0;
@@ -230,7 +243,9 @@ export async function migrateLegacyMacSafeStorageSettings(options: {
       if (result.status === "success" || result.status === "not_found") continue;
 
       try {
-        options.repository.save(category as SettingsCategory, settings);
+        options.repository.save(category as SettingsCategory, settings, {
+          allowUnreadableOverwrite: true,
+        });
         migratedCount += 1;
         migratedFromIdentity = true;
       } catch {
@@ -279,12 +294,21 @@ export async function migrateLegacyMacSafeStorageChannels(options: {
   ).all() as Array<{ id: string; config: string }>;
   if (rows.length === 0) return 0;
 
+  const canDecryptWithCurrentIdentity = (config: string): boolean => {
+    try {
+      options.safeStorage.decryptString(Buffer.from(config.slice("enc:".length), "base64"));
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const encryptedRows: EncryptedSecureSettingRow[] = rows
     .filter(
       (row) =>
         typeof row?.id === "string" &&
         typeof row.config === "string" &&
-        row.config.startsWith("enc:"),
+        row.config.startsWith("enc:") &&
+        !canDecryptWithCurrentIdentity(row.config),
     )
     .map((row) => {
       const encrypted_data = `os:${row.config.slice("enc:".length)}`;

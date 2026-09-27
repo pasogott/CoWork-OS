@@ -11,6 +11,7 @@ import {
   Suspense,
   startTransition,
 } from "react";
+import { PulseConsentPrompt } from "./components/PulseConsentPrompt";
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { useReplayMode, type ReplayControls } from "./hooks/useReplayMode";
 import { useTaskDuration } from "./hooks/useTaskDuration";
@@ -31,6 +32,7 @@ import type { SpreadsheetTurnContext } from "./components/SpreadsheetArtifactVie
 import { ResizableDividerHandle } from "./components/ResizableDividerHandle";
 import { DisclaimerModal } from "./components/DisclaimerModal";
 import { Onboarding } from "./components/Onboarding";
+import { QuickFirstRun } from "./components/QuickFirstRun";
 // TaskQueuePanel moved to RightPanel
 import { ToastContainer } from "./components/Toast";
 import {
@@ -87,6 +89,11 @@ import {
 import type { ComposerDraft, DraftAttachmentRef } from "../shared/composer-drafts";
 import { TASK_EVENT_STATUS_MAP } from "../shared/task-event-status-map";
 import { getEffectiveTaskEventType } from "./utils/task-event-compat";
+import {
+  clampResizableSidebarWidth,
+  getResizableSidebarWidthConstraints,
+  RESIZABLE_SIDEBAR_MIN_WIDTH,
+} from "./utils/resizable-sidebar-layout";
 import {
   getLatestTaskSnapshotAfterCreate,
   shouldApplyReconciledTaskSnapshot,
@@ -245,9 +252,6 @@ const HomeDashboard = lazy(() =>
   import("./components/HomeDashboard").then((module) => ({ default: module.HomeDashboard })),
 );
 const AutomationStudioPanel = lazy(() => import("./components/AutomationStudioPanel"));
-const HealthPanel = lazy(() =>
-  import("./components/HealthPanel").then((module) => ({ default: module.HealthPanel })),
-);
 const DevicesPanel = lazy(() =>
   import("./components/DevicesPanel").then((module) => ({ default: module.DevicesPanel })),
 );
@@ -272,8 +276,7 @@ const MissionControlPanel = lazy(() =>
 );
 
 const SPREADSHEET_SIDEBAR_DEFAULT_WIDTH = 720;
-const SPREADSHEET_SIDEBAR_MIN_WIDTH = 420;
-const SPREADSHEET_MAIN_MIN_WIDTH = 390;
+const SPREADSHEET_SIDEBAR_MIN_WIDTH = RESIZABLE_SIDEBAR_MIN_WIDTH;
 /** Conversation column width beside an open artifact in the calm theme. */
 const CALM_CHAT_COLUMN_WIDTH = 400;
 const SPREADSHEET_SIDEBAR_WIDTH_STORAGE_KEY = "cowork:spreadsheetSidebarWidth";
@@ -675,7 +678,6 @@ type AppView =
   | "settings"
   | "browser"
   | "devices"
-  | "health"
   | "ideas"
   | "inboxAgent"
   | "agents"
@@ -813,6 +815,7 @@ type SelectedTaskWorkspaceViewProps = {
     images?: ImageAttachment[],
     workspace?: Workspace,
   ) => Promise<void | boolean>;
+  onFirstTaskReady: (task: Task, workspace: Workspace) => void;
   onAskInbox: (query: string) => void;
   onChangeWorkspace: () => void;
   onSelectWorkspace: (workspace: Workspace) => void;
@@ -940,6 +943,7 @@ const SelectedTaskWorkspaceView = memo(
     onStartOnboarding,
     onStartFreshSession,
     onCreateTask,
+    onFirstTaskReady,
     onAskInbox,
     onChangeWorkspace,
     onSelectWorkspace,
@@ -999,15 +1003,8 @@ const SelectedTaskWorkspaceView = memo(
       }
       const containerWidth =
         splitLayoutRef.current?.getBoundingClientRect().width || window.innerWidth;
-      const maxWidth = Math.max(
-        SPREADSHEET_SIDEBAR_MIN_WIDTH,
-        containerWidth - SPREADSHEET_MAIN_MIN_WIDTH,
-      );
       setSpreadsheetSidebarWidth(
-        Math.min(
-          Math.max(containerWidth - CALM_CHAT_COLUMN_WIDTH, SPREADSHEET_SIDEBAR_MIN_WIDTH),
-          maxWidth,
-        ),
+        clampResizableSidebarWidth(containerWidth - CALM_CHAT_COLUMN_WIDTH, containerWidth),
       );
     }, [onRevealRightSidebar]);
     const openSpreadsheetArtifact = useCallback(
@@ -1091,16 +1088,12 @@ const SelectedTaskWorkspaceView = memo(
         onRevealRightSidebar?.();
         const containerWidth =
           splitLayoutRef.current?.getBoundingClientRect().width || window.innerWidth;
-        const maxWidth = Math.max(
-          SPREADSHEET_SIDEBAR_MIN_WIDTH,
-          containerWidth - SPREADSHEET_MAIN_MIN_WIDTH,
-        );
         const preferredBrowserWidth = Math.max(
           SPREADSHEET_SIDEBAR_DEFAULT_WIDTH,
           containerWidth - 460,
         );
         setSpreadsheetSidebarWidth(
-          Math.min(Math.max(preferredBrowserWidth, SPREADSHEET_SIDEBAR_MIN_WIDTH), maxWidth),
+          clampResizableSidebarWidth(preferredBrowserWidth, containerWidth),
         );
         setBrowserWorkbench({
           sessionId: request.sessionId || "default",
@@ -1170,12 +1163,11 @@ const SelectedTaskWorkspaceView = memo(
     const clampSpreadsheetSidebarWidth = useCallback((width: number) => {
       const containerWidth =
         splitLayoutRef.current?.getBoundingClientRect().width || window.innerWidth;
-      const maxWidth = Math.max(
-        SPREADSHEET_SIDEBAR_MIN_WIDTH,
-        containerWidth - SPREADSHEET_MAIN_MIN_WIDTH,
-      );
-      return Math.min(Math.max(width, SPREADSHEET_SIDEBAR_MIN_WIDTH), maxWidth);
+      return clampResizableSidebarWidth(width, containerWidth);
     }, []);
+    const sidebarWidthConstraints = getResizableSidebarWidthConstraints(
+      splitLayoutRef.current?.getBoundingClientRect().width || window.innerWidth,
+    );
     useLayoutEffect(() => {
       if (
         !(
@@ -1207,12 +1199,7 @@ const SelectedTaskWorkspaceView = memo(
         event.currentTarget.setPointerCapture?.(event.pointerId);
         const resizeHandle = event.currentTarget;
         const pointerId = event.pointerId;
-        const maxWidth = Math.max(
-          SPREADSHEET_SIDEBAR_MIN_WIDTH,
-          rect.width - SPREADSHEET_MAIN_MIN_WIDTH,
-        );
-        const clampWidth = (width: number) =>
-          Math.min(Math.max(width, SPREADSHEET_SIDEBAR_MIN_WIDTH), maxWidth);
+        const clampWidth = (width: number) => clampResizableSidebarWidth(width, rect.width);
         setIsSpreadsheetResizing(true);
         setSpreadsheetSidebarWidth(clampWidth(rect.right - event.clientX));
 
@@ -1485,6 +1472,7 @@ const SelectedTaskWorkspaceView = memo(
         return (
           <WebArtifactViewer
             filePath={spreadsheetArtifact.path}
+            readOnlyPreview={task?.source === "sample"}
             workspacePath={workspace.path}
             mode="fullscreen"
             onClose={closeSpreadsheetArtifact}
@@ -1584,6 +1572,7 @@ const SelectedTaskWorkspaceView = memo(
               onStartOnboarding={onStartOnboarding}
               onStartFreshSession={onStartFreshSession}
               onCreateTask={onCreateTask}
+              onFirstTaskReady={onFirstTaskReady}
               onAskInbox={onAskInbox}
               onChangeWorkspace={onChangeWorkspace}
               onSelectWorkspace={onSelectWorkspace}
@@ -1681,7 +1670,7 @@ const SelectedTaskWorkspaceView = memo(
                 role="separator"
                 orientation="vertical"
                 aria-label="Resize workbench sidebar"
-                aria-valuemin={SPREADSHEET_SIDEBAR_MIN_WIDTH}
+                aria-valuemin={sidebarWidthConstraints.minWidth}
                 aria-valuenow={Math.round(spreadsheetSidebarWidth)}
                 tabIndex={0}
                 onPointerDown={handleSpreadsheetResizePointerDown}
@@ -1756,6 +1745,7 @@ const SelectedTaskWorkspaceView = memo(
                   ) : spreadsheetArtifact?.kind === "webpage" ? (
                     <WebArtifactViewer
                       filePath={spreadsheetArtifact.path}
+                      readOnlyPreview={task?.source === "sample"}
                       workspacePath={workspace.path}
                       mode="sidebar"
                       onClose={closeSpreadsheetArtifact}
@@ -2153,13 +2143,10 @@ export function App() {
     | "skills"
     | "scheduled"
     | "voice"
-    | "companies"
-    | "digitaltwins"
     | "mcp"
     | "triggers"
     | "subconscious"
-    | "health"
-    | "suggestions"
+      | "suggestions"
     | "insights"
     | "pulse"
     | "traces"
@@ -2910,6 +2897,8 @@ export function App() {
   const [disclaimerAccepted, setDisclaimerAccepted] = useState<boolean | null>(null);
   // Onboarding state (null = loading)
   const [onboardingCompleted, setOnboardingCompleted] = useState<boolean | null>(null);
+  const [pendingOnboardingPrompt, setPendingOnboardingPrompt] = useState<string | null>(null);
+  const firstOnboardingPromptStartedRef = useRef(false);
   // Timestamp of when onboarding was completed
   const [onboardingCompletedAt, setOnboardingCompletedAt] = useState<string | undefined>(undefined);
   const hasElectronAPI = typeof window !== "undefined" && !!window.electronAPI;
@@ -3204,21 +3193,22 @@ export function App() {
     setDisclaimerAccepted(true);
   };
 
-  const handleOnboardingComplete = (dontShowAgain: boolean) => {
+  const handleOnboardingComplete = async (dontShowAgain: boolean, firstPrompt?: string) => {
     const timestamp = new Date().toISOString();
     // Save to main process for persistence
     // If dontShowAgain is true, mark as completed with timestamp
     // If false, just save the timestamp but don't mark as completed (user can see it again next time)
-    window.electronAPI
-      ?.saveAppearanceSettings?.({
+    try {
+      await window.electronAPI?.saveAppearanceSettings?.({
         onboardingCompleted: dontShowAgain,
         onboardingCompletedAt: timestamp,
-      })
-      ?.catch((error) => {
-        console.error("Failed to save onboarding state:", error);
       });
+    } catch (error) {
+      console.error("Failed to save onboarding state:", error);
+    }
     setOnboardingCompleted(true); // Always allow proceeding to main app
     setOnboardingCompletedAt(timestamp);
+    if (firstPrompt?.trim()) setPendingOnboardingPrompt(firstPrompt.trim());
 
     // Sync any onboarding-time appearance changes (e.g. light/dark toggle)
     window.electronAPI
@@ -3235,6 +3225,32 @@ export function App() {
 
     // Refresh LLM config after onboarding (user may have configured a provider)
     loadLLMConfig();
+  };
+
+  const handleQuickFirstRunComplete = async (
+    choice: "ready" | "skipped" | "browsing_without_ai" | "connecting",
+    openSettings = false,
+  ) => {
+    try {
+      const previousTasks = await window.electronAPI.listTasks({ limit: 1 });
+      if (Array.isArray(previousTasks) && previousTasks.length === 0) {
+        const currentMemoryFeatures = await window.electronAPI.getMemoryFeaturesSettings();
+        await window.electronAPI.saveMemoryFeaturesSettings({
+          ...currentMemoryFeatures,
+          contextPackInjectionEnabled: false,
+          heartbeatMaintenanceEnabled: false,
+        });
+      }
+      await window.electronAPI.setFirstTaskSetup(choice);
+    } catch (error) {
+      // Setup preferences are best-effort; never trap the user in first-run.
+      console.error("Failed to save first-run setup:", error);
+    }
+    await handleOnboardingComplete(true);
+    if (openSettings) {
+      setSettingsTab("llm");
+      setCurrentView("settings");
+    }
   };
 
   const handleOpenBrowserView = (url?: string) => {
@@ -3411,8 +3427,9 @@ export function App() {
 
     const checkUpdates = async () => {
       try {
-        const info = await window.electronAPI.checkForUpdates();
-        if (info.available) {
+        const info = await window.electronAPI.checkForUpdates("background");
+        // Only a live answer is worth an update prompt; cached metadata may be stale.
+        if (info.available && info.provenance?.source === "live") {
           setUpdateInfo(info);
         }
       } catch (error) {
@@ -6018,6 +6035,23 @@ export function App() {
     }
   };
 
+  useEffect(() => {
+    if (!pendingOnboardingPrompt || !onboardingCompleted || !disclaimerAccepted || firstOnboardingPromptStartedRef.current) return;
+    firstOnboardingPromptStartedRef.current = true;
+    const prompt = pendingOnboardingPrompt;
+    setPendingOnboardingPrompt(null);
+    void (async () => {
+      try {
+        const workspace = currentWorkspace ?? await window.electronAPI.getTempWorkspace({ createNew: true });
+        if (!workspace) throw new Error("Could not create a workspace for the first task.");
+        if (!currentWorkspace) setCurrentWorkspace(workspace);
+        await handleCreateTask(prompt.slice(0, 80), prompt, { generateTitle: true }, undefined, workspace);
+      } catch (error) {
+        addToast({ type: "error", title: "First task could not start", message: error instanceof Error ? error.message : "Try the prompt again in the workspace." });
+      }
+    })();
+  }, [pendingOnboardingPrompt, onboardingCompleted, disclaimerAccepted, currentWorkspace]);
+
   const handleOpenManagedAgentTask = useCallback(
     async (taskId: string) => {
       setCurrentView("main");
@@ -7405,10 +7439,17 @@ export function App() {
   if (!onboardingCompleted) {
     return (
       <div className="app">
-        <Onboarding
-          onComplete={handleOnboardingComplete}
-          workspaceId={currentWorkspace?.id ?? null}
-        />
+        {import.meta.env.VITE_FIRST_TASK_BETA === "1" ? (
+          <QuickFirstRun
+            onComplete={(choice) => handleQuickFirstRunComplete(choice, false)}
+            onOpenSettings={() => handleQuickFirstRunComplete("connecting", true)}
+          />
+        ) : (
+          <Onboarding
+            onComplete={handleOnboardingComplete}
+            workspaceId={currentWorkspace?.id ?? null}
+          />
+        )}
       </div>
     );
   }
@@ -7717,7 +7758,6 @@ export function App() {
         currentView === "home" ||
         currentView === "automations" ||
         currentView === "devices" ||
-        currentView === "health" ||
         currentView === "ideas" ||
         currentView === "inboxAgent" ||
         currentView === "agents" ||
@@ -7748,7 +7788,6 @@ export function App() {
                 isAgentsActive={currentView === "agents"}
                 isEverydayAgentActive={currentView === "everydayAgent"}
                 isMissionControlActive={currentView === "missionControl"}
-                isHealthActive={currentView === "health"}
                 isDevicesActive={currentView === "devices"}
                 isBuildActive={currentView === "build"}
                 isLibraryActive={currentView === "library"}
@@ -7775,7 +7814,6 @@ export function App() {
                   }
                 }}
                 onOpenEverydayAgent={() => setCurrentView("everydayAgent")}
-                onOpenHealth={() => setCurrentView("health")}
                 onOpenDevices={() => setCurrentView("devices")}
                 onNewSession={handleNewSession}
                 onOpenSettings={handleOpenSettings}
@@ -7944,17 +7982,6 @@ export function App() {
                   }}
                   availableProviders={availableProviders}
                 />
-              ) : currentView === "health" ? (
-                <HealthPanel
-                  onOpenSettings={() => {
-                    setSettingsTab("health");
-                    setCurrentView("settings");
-                  }}
-                  onCreateTask={(title, prompt) => {
-                    setCurrentView("main");
-                    handleCreateTask(title, prompt, { generateTitle: true });
-                  }}
-                />
               ) : currentView === "ideas" ? (
                 <IdeasPanel
                   onCreateTaskFromPrompt={handleCreateTaskFromIdea}
@@ -7981,10 +8008,6 @@ export function App() {
                       setMissionControlInitialIssueId(null);
                       setMissionControlEverydayAgentFocus(false);
                       setCurrentView("missionControl");
-                    }}
-                    onOpenAgentPersonas={() => {
-                      setSettingsTab("digitaltwins");
-                      setCurrentView("settings");
                     }}
                     onOpenSlackSettings={() => {
                       setSettingsTab("slack");
@@ -8107,6 +8130,14 @@ export function App() {
                   onStartOnboarding={handleShowOnboarding}
                   onStartFreshSession={handleClearTaskView}
                   onCreateTask={handleCreateTask}
+                  onFirstTaskReady={(task, workspace) => {
+                    setTasks((previous) => upsertTaskPreservingIdentity(previous, task, { prependIfMissing: true }));
+                    tasksRef.current = upsertTaskPreservingIdentity(tasksRef.current, task, { prependIfMissing: true });
+                    setCurrentWorkspace(workspace);
+                    clearRemoteTaskView();
+                    setCurrentView("main");
+                    void selectTaskAfterDraftFlush(task.id);
+                  }}
                   onAskInbox={handleAskInboxFromComposer}
                   onChangeWorkspace={handleChangeWorkspace}
                   onSelectWorkspace={handleSelectWorkspace}
@@ -8176,6 +8207,9 @@ export function App() {
             />
           ) : null}
 
+          {/* Ask for Pulse consent after the first successful real task, not at install. */}
+          <PulseConsentPrompt tasks={tasks} />
+
           {/* Toast Notifications */}
           <ToastContainer
             toasts={toasts}
@@ -8222,15 +8256,6 @@ export function App() {
               setCurrentView("main");
               void selectTaskAfterDraftFlush(taskId);
               setRightSidebarCollapsed(false);
-            }}
-            onNavigateToMissionControl={(companyId) => {
-              setMissionControlInitialCompanyId(companyId);
-              setMissionControlInitialIssueId(null);
-              setMissionControlEverydayAgentFocus(false);
-              setCurrentView("missionControl");
-            }}
-            onNavigateToAgents={() => {
-              setCurrentView("agents");
             }}
           />
         </Suspense>
