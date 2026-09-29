@@ -66,12 +66,16 @@ retract a request the server already accepted.
 HTTPS enrollment/daily requests reach the separate `services/pulse-worker` deployment at
 `pulse.coworkosapp.com`. The Worker validates closed payload shapes and stores pseudonyms and
 aggregates in D1. A cron prunes old rows; a bearer-protected API serves aggregate reports.
-The desktop updater is separate from Pulse. Manual checks (Settings) go directly to GitHub with
-an 8-second total deadline; background checks (startup) may first ask the identifier-free CoWork
-version endpoint for up to 2 seconds. Every `UpdateInfo` says whether it is a live answer or
-no published release, with its check time. Release metadata is not cached: a failed check is an
-error, same-intent checks are coalesced, and only a manual check sets the install target.
-Operator OTLP export and local Usage Insights remain distinct data flows.
+The desktop updater is separate from Pulse. For installed builds, manual checks (Settings) go
+directly to GitHub with an 8-second total deadline; background checks (startup) may first ask the
+identifier-free CoWork version endpoint for up to 2 seconds. Source checkouts fetch and compare the
+exact `origin/main` commit within one 15-second budget that includes local Git probes and the remote
+fetch. Their result is explicitly current, a new target, or unavailable; a failed fetch cannot
+establish that the checkout is current. Every `UpdateInfo` says whether it is a live answer, no
+published release, or an unavailable source check, with its check time. Release metadata is not
+cached: a failed release check is an error, same-intent checks are coalesced, and only a manual
+check sets the install target. Operator OTLP export and local Usage Insights remain distinct data
+flows.
 
 See [CoWork Pulse](cowork-pulse.md) for contracts and delivery limitations, and the
 [collector runbook](../services/pulse-worker/README.md) for deployment and recovery. Server
@@ -272,6 +276,34 @@ Artifact graders run in bounded subprocesses, and unresolved cleanup retains the
 inspection. This is application-profile isolation, not an operating-system sandbox. The optional
 scripted-provider smoke exercises native file tools without measuring model quality. Commands,
 prerequisites and rendering limits are documented in [Disposable evaluation battery](harness-eval-battery.md).
+
+## Database Ownership
+
+SQLite is owned by worker threads by default in the desktop app, the daemon and the CLI.
+
+- **Write worker:**
+  - One per runtime (`src/electron/database/async/`). It runs every mutation for the timeline, reports, settings, storage, services, memory, mailbox and control-plane domains.
+  - A write is a catalogued unit: one IMMEDIATE transaction, so a read-then-write is never interleaved with another writer.
+  - A reply means the write committed. If the worker exits before replying, the outcome is reported as `unknown`, and the caller reconciles against durable state instead of replaying the write.
+- **Read workers:**
+  - The reporting reader runs heavy reports and the mailbox reads.
+  - The memory FTS worker runs lexical recall.
+  - Neither falls back to host SQL or returns an empty success.
+- **Host thread:**
+  - The host bootstraps and migrates the schema, then starts the workers.
+  - It keeps only the reviewed exceptions listed in `scripts/qa/sqlite-audit-rules.json`, each with an owner: the daemon hot path, synchronous settings saves and the vault commit, service schema DDL, and one-time startup migrations.
+  - The daemon's milestone and timeline commits go through `TimelineWriter`, which commits in the worker.
+- **Backend choice:**
+  - The backend is chosen once per run (`DATABASE_WORKER_ROLLOUT`, `src/electron/database/async/runtime.ts`).
+  - `COWORK_DB_WORKER=0` restarts on the host backend. Setting a domain flag (for example `COWORK_DB_WORKER_SERVICES=0`) to `0` keeps only that domain on the host.
+  - Nothing switches backend mid-run. After a worker failure, operations fail explicitly.
+- **Rollback:**
+  - Both backends use the same schema.
+  - To roll back: quit the app so the worker drains, then restart it with the kill switch.
+  - Never delete the profile database to recover.
+- **Enforcement:** `npm run qa:db:ratchet` and `npm run qa:db:audit` fail on new host SQL outside unit stores, on files covered only by backstop rules, and on rules without an owner.
+
+Design, phases and evidence: [async SQLite migration plan](async-sqlite-migration-plan-2026-09-27.md) and [baseline](async-sqlite-db0-baseline-2026-09-27.md).
 
 ## Update Rule
 

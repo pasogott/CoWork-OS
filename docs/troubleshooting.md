@@ -655,6 +655,52 @@ Windows ARM64 note:
 - Setup now auto-tries x64 Electron emulation if ARM64 native rebuild fails.
 - To disable that fallback and force native ARM64 only, set `COWORK_SETUP_SKIP_X64_FALLBACK=1`.
 
+## Upgrading or downgrading CoWork OS
+
+You don't need to migrate your data. On first launch after an upgrade, CoWork updates its database in place and records a schema version. Your tasks, settings and history stay where they are. Don't delete the app database as an upgrade workaround; if startup fails, capture `logs/dev-latest.log` and report it.
+
+Going back to 0.5.54 after upgrading also works: that release opens the upgraded profile and ignores the tables it doesn't know.
+
+If CoWork says **"This profile's database was upgraded by a newer CoWork OS"**, a newer build has already migrated this profile past what the running build supports. Install the newer version again to open it. The message is there so an older build never runs on a schema it doesn't understand.
+
+## Updates says "Could not confirm you're up to date"
+
+This appears only when running from a source checkout (a `git clone` started with `npm run dev`). CoWork compares your checkout with `origin/main` and shows this message instead of claiming you're current when it can't verify that. The line under it says when the check ran, and whether it timed out. Common causes:
+
+- No network, or `git fetch origin` took longer than the 15-second limit.
+- Your local branch has commits that aren't on `origin/main`.
+- The update can't be applied as a fast-forward, for example after a local rebase.
+
+Check that `git fetch origin` works in the checkout, then press **Check for Updates** again. Installed builds from a release are not affected; they check the published release instead.
+
+## A scheduled task didn't run, or ran late, after a restart
+
+Scheduled Tasks run only while a CoWork process that hosts the scheduler is running: the desktop app or a CoWork daemon. **Settings → Automations → Scheduled Tasks** shows which process is hosting it and why it wakes next. Keep that machine awake and the process running for schedules to fire on time.
+
+After a restart:
+
+- A run whose task is still queued, planning or executing is kept and is not started a second time.
+- A run whose task ended while CoWork was closed (completed, failed, cancelled, paused, blocked or interrupted) is recorded with that outcome and delivered.
+- A schedule that became due while CoWork was closed runs once when the scheduler resumes. Missed slots are not replayed one by one.
+- If CoWork can't confirm a run's task, it waits until that run's timeout before starting the next one, rather than risk a duplicate.
+
+## Database worker errors
+
+SQLite runs in worker threads by default. See [Architecture: Database Ownership](architecture.md#database-ownership). Look for these lines in the log:
+
+- `Database worker ready (desktop)`, `(daemon)` or `(cli)`: the worker started. `Reporting reader ready` follows on desktop.
+- `Database worker unavailable`: the worker failed to start, so this run uses the host backend for every domain. Check the native module, as in the Windows section above, and the packaged worker files.
+- `overloaded`: the worker queue is full. The request was not accepted, so it is safe to retry later. Repeated overloads under normal load are a bug; capture the log.
+- `worker_exited` with outcome `unknown`: the worker stopped after the write may have committed. The app reconciles on its next read. Do not re-run the action blindly.
+
+To rule the workers out, quit the app so the worker drains, then restart on the host backend:
+
+```bash
+COWORK_DB_WORKER=0 npm run dev
+```
+
+To keep only one domain on the host, set its flag to `0` instead, for example `COWORK_DB_WORKER_MAILBOX=0`. Both backends use the same schema, so you can switch back by restarting without the variable. Never delete the app database to recover from a worker error; capture `logs/dev-latest.log` instead.
+
 ## App shows "vUnknown" or remote method error
 
 If the app opens but shows `vUnknown` or `Error invoking remote method 'app:getVersion'`, you likely connected to an older already-running instance.

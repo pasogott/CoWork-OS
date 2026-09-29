@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Automation Library**: **Automations → Library** lists every routine, flow, schedule, event trigger, webhook rule and Council once, and **View** opens the editor that owns it. See [Automation Studio](automation-studio.md#library).
+- **Add Tools**: **Settings → Add tools** searches Feature Packs, skills, connectors, MCP servers and built-in tools in one place and opens the screen where you finish setup. It never installs or connects anything by itself. See [Add tools discovery](add-tools-discovery.md).
 - **WhatsApp Business (Cloud API) channel**: signed webhooks, a durable inbound spool with retries, delivery receipts, and held replies with a fallback template outside the 24-hour window. See [Channels](channels.md#whatsapp-business-cloud-api).
 - **Twilio SMS channel**: SMS/MMS with signed inbound and status webhooks, delivery receipts, and carrier keywords (STOP, HELP, …) recorded without routing.
 - **Teams meeting transcripts**: saved as local meeting artifacts (**Settings > Integrations**) and readable by the agent with `meeting_artifacts_list` / `meeting_artifact_get`. See [Meeting Artifacts](meeting-artifacts.md).
@@ -20,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Database work runs in background threads**: saving task events, reports, settings and background services no longer blocks the app, so the window stays responsive with several tasks running or while another CoWork process holds the database. Upgrading needs no manual step. If you suspect a problem, start with `COWORK_DB_WORKER=0` to use the previous in-process path on the same database. See [Troubleshooting](troubleshooting.md#database-worker-errors).
+- **Scheduled Tasks and Routines show where a schedule runs**: which process hosts the scheduler (desktop app or daemon), its time zone and why it wakes next. Cron expressions and time zones are checked when you save. See [Core Automation](core-automation.md#scheduler-availability-contract).
+- **Work-choice labels**: the standard and Calm composers now use Ask/Do consistently; advanced execution overrides remain separate and retain their existing runtime values. The first-task guide leads to a reviewable result before optional setup. See [Work Modes](interaction-modes.md) and the [release surface reference](release-surface-reference.md).
 - **Cost budget guardrail** is on by default at $10 per task. Subscription-billed routes (ChatGPT sign-in, Copilot, coding plans) skip the global cap. A task's own token/cost budget is always enforced but can only lower the global limit.
 - **Shell without an OS sandbox** (Windows, Linux without Docker): when admin policy sets `allowUnsandboxedShell`, the user can approve individual commands to run unsandboxed; otherwise they fail closed.
 - **Unreadable secure settings** (for example after a keychain change) are backed up as ciphertext and replaced on the next save instead of blocking it.
@@ -28,11 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scheduled tasks after a restart** no longer start a second copy of a run that is still working, and a run that ended while the app was closed (completed, failed, cancelled, paused, blocked or interrupted) is recorded with its real outcome and delivered. See [Troubleshooting](troubleshooting.md#a-scheduled-task-didnt-run-or-ran-late-after-a-restart).
+- **Protected credential requests** that are not tied to a task are accepted only from the local owner.
 - **CoWork Pulse opt-out and deletion** can no longer be undone by a late network response. Every decision is saved first and fences in-flight delivery, including delivery by another process sharing the profile. Remote deletion turns reporting off before it starts and keeps a retryable "deletion pending" state until the collector confirms it. Acknowledged days are never resent, and the Settings/CLI preview shows exactly what would be sent next (queued, estimate, not eligible, or already sent). See [CoWork Pulse](cowork-pulse.md).
 - **ACP (acpx) turns** are classified from their stop reason: an empty `end_turn` needs your attention instead of counting as success, token/request limits are partial results, refusals and unknown reasons fail, and an external cancellation is recorded as cancelled. A cancellation you make always wins over a late result.
 - **Scheduled task run success** counts only fully successful runs among classified attempts; partial and needs-attention runs are shown separately, cancelled runs are distinct, and older runs without a known outcome are shown as unclassified. See [Task Automations](task-automations.md).
 - **Playbook learning** only cites independent, successful executions recorded in a durable evidence ledger. Failures are no longer "reinforced", unrelated prompts no longer match, legacy reinforcement text no longer re-enters prompts, and older auto-proposals without evidence must be revalidated before approval.
-- **Update checks** have bounded waits (8 seconds for manual checks; 2 seconds for the optional CoWork endpoint on automatic checks) and no longer show stale release metadata as current: a failed check is reported as an error, and "no published release" is no longer reported as "up to date".
+- **Update checks** have bounded waits (8 seconds for manual release checks; 2 seconds for the optional CoWork endpoint on automatic release checks; 15 seconds for a whole source-checkout check) and no longer show stale release metadata as current: a failed release check is reported as an error, and "no published release" is no longer reported as "up to date". Source checkouts distinguish a verified current commit, a new `origin/main` target, and an unavailable check.
 
 ### Removed
 
@@ -1456,8 +1463,8 @@ for the defect, fix, and enforcement point of each item.
 
 | Version | Date       | Highlights                                                                                                                                                                                                        |
 | ------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0.5.54  | 2026-09-20 | Registry publication recovery, exact package/checksum validation, corrected GitHub Packages access behavior, portable recovery CI, and refreshed public adoption reporting                                      |
-| 0.5.53  | 2026-09-20 | Profile-first approvals, MLX/Atomic Chat/Jev execution, durable WorkSessions, bot collaboration, Box Brain, CoWork Pulse, security hardening, and release tooling                   |
+| 0.5.54  | 2026-09-20 | Registry publication recovery, exact package/checksum validation, corrected GitHub Packages access behavior, portable recovery CI, and refreshed public adoption reporting                                        |
+| 0.5.53  | 2026-09-20 | Profile-first approvals, MLX/Atomic Chat/Jev execution, durable WorkSessions, bot collaboration, Box Brain, CoWork Pulse, security hardening, and release tooling                                                 |
 | 0.5.52  | 2026-08-27 | OpenRouter image generation, OpenCode Zen/Go, SearXNG/Web Search Plus, Atlas Cloud, Electron 44, macOS 13 minimum, and reliability hardening                                                                      |
 | 0.5.51  | 2026-08-17 | Opt-in Numbat agent security, bounded document analysis, long-session timeline stability, native System Voice TTS, WSL framing, persistent UI density, and browser/runtime recovery                               |
 | 0.5.50  | 2026-07-20 | GPT-5.6 subscription controls, Mixture of Agents, browser annotations, inline mail review, video analysis, governed memory writes, safer visible automation, session retention, and new connector/skill workflows |
