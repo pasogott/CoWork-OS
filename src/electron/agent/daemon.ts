@@ -1,3 +1,4 @@
+import { CanvasManager } from "../canvas/canvas-manager";
 import {
   AnnotationRepository,
   ApprovalRepository,
@@ -823,6 +824,9 @@ export class AgentDaemon extends EventEmitter {
     this.orchestrationGraphStore = new OrchestrationGraphStore(db);
     this.eventRepo = new TaskEventRepository(db);
     this.workspaceRepo = new WorkspaceStore(db);
+    CanvasManager.getInstance().setWorkspaceResolver((taskId) =>
+      this.getEffectiveWorkspaceForTask(taskId),
+    );
     this.approvalRepo = new ApprovalRepository(db);
     this.approvalStore = new ApprovalStore(db);
     this.workspacePermissionRuleRepo = new WorkspacePermissionRuleRepository(db);
@@ -14970,6 +14974,9 @@ export class AgentDaemon extends EventEmitter {
       // queueFollowUp snapshots the pending item; include that row in the return
       // boundary so the accepted queue item survives an immediate restart.
       await this.timelineRowsCommitted(taskId);
+      // The turn can end while the receipt commits, after its post-run drain
+      // found the queue empty. Nothing would then pick this item up, so drain now.
+      if (!executor.isRunning) this.processOrphanedFollowUps(taskId, executor);
       return {
         queued: true,
         deliveryMode,
@@ -16798,6 +16805,7 @@ export class AgentDaemon extends EventEmitter {
   private processOrphanedFollowUps(taskId: string, executor: TaskExecutor): void {
     if (this.shutdownRequested || executor.isRunning || this.drainingFollowUps.has(taskId)) return;
     this.drainingFollowUps.add(taskId);
+    let queueExhausted = false;
     // Leave later messages in the runtime snapshot while processing each turn.
     const drain = async () => {
       let followUp = executor.takeNextFollowUpAtTurnBoundary();
@@ -17030,8 +17038,16 @@ export class AgentDaemon extends EventEmitter {
         }
         followUp = executor.takeNextFollowUpAtTurnBoundary();
       }
+      queueExhausted = followUp === undefined;
     };
-    void drain().finally(() => this.drainingFollowUps.delete(taskId));
+    void drain().finally(() => {
+      this.drainingFollowUps.delete(taskId);
+      // A follow-up queued after the final take saw this drain still registered
+      // and left the item to it. Drain again so the item is not stranded.
+      if (queueExhausted && executor.hasPendingFollowUps) {
+        this.processOrphanedFollowUps(taskId, executor);
+      }
+    });
   }
 
   // ===== Queue Management Methods =====
