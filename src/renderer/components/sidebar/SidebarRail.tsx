@@ -15,6 +15,7 @@ import { useDismissable } from "../calm/useDismissable";
 import {
   getSidebarRailLayout,
   getSidebarRailShortcutTargets,
+  isCustomSidebarRailOrder,
   moveSidebarDestination,
   readPinnedSidebarDestinations,
   readSidebarRailOrder,
@@ -29,6 +30,8 @@ import "./sidebar-rail.css";
 
 export interface SidebarRailProps {
   activeId: SidebarDestinationId | null;
+  /** Settings is open; its rail button reads as the current page. */
+  settingsActive?: boolean;
   onNavigate: (id: SidebarDestinationId) => void;
   onOpenSettings: () => void;
   workspaceId?: string;
@@ -168,6 +171,7 @@ function RailButton({
 /** Left rail: labelled destinations, pinned More items, and the More menu. */
 function SidebarRailComponent({
   activeId,
+  settingsActive = false,
   onNavigate,
   onOpenSettings,
   workspaceId,
@@ -199,6 +203,7 @@ function SidebarRailComponent({
     () => getSidebarRailLayout({ isCalm, isBrowserHost }, pinnedIds, railOrder),
     [isBrowserHost, isCalm, pinnedIds, railOrder],
   );
+  const railIsCustom = isCustomSidebarRailOrder({ isCalm, isBrowserHost }, railOrder);
   const activeIsHiddenInMore =
     activeId !== null &&
     layout.more.some((item) => item.id === activeId) &&
@@ -240,8 +245,10 @@ function SidebarRailComponent({
 
   const applyGroupOrder = (group: RailGroup, next: SidebarDestinationId[]) => {
     if (group === "rail") {
-      setRailOrder(next);
-      writeSidebarRailOrder(next);
+      // An order moved back to the default is stored as no order.
+      const stored = isCustomSidebarRailOrder({ isCalm, isBrowserHost }, next) ? next : [];
+      setRailOrder(stored);
+      writeSidebarRailOrder(stored);
     } else {
       setPinnedIds(next);
       writePinnedSidebarDestinations(next);
@@ -376,7 +383,7 @@ function SidebarRailComponent({
                   </div>
                 );
               })}
-              {railOrder.length > 0 && (
+              {railIsCustom && (
                 <>
                   <div className="sidebar-rail-menu-separator" role="separator" />
                   <button
@@ -428,8 +435,9 @@ function SidebarRailComponent({
 
       <button
         type="button"
-        className="sidebar-rail-btn"
+        className={`sidebar-rail-btn${settingsActive ? " active" : ""}`}
         onClick={onOpenSettings}
+        aria-current={settingsActive ? "page" : undefined}
         aria-label={flagSettings ? "Settings, update available" : "Settings"}
         title={
           flagSettings
@@ -442,6 +450,7 @@ function SidebarRailComponent({
         <RailItemContent
           icon={Settings}
           caption="Settings"
+          active={settingsActive}
           dot={flagSettings ? "update" : undefined}
         />
       </button>

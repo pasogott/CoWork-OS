@@ -53,6 +53,13 @@ html.platform-darwin.visual-calm .app-layout > .sidebar.sidebar-panel {
   background: var(--sidebar-panel-bg) !important;
 }
 
+/* One typeface for the whole panel. The terminal theme sets the old sidebar
+   to monospace, which left project names and section labels in it beside
+   session titles in the UI font. */
+.sidebar.sidebar-panel.cli-sidebar {
+  font-family: var(--font-ui);
+}
+
 /* With the panel open, the main view meets it and the navbar with hairlines
    instead of being its own rounded card. */
 html .app-layout:not(.sidebar-panel-collapsed) > .main-content,
@@ -75,6 +82,25 @@ html.visual-calm
   > .selected-workspace-main-row
   > .main-content {
   border-top: 1px solid var(--calm-border);
+}
+
+/* Settings sits beside the rail like any view with the panel hidden: it fills
+   the rest of the window as a card with the same edges as the main view. */
+.app-layout-settings > .settings-page {
+  flex: 1;
+  min-width: 0;
+  border-top: 1px solid var(--color-border-subtle);
+  border-bottom: 1px solid var(--color-border-subtle);
+  border-left: 1px solid var(--color-border-subtle);
+  border-top-left-radius: var(--app-shell-panel-radius);
+  border-bottom-left-radius: var(--app-shell-panel-radius);
+  overflow: hidden;
+}
+
+html.visual-calm .app-layout-settings > .settings-page {
+  border-top: none;
+  border-left-color: var(--calm-border);
+  border-bottom-color: var(--calm-border);
 }
 
 /* The hairline under the navbar runs across the whole session row, including
@@ -428,6 +454,14 @@ html.visual-calm .sidebar-panel .sidebar-panel-segments > button {
 
 /* ---------- List ---------- */
 
+/* The panel's lists scroll with a slim thumb and no track in every theme.
+   Dark mode had no scrollbar styling, so it drew the platform's full-height
+   track down the panel. */
+.sidebar-panel :is(.task-list, .sidebar-virtual-list, .sidebar-bots-list, .devices-sidebar-panel) {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-text-primary) 16%, transparent) transparent;
+}
+
 .sidebar-panel .task-list {
   padding: 0 6px 8px;
 }
@@ -663,6 +697,26 @@ html:not(.theme-light) .sidebar-workspace-tile {
 .sidebar.sidebar-panel .cli-more-btn[aria-expanded="true"] {
   background: var(--color-bg-secondary);
   color: var(--color-text-primary);
+}
+
+/* A row's age shows on hover, beside its menu, at every panel width (the
+   narrow-sidebar rules used to hide it outright). */
+.sidebar-panel .cli-task-time {
+  display: none;
+  min-width: 0;
+  color: var(--color-text-muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sidebar-panel .cli-task-item:hover .cli-task-time,
+.sidebar-panel .cli-task-item:focus-within .cli-task-time {
+  display: inline;
+}
+
+/* Automated sessions sit under the Automated group, which already says so. */
+.sidebar-panel .cli-task-automation-icon {
+  display: none;
 }
 
 /* Status reads at the end of the row, as with the running spinner. */
