@@ -139,14 +139,12 @@ const DEFERRED_BY_DEFAULT_TOOLS = new Set([
   "monty_list_transforms",
   "monty_run_transform",
   "monty_transform_file",
-  // Memory internals (search_memories / memory_save stay visible)
-  "memory_timeline",
-  "memory_details",
-  "memory_topics_load",
-  "search_quotes",
-  "search_sessions",
-  "memory_curate",
-  "memory_curated_read",
+  // Memory recall and curation tools are always exposed (ALWAYS_EXPOSE_TOOLS);
+  // listing them here as well made the two lists contradict each other. The
+  // knowledge-graph reads are deferred: tool_search surfaces them when needed.
+  "kg_search",
+  "kg_get_neighbors",
+  "kg_get_subgraph",
   // Agent lifecycle management (spawn_agent / orchestrate_agents stay visible)
   "capture_agent_events",
   "send_agent_message",
@@ -230,9 +228,9 @@ function inferCapabilityTags(toolName: string): RuntimeToolCapabilityTag[] {
 
 function inferConcurrencyClass(toolName: string): RuntimeToolConcurrencyClass {
   if (toolName.startsWith("mcp_")) {
-    return toolName.includes("read") || toolName.includes("search")
-      ? "read_parallel"
-      : "serial_only";
+    // The connected catalog supplies annotation-based overrides. Names alone
+    // cannot authorize concurrent reads or classify a mutating MCP tool.
+    return "serial_only";
   }
   if (READ_PARALLEL_TOOLS.has(toolName)) return "read_parallel";
   if (EXCLUSIVE_TOOLS.has(toolName)) return "exclusive";
@@ -273,7 +271,7 @@ function inferReadOnly(toolName: string, concurrencyClass: RuntimeToolConcurrenc
     );
   }
   if (toolName.startsWith("canvas_")) return false;
-  if (toolName.startsWith("mcp_")) return concurrencyClass === "read_parallel";
+  if (toolName.startsWith("mcp_")) return false;
   if (isArtifactGenerationToolName(toolName) || isFileMutationToolName(toolName)) return false;
   return concurrencyClass === "read_parallel";
 }
@@ -378,7 +376,7 @@ export function getDefaultRuntimeToolMetadata(toolName: string): RuntimeToolMeta
     resultKind: inferResultKind(canonicalName),
     supportsContextMutation: !readOnly,
     capabilityTags: inferCapabilityTags(canonicalName),
-    exposure: exposure.exposure,
+    exposure: canonicalName.startsWith("mcp_") ? "always" : exposure.exposure,
   };
 }
 

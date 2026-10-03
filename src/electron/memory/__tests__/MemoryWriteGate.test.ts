@@ -281,6 +281,36 @@ describe("MemoryWriteGate", () => {
     expect(await MemoryWriteGate.listPending("ws-1")).toHaveLength(0);
   });
 
+  it("blocks external writes holding secret shapes from the shared detector", async () => {
+    vi.spyOn(MemoryFeaturesManager, "loadSettings").mockReturnValue({
+      contextPackInjectionEnabled: true,
+      heartbeatMaintenanceEnabled: true,
+      memoryWriteApprovalMode: "off",
+    });
+    for (const content of [
+      "aws id AKIAABCDEFGHIJKLMNOP in config",
+      "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N",
+    ]) {
+      const decision = await MemoryWriteGate.evaluate({
+        ...baseRequest,
+        target: "external",
+        action: "remember",
+        payload: { content },
+      });
+      expect("blocked" in decision && decision.blocked).toBe(true);
+    }
+  });
+
+  it("redacts shared-detector secret shapes in pending display values", async () => {
+    const record = repoMock.create({
+      ...baseRequest,
+      target: "archive",
+      summary: "Saved AKIAABCDEFGHIJKLMNOP for later",
+    });
+    const display = await MemoryWriteGate.findPendingForDisplay(record.id);
+    expect(display?.summary).toBe("Saved [REDACTED_SECRET] for later");
+  });
+
   it("applies archive pending writes with the write gate bypassed", async () => {
     vi.spyOn(MemoryFeaturesManager, "loadSettings").mockReturnValue({
       contextPackInjectionEnabled: true,
@@ -447,5 +477,24 @@ describe("MemoryWriteGate", () => {
         skipMemoryWriteGate: true,
       }),
     );
+  });
+});
+
+describe("MemoryWriteGate.initialize", () => {
+  it("is idempotent for the same database and re-initializes for another", () => {
+    const state = MemoryWriteGate as unknown as { pendingRepo: unknown };
+    const dbA = {};
+    const dbB = {};
+    const managerFor = (db: object) =>
+      ({ getDatabase: () => db }) as unknown as Parameters<typeof MemoryWriteGate.initialize>[0];
+
+    MemoryWriteGate.initialize(managerFor(dbA));
+    const firstRepo = state.pendingRepo;
+    MemoryWriteGate.initialize(managerFor(dbA));
+    MemoryWriteGate.initialize(managerFor(dbA));
+    expect(state.pendingRepo).toBe(firstRepo);
+
+    MemoryWriteGate.initialize(managerFor(dbB));
+    expect(state.pendingRepo).not.toBe(firstRepo);
   });
 });

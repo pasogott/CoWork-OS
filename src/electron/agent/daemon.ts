@@ -211,6 +211,7 @@ import {
 } from "../security/concurrency";
 import { MemoryService } from "../memory/MemoryService";
 import { taskDisablesMemoryCapture } from "../memory/no-memory-directive";
+import { buildSalientTaskEventCapture } from "../memory/memory-capture-salience";
 import { GuardrailManager } from "../guardrails/guardrail-manager";
 import { PermissionSettingsManager } from "../security/permission-settings-manager";
 import {
@@ -232,6 +233,7 @@ import { UserProfileService } from "../memory/UserProfileService";
 import { RelationshipMemoryService } from "../memory/RelationshipMemoryService";
 import { AdaptiveStyleEngine } from "../memory/AdaptiveStyleEngine";
 import { MemoryConsolidator } from "../memory/MemoryConsolidator";
+import { MemoryWorkspacePurgeService } from "../memory/MemoryWorkspacePurgeService";
 import { DreamingRepository } from "../memory/DreamingRepository";
 import { DreamingService } from "../memory/DreamingService";
 import { MemoryPressureService } from "../memory/MemoryPressureService";
@@ -295,6 +297,7 @@ import {
 import { OrchestrationGraphRepository } from "./orchestration/orchestration-graph-repository-facades";
 import { OrchestrationGraphStore } from "./orchestration/OrchestrationGraphRepository";
 import { MCPClientManager } from "../mcp/client/MCPClientManager";
+import { getConfiguredMcpToolPolicy } from "../mcp/tool-policy";
 import { getMailboxServiceInstance } from "../mailbox/MailboxService";
 import { type RecurringApprovalFingerprintInput } from "../security/recurring-approval-service";
 import { RecurringApprovalService } from "../security/recurring-approval-repository-facades";
@@ -304,6 +307,7 @@ import {
 } from "../../shared/mailbox";
 import { extractCanonicalTaskImpactMetrics } from "./canonical-task-impact";
 import { getBackgroundProcessManager } from "./tools/background-processes";
+import { emitCorrectionLearningSignal } from "../agents/heartbeat-signal-bus";
 
 export interface AgentDaemonOptions {
   startupRecovery?: boolean;
@@ -553,6 +557,25 @@ const TASK_OVERRIDE_ALLOWLIST = new Set<keyof Task>([
   "branchLabel",
   "resumeStrategy",
 ]);
+
+/**
+ * Mirrors the executor's allowMemoryInjection: memory is retained unless the
+ * task opts out (sub-agents default to opting out), and group/public gateway
+ * contexts only get it when shared-context memory is explicitly trusted.
+ */
+function isRelationshipMemoryAllowedForTask(
+  agentConfig: AgentConfig | undefined,
+  isSubAgentTask: boolean,
+): boolean {
+  const retainMemory = agentConfig?.retainMemory ?? !isSubAgentTask;
+  if (!retainMemory) return false;
+  const gatewayContext = agentConfig?.gatewayContext ?? "private";
+  if (gatewayContext === "private") return true;
+  return (
+    agentConfig?.allowSharedContextMemory === true &&
+    (gatewayContext === "group" || gatewayContext === "public")
+  );
+}
 
 function sanitizeTaskOverrides(taskOverrides?: Partial<Task>): Partial<Task> | undefined {
   if (!taskOverrides) return undefined;
@@ -1109,6 +1132,7 @@ export class AgentDaemon extends EventEmitter {
         ? await pruneTaskEventsWithWorker(worker, 90)
         : await repo.pruneOldEvents(90);
       if (pruned > 0) log.info(`DB maintenance: pruned ${pruned} old events`);
+      await this.runTranscriptMaintenance(90);
       if (worker) {
         const stats = await readStorageStats(worker);
         log.info(
@@ -1120,6 +1144,30 @@ export class AgentDaemon extends EventEmitter {
     } catch (error) {
       log.error("DB maintenance failed:", error);
     }
+  }
+
+  /**
+   * Transcript retention follows task-event retention, then the one-time span
+   * storage cleanup runs in the background (resumable, batched, recorded once
+   * complete). Freed pages are returned by the idle VACUUM below.
+   */
+  private async runTranscriptMaintenance(retentionDays: number): Promise<void> {
+    try {
+      const pruned = await TranscriptStore.pruneRetention({ retentionDays });
+      if (pruned.tasks > 0 || pruned.lockFiles > 0) {
+        log.info(
+          `DB maintenance: pruned transcripts of ${pruned.tasks} task(s) ` +
+            `(${pruned.spanRows} span rows, ${pruned.spanFiles} span files, ` +
+            `${pruned.checkpointFiles} checkpoint files, ${pruned.lockFiles} lock files, ` +
+            `${Math.round(pruned.bytesFreed / 1048576)} MB of files)`,
+        );
+      }
+    } catch (error) {
+      log.warn("DB maintenance: transcript retention failed:", error);
+    }
+    void TranscriptStore.runStorageCleanup({ log: (message) => log.info(message) }).catch(
+      (error) => log.warn("DB maintenance: transcript storage cleanup failed:", error),
+    );
   }
 
   /**
@@ -1201,6 +1249,14 @@ export class AgentDaemon extends EventEmitter {
           } catch (error) {
             log.warn(`Session auto-prune worktree cleanup failed for ${task.id}:`, error);
           }
+        },
+        // Transcript files and Chronicle captures go with the task (SEC-15). Learned
+        // memory is left to memory retention.
+        onTaskDeleted: async (task) => {
+          await MemoryWorkspacePurgeService.purgeTaskFiles({
+            taskId: task.id,
+            workspacePath: this.workspaceRepo.findById(task.workspaceId)?.path,
+          });
         },
       },
     );
@@ -1548,6 +1604,8 @@ export class AgentDaemon extends EventEmitter {
     agentConfig?: AgentConfig;
     lastProgressScore?: number;
     workspaceId?: string;
+    /** Child/sub-agent task; defaults retainMemory to false like the executor. */
+    isSubAgentTask?: boolean;
   }): {
     route: IntentRoute;
     strategy: DerivedTaskStrategy;
@@ -1590,10 +1648,18 @@ export class AgentDaemon extends EventEmitter {
     if (!agentConfig.executionMode) {
       agentConfig.executionMode = strategy.executionMode;
     }
-    const relationshipContext = RelationshipMemoryService.buildPromptContext({
-      maxPerLayer: 2,
-      maxChars: 1200,
-    });
+    // task.prompt is persisted and can reach any model that sees the task, so
+    // relationship memory is only added under the executor's memory-injection gate
+    // (retainMemory, and a private gateway context unless shared memory is trusted).
+    const relationshipContext = isRelationshipMemoryAllowedForTask(
+      input.agentConfig,
+      input.isSubAgentTask === true,
+    )
+      ? RelationshipMemoryService.buildPromptContext({
+          maxPerLayer: 2,
+          maxChars: 1200,
+        })
+      : "";
     const prompt = TaskStrategyService.decoratePrompt(
       input.prompt,
       route,
@@ -1669,6 +1735,7 @@ export class AgentDaemon extends EventEmitter {
       agentConfig: task.agentConfig,
       lastProgressScore: task.lastProgressScore,
       workspaceId: task.workspaceId,
+      isSubAgentTask: (task.agentType ?? "main") === "sub" || !!task.parentTaskId,
     });
     const nextAgentConfig = derived.agentConfig;
     const agentConfigChanged = derived.agentConfigChanged;
@@ -3021,6 +3088,14 @@ export class AgentDaemon extends EventEmitter {
    * Called from initialize() after a short delay to let the app finish starting.
    */
   private async resumeInterruptedTasks(tasks: Task[]): Promise<void> {
+    // Desktop MCP startup runs in the background. Recovery must wait for the
+    // first catalog so the resumed turn does not tell the model its tools are
+    // unavailable just before the configured servers finish connecting.
+    try {
+      await MCPClientManager.getInstance().initialize();
+    } catch (error) {
+      log.warn("MCP startup was unavailable during task recovery:", error);
+    }
     for (const task of tasks) {
       try {
         console.log(`[AgentDaemon] Resuming interrupted task ${task.id}: ${task.title}`);
@@ -4376,6 +4451,8 @@ export class AgentDaemon extends EventEmitter {
       routingPrompt: params.prompt,
       agentConfig: taskAgentConfig,
       workspaceId: params.workspaceId,
+      isSubAgentTask:
+        params.taskOverrides?.agentType === "sub" || !!params.taskOverrides?.parentTaskId,
     });
     const isCronTask = params.source === "cron";
     const cronBudgetProfile = isCronTask
@@ -7120,6 +7197,7 @@ export class AgentDaemon extends EventEmitter {
       command: typeof details?.command === "string" ? details.command : null,
       path: typeof details?.path === "string" ? details.path : null,
       serverName,
+      mcpToolPolicy: getConfiguredMcpToolPolicy(toolName),
       allowPersistence,
       denyState: runtime
         ? runtime.getPermissionDenialState(
@@ -9214,9 +9292,14 @@ export class AgentDaemon extends EventEmitter {
     const canRead = (candidatePath: string): boolean =>
       evaluateWorkspaceFilesystemAccess(effectiveWorkspace, candidatePath, "read").decision ===
       "allow";
+    // Only guards the daemon's own transcript span and checkpoint writes.
+    // `.cowork/memory/transcripts` is protected from tool writes, so this
+    // internal writer opts in explicitly while still honoring the workspace
+    // write capability and profile filesystem rules.
     const canWrite = (candidatePath: string): boolean =>
-      evaluateWorkspaceFilesystemAccess(effectiveWorkspace, candidatePath, "write").decision ===
-      "allow";
+      evaluateWorkspaceFilesystemAccess(effectiveWorkspace, candidatePath, "write", {
+        internalRuntimeStorageWrite: true,
+      }).decision === "allow";
     const transcriptFilePath = path.join(
       workspace.path,
       ".cowork",
@@ -9477,6 +9560,43 @@ export class AgentDaemon extends EventEmitter {
     };
   }
 
+  /**
+   * Snapshot-triggered checkpoints are rewritten (with fsync) at most once per
+   * window per task. Compaction, periodic and completion checkpoints are never
+   * throttled, and the task database keeps the latest snapshot regardless.
+   */
+  private static readonly SNAPSHOT_CHECKPOINT_MIN_INTERVAL_MS = 30_000;
+  private static readonly SNAPSHOT_CHECKPOINT_THROTTLE_MAX_TASKS = 500;
+  private readonly snapshotCheckpointWrites = new Map<
+    string,
+    { writtenAt: number; summaryCreatedAt: number }
+  >();
+
+  private getSnapshotSummaryCreatedAt(
+    payload: Record<string, unknown> | null | undefined,
+  ): number {
+    if (!payload) return 0;
+    const transcript =
+      payload.transcript && typeof payload.transcript === "object"
+        ? (payload.transcript as Record<string, unknown>)
+        : null;
+    const value = Number(
+      payload.explicitChatSummaryCreatedAt ?? transcript?.explicitChatSummaryCreatedAt ?? 0,
+    );
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  private recordSnapshotCheckpointWrite(taskId: string, summaryCreatedAt: number): void {
+    const writes = this.snapshotCheckpointWrites;
+    writes.delete(taskId);
+    writes.set(taskId, { writtenAt: Date.now(), summaryCreatedAt });
+    while (writes.size > AgentDaemon.SNAPSHOT_CHECKPOINT_THROTTLE_MAX_TASKS) {
+      const oldest = writes.keys().next().value;
+      if (oldest === undefined) break;
+      writes.delete(oldest);
+    }
+  }
+
   private async maybeCaptureRuntimeCheckpoint(params: {
     task: Task;
     workspacePath: string;
@@ -9500,6 +9620,23 @@ export class AgentDaemon extends EventEmitter {
       !isMeaningfulExchange
     ) {
       return;
+    }
+
+    // Skip a snapshot inside the throttle window unless it carries a compaction
+    // summary that the last snapshot checkpoint did not have.
+    const snapshotSummaryCreatedAt =
+      effectiveType === "conversation_snapshot"
+        ? this.getSnapshotSummaryCreatedAt(params.legacyPayload)
+        : 0;
+    if (effectiveType === "conversation_snapshot") {
+      const lastWrite = this.snapshotCheckpointWrites.get(params.task.id);
+      if (
+        lastWrite &&
+        lastWrite.summaryCreatedAt === snapshotSummaryCreatedAt &&
+        Date.now() - lastWrite.writtenAt < AgentDaemon.SNAPSHOT_CHECKPOINT_MIN_INTERVAL_MS
+      ) {
+        return;
+      }
     }
 
     const checkpointDirectory = path.join(
@@ -9572,9 +9709,17 @@ export class AgentDaemon extends EventEmitter {
         params.task.id,
         meaningfulEvents.slice(-Math.max(1, Math.min(meaningfulExchangeCount, 12))),
       );
-      const checkpointKind = this.getSnapshotSummaryBlock(params.legacyPayload)
-        ? "pre_compaction"
-        : "snapshot";
+      // Only a snapshot that introduces a new compaction summary marks a compaction;
+      // later snapshots keep carrying the same summary and are plain snapshots.
+      const previousSummaryCreatedAt = this.getSnapshotSummaryCreatedAt(
+        latestCheckpoint as Record<string, unknown> | null | undefined,
+      );
+      const checkpointKind =
+        this.getSnapshotSummaryBlock(params.legacyPayload) &&
+        snapshotSummaryCreatedAt > 0 &&
+        snapshotSummaryCreatedAt !== previousSummaryCreatedAt
+          ? "pre_compaction"
+          : "snapshot";
       await TranscriptStore.writeCheckpoint(params.workspacePath, params.task.id, {
         ...(params.legacyPayload as Record<string, unknown>),
         checkpointKind,
@@ -9589,6 +9734,7 @@ export class AgentDaemon extends EventEmitter {
           meaningfulExchangeCount,
         },
       });
+      this.recordSnapshotCheckpointWrite(params.task.id, snapshotSummaryCreatedAt);
       return;
     }
 
@@ -10521,67 +10667,16 @@ export class AgentDaemon extends EventEmitter {
   }
 
   /**
-   * Capture task event to memory system for cross-session context
+   * Capture task event to memory system for cross-session context.
+   *
+   * Salience-gated (audit DATA-2): raw telemetry (tool calls/results, step progress,
+   * plan JSON, assistant chatter, file events) is not archived; the task timeline keeps
+   * it. User messages still feed awareness / style learning and correction detection.
    */
   private async captureToMemory(taskId: string, type: string, payload: Any): Promise<void> {
-    // Map event types to memory types
-    const memoryTypeMap: Record<string, MemoryType> = {
-      tool_call: "observation",
-      tool_result: "observation",
-      tool_error: "error",
-      step_started: "observation",
-      step_completed: "observation",
-      step_failed: "error",
-      assistant_message: "observation",
-      user_message: "observation",
-      user_feedback: "decision",
-      plan_created: "decision",
-      plan_revised: "decision",
-      error: "error",
-      verification_passed: "insight",
-      verification_failed: "error",
-      verification_pending_user_action: "insight",
-      file_created: "observation",
-      file_modified: "observation",
-    };
-
-    const memoryType = memoryTypeMap[type];
-    if (!memoryType) return;
-
-    // Guardrail: avoid storing high-volume diagnostic tool payloads in memory.
-    // These create low-signal entries and trigger expensive background compression.
-    const toolName = String(payload?.tool || payload?.name || "").trim();
-    const skipMemoryToolNames = new Set([
-      "task_events",
-      "task_history",
-      "search_memories",
-      "search_sessions",
-      "memory_topics_load",
-      "memory_curated_read",
-      "supermemory_profile",
-      "supermemory_search",
-      "supermemory_remember",
-      "supermemory_forget",
-      "scratchpad_read",
-      "glob",
-      "list_directory",
-      "list_directory_with_sizes",
-    ]);
-    if ((type === "tool_call" || type === "tool_result") && skipMemoryToolNames.has(toolName)) {
-      return;
-    }
-
-    if (type === "tool_call") {
-      const inputPreview = JSON.stringify(payload?.input ?? {});
-      if (inputPreview.length > 1500) return;
-    }
-    if (type === "tool_result") {
-      const rawResult =
-        typeof payload?.result === "string"
-          ? payload.result
-          : JSON.stringify(payload?.result ?? payload ?? {});
-      if (rawResult.length > 1500) return;
-    }
+    const feedsProfile = type === "user_message" || type === "user_feedback";
+    const salient = buildSalientTaskEventCapture(type, payload);
+    if (!feedsProfile && !salient) return;
 
     const task = this.taskRepo.findById(taskId);
     if (!task) return;
@@ -10623,6 +10718,7 @@ export class AgentDaemon extends EventEmitter {
           AdaptiveStyleEngine.observe(text);
 
           // Mid-conversation correction detection: capture when the user corrects the agent.
+          // This is the single place a correction is detected; it yields one archive row.
           if (taskId && task.workspaceId && detectsCorrection(text)) {
             try {
               const correctionContent = [
@@ -10630,22 +10726,16 @@ export class AgentDaemon extends EventEmitter {
                 `User said: ${text.slice(0, 300)}`,
                 `Task context: ${(task.prompt || "").slice(0, 200)}`,
               ].join("\n");
-              MemoryService.capture(task.workspaceId, taskId, "insight", correctionContent).catch(
-                () => {},
-              );
+              MemoryService.capture(task.workspaceId, taskId, "insight", correctionContent, false, {
+                allowExternalMirror,
+              }).catch(() => {});
 
-              PlaybookService.captureOutcome(
-                task.workspaceId,
-                taskId,
-                task.title || "unknown",
-                task.prompt || "",
-                "failure",
-                "Agent approach was corrected by user mid-task",
-                [],
-                `[CORRECTION] ${text.slice(0, 200)}`,
-                [],
-                { allowExternalMirror },
-              ).catch(() => {});
+              // Playbook ledger only (no second archive row): the task's success evidence
+              // is invalidated as corrected by the user.
+              PlaybookService.recordUserCorrection(task.workspaceId, taskId).catch(() => {});
+
+              // Lets Heartbeat route the correction to Dreaming (fire-and-forget, no user text).
+              emitCorrectionLearningSignal({ workspaceId: task.workspaceId, taskId });
             } catch {
               // best-effort
             }
@@ -10664,49 +10754,21 @@ export class AgentDaemon extends EventEmitter {
       return;
     }
 
-    // Build content string based on event type
-    let content = "";
-    if (type === "tool_call") {
-      content = `Tool called: ${payload.tool || payload.name}\nInput: ${JSON.stringify(payload.input, null, 2)}`;
-    } else if (type === "tool_result") {
-      const result =
-        typeof payload.result === "string" ? payload.result : JSON.stringify(payload.result);
-      content = `Tool result for ${payload.tool || payload.name}:\n${result}`;
-    } else if (type === "tool_error") {
-      content = `Tool error for ${payload.tool || payload.name}: ${payload.error}`;
-    } else if (type === "assistant_message") {
-      content = payload.content || payload.message || JSON.stringify(payload);
-    } else if (type === "user_message") {
-      content = payload.message || payload.content || JSON.stringify(payload);
-    } else if (type === "user_feedback") {
-      const decision = payload?.decision ? `Decision: ${payload.decision}` : "Feedback received";
-      const reason = payload?.reason ? `\nReason: ${payload.reason}` : "";
-      content = `${decision}${reason}`;
-    } else if (type === "plan_created" || type === "plan_revised") {
-      content = `Plan ${type === "plan_revised" ? "revised" : "created"}:\n${JSON.stringify(payload.plan || payload, null, 2)}`;
-    } else if (type === "step_completed") {
-      content = `Step completed: ${payload.step?.description || JSON.stringify(payload)}`;
-    } else if (type === "step_failed") {
-      content = `Step failed: ${payload.step?.description || ""}\nError: ${payload.error || "Unknown error"}`;
-    } else if (type === "file_created" || type === "file_modified") {
-      content = `File ${type === "file_created" ? "created" : "modified"}: ${payload.path}`;
-    } else if (type === "verification_passed") {
-      content = `Verification passed: ${payload.message || "Task completed successfully"}`;
-    } else if (type === "verification_failed") {
-      content = `Verification failed: ${payload.message || payload.error || "Unknown failure"}`;
-    } else {
-      content = JSON.stringify(payload);
-    }
-
-    // Truncate very long content
-    if (content.length > 5000) {
-      content = content.slice(0, 5000) + "\n[... truncated]";
-    }
+    // Only salient events reach the archive; task context is resolved here.
+    const capture = salient
+      ? buildSalientTaskEventCapture(type, payload, { title: task.title, prompt: task.prompt })
+      : null;
+    if (!capture) return;
 
     const forcePrivate = gatewayContext === "group" || gatewayContext === "public";
-    await MemoryService.capture(task.workspaceId, taskId, memoryType, content, forcePrivate, {
-      allowExternalMirror,
-    });
+    await MemoryService.capture(
+      task.workspaceId,
+      taskId,
+      capture.memoryType,
+      capture.content,
+      forcePrivate,
+      { allowExternalMirror },
+    );
   }
 
   /**

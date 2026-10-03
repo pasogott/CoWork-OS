@@ -11,7 +11,7 @@ import {
   allowsStructuredHumanInput,
   resolveHumanInputPolicy,
 } from "../../shared/human-input-policy";
-import { isCanonicalWriteToolName } from "./tool-semantics";
+import { isCanonicalWriteToolName, isMemoryWriteToolName } from "./tool-semantics";
 
 export type ToolLane =
   | "core"
@@ -160,6 +160,20 @@ const CONDITIONAL_SYSTEM_TOOLS = new Set([
   "get_app_paths",
   "run_applescript",
   "screen_context_resolve",
+]);
+
+/**
+ * Read-only recall tools that belong to the memory lane. The progressive recall
+ * trio is always exposed; the knowledge-graph reads are deferred-load tools
+ * (see runtime-tool-definition.ts) that `tool_search` surfaces on demand.
+ */
+const MEMORY_RECALL_LANE_TOOLS = new Set([
+  "memory_search_index",
+  "memory_timeline",
+  "memory_details",
+  "kg_search",
+  "kg_get_neighbors",
+  "kg_get_subgraph",
 ]);
 
 const ALWAYS_VISIBLE_TOOLS = new Set([
@@ -363,6 +377,10 @@ function inferToolExposureMetadata(
   }
   if (
     toolName === "search_memories" ||
+    // Progressive recall and knowledge-graph reads are memory recall, not system
+    // interaction; they used to fall through to the conditional system lane and
+    // were shown only for clipboard/application/screenshot wording (RECALL-1).
+    MEMORY_RECALL_LANE_TOOLS.has(toolName) ||
     toolName === "search_quotes" ||
     toolName === "search_sessions" ||
     toolName === "memory_topics_load" ||
@@ -419,6 +437,12 @@ export function evaluateToolAvailability(
   const metadata = inferToolExposureMetadata(normalizedToolName, runtime);
   if (!normalizedToolName) {
     return { decision: "defer", reason: "empty_tool_name", metadata };
+  }
+
+  // A connected MCP catalog is already an explicit user configuration. Tool
+  // discovery must work in any language without requiring protocol keywords.
+  if (normalizedToolName.startsWith("mcp_") || runtime?.capabilityTags.includes("mcp")) {
+    return { decision: "allow", metadata };
   }
 
   if (hasToolAffinity(normalizedToolName, ctx.requiredTools)) {
@@ -641,6 +665,9 @@ function isMutatingTool(toolName: string): boolean {
   // monty_transform_file, batch_image_process, scratchpad_write), which let
   // them through applyModeGate in Plan mode.
   if (isCanonicalWriteToolName(toolName)) return true;
+  // Memory/KG/Supermemory writes persist state across tasks; plan and analyze
+  // modes are read-only, so they must not save or erase memory. (SEC-12)
+  if (isMemoryWriteToolName(toolName)) return true;
   if (ALWAYS_MUTATING.has(toolName)) return true;
   if (isMutatingGitTool(toolName)) return true;
   if (toolName.endsWith("_action")) return true;

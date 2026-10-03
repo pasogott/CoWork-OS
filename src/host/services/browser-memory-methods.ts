@@ -22,7 +22,7 @@ import { MemorySynthesizer } from "../../electron/memory/MemorySynthesizer";
 import { evaluateWorkspaceFilesystemAccess } from "../../electron/security/access-profile-paths";
 import { MemoryWriteGate } from "../../electron/memory/MemoryWriteGate";
 import { MemoryService } from "../../electron/memory/MemoryService";
-import { DurableContextService } from "../../electron/memory/DurableContextService";
+import { MemoryWorkspacePurgeService } from "../../electron/memory/MemoryWorkspacePurgeService";
 import { MemoryObservationService } from "../../electron/memory/MemoryObservationService";
 import { UserProfileService } from "../../electron/memory/UserProfileService";
 import { RelationshipMemoryService } from "../../electron/memory/RelationshipMemoryService";
@@ -75,13 +75,11 @@ const featureBooleanKeys = [
   "verbatimRecallEnabled",
   "wakeUpLayersEnabled",
   "temporalKnowledgeEnabled",
-  "promptStackV2Enabled",
   "layeredMemoryEnabled",
   "transcriptStoreEnabled",
   "durableContextEnabled",
   "backgroundConsolidationEnabled",
   "queryOrchestratorEnabled",
-  "sessionLineageEnabled",
   "curatedMemoryEnabled",
   "sessionRecallEnabled",
   "topicMemoryEnabled",
@@ -95,10 +93,7 @@ const featureSettings = z
   .object({
     ...Object.fromEntries(featureBooleanKeys.map((key) => [key, z.boolean().optional()])),
     durableContextMode: z.enum(["off", "experimental", "on"]).optional(),
-    durableContextThreshold: z.number().min(0.25).max(0.95).optional(),
-    durableContextFreshTailCount: z.number().int().min(1).max(1000).optional(),
     durableContextLargePayloadThreshold: z.number().int().min(1).max(1_000_000).optional(),
-    durableContextSummaryModel: z.string().max(200).optional(),
     memoryWriteApprovalMode: z
       .enum(["off", "curated_only", "external_only", "background_only", "all"])
       .optional(),
@@ -470,17 +465,32 @@ export function createBrowserMemoryDefinitions(options: {
       "read",
       (value) => MemoryService.searchAsync(value.workspaceId, value.query, value.limit ?? 30),
     ),
-    getMemoryDetails: action(ids, async (memoryIds) => {
-      const details = await MemoryService.getFullDetails(memoryIds);
-      for (const workspaceId of new Set(details.map((memory) => memory.workspaceId)))
-        await requireWorkspace(workspaceId);
-      return details;
-    }),
+    // Accepts the desktop shape `{ workspaceId, ids }` (SEC-11) and the older bare id list.
+    getMemoryDetails: action(
+      z.union([ids, z.object({ workspaceId: id, ids }).strict()]),
+      async (value) => {
+        const scope = Array.isArray(value) ? undefined : value.workspaceId;
+        const details = await MemoryService.getFullDetails(Array.isArray(value) ? value : value.ids);
+        const visible = scope
+          ? details.filter((memory) => memory.workspaceId === scope)
+          : details;
+        for (const workspaceId of new Set(visible.map((memory) => memory.workspaceId)))
+          await requireWorkspace(workspaceId);
+        return visible;
+      },
+    ),
     getMemoryTimeline: action(
-      z.object({ memoryId: id, windowSize: z.number().int().min(1).max(50).optional() }).strict(),
+      z
+        .object({
+          workspaceId: id.optional(),
+          memoryId: id,
+          windowSize: z.number().int().min(1).max(50).optional(),
+        })
+        .strict(),
       async (value) => {
         const [memory] = await MemoryService.getFullDetails([value.memoryId]);
         if (!memory) return [];
+        if (value.workspaceId && memory.workspaceId !== value.workspaceId) return [];
         await requireWorkspace(memory.workspaceId);
         return MemoryService.getTimelineContext(value.memoryId, value.windowSize);
       },
@@ -511,9 +521,9 @@ export function createBrowserMemoryDefinitions(options: {
       },
     ),
     clearMemory: workspaceIdAction("delete", async (workspaceId) => {
-      await MemoryService.clearWorkspace(workspaceId);
-      await DurableContextService.clearWorkspace(workspaceId);
-      return { success: true };
+      const workspace = await requireWorkspace(workspaceId, "delete");
+      // Same purge as the desktop IPC path: every memory store, with per-store counts.
+      return MemoryWorkspacePurgeService.purgeWorkspace({ id: workspaceId, path: workspace.path });
     }),
     importMemoryFromText: workspaceAction(
       scope

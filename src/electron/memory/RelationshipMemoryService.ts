@@ -1,13 +1,18 @@
 import { v4 as uuidv4 } from "uuid";
 import { SecureSettingsRepository } from "../database/SecureSettingsRepository";
 import type { Task } from "../../shared/types";
-import {
-  extractPreferredNameFromMessage,
-  sanitizePreferredNameMemoryLine,
-} from "../utils/preferred-name";
+import { InputSanitizer } from "../agent/security/input-sanitizer";
+import { bumpHotMemoryVersion } from "./hot-memory-version";
+import { sanitizePreferredNameMemoryLine } from "../utils/preferred-name";
 
 type RelationshipLayer = "identity" | "preferences" | "context" | "history" | "commitments";
-type RelationshipSource = "conversation" | "feedback" | "task";
+/**
+ * Where an item came from. "mailbox" items are third-party text (email subjects,
+ * summaries, sender names, extracted commitments) and are not trusted as facts
+ * about the user: they stay available to mailbox features but are never rendered
+ * into the user-profile / relationship prompt context.
+ */
+type RelationshipSource = "conversation" | "feedback" | "task" | "mailbox";
 type TaskSource = NonNullable<Task["source"]>;
 
 export interface RelationshipMemoryItem {
@@ -45,6 +50,13 @@ interface BuildPromptContextOptions {
   includeDueSoon?: boolean;
   contactIdentityId?: string;
   companyId?: string;
+  /**
+   * Include third-party ("mailbox") items. Off by default: the result feeds the
+   * pinned user-profile block and task prompts, where sender-controlled text must
+   * not appear. Only mailbox features that already handle the sender's content
+   * should opt in.
+   */
+  includeThirdParty?: boolean;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -61,11 +73,14 @@ export class RelationshipMemoryService {
       limit?: number;
       contactIdentityId?: string;
       companyId?: string;
+      /** Drop third-party ("mailbox") items, for callers that render into prompts. */
+      excludeThirdParty?: boolean;
     } = {},
   ): RelationshipMemoryItem[] {
     const profile = this.load();
     const limit = Math.max(1, params.limit ?? 80);
     return this.sort(this.filterByScope(profile.items, params.contactIdentityId, params.companyId))
+      .filter((item) => !params.excludeThirdParty || !this.isThirdPartyItem(item))
       .filter((item) => !params.layer || item.layer === params.layer)
       .filter((item) => params.includeDone === true || item.status !== "done")
       .slice(0, limit);
@@ -150,101 +165,6 @@ export class RelationshipMemoryService {
       .sort((a, b) => Number(a.dueAt || 0) - Number(b.dueAt || 0));
   }
 
-  static ingestUserMessage(message: string, taskId?: string): void {
-    const text = String(message || "").trim();
-    if (!text) return;
-
-    const candidates: Array<Omit<RelationshipMemoryItem, "id" | "createdAt" | "updatedAt">> = [];
-    const _lower = text.toLowerCase();
-
-    const preferredName = extractPreferredNameFromMessage(text);
-    if (preferredName) {
-      candidates.push({
-        layer: "identity",
-        text: `Preferred name: ${preferredName}`,
-        confidence: 0.9,
-        source: "conversation",
-        lastTaskId: taskId,
-      });
-    }
-
-    const preferenceMatch = text.match(
-      /\b(?:i prefer|please always|please don't|i like|i dislike)\s+([^.!?\n]{3,120})/i,
-    );
-    if (preferenceMatch) {
-      candidates.push({
-        layer: "preferences",
-        text: preferenceMatch[0].trim(),
-        confidence: 0.78,
-        source: "conversation",
-        lastTaskId: taskId,
-      });
-    }
-
-    const contextMatch = text.match(
-      /\b(?:remember that|please remember|for future reference)\s+([^.!?\n]{3,150})/i,
-    );
-    if (contextMatch) {
-      candidates.push({
-        layer: "context",
-        text: contextMatch[0].trim(),
-        confidence: 0.8,
-        source: "conversation",
-        lastTaskId: taskId,
-      });
-    }
-
-    const commitmentMatch = text.match(
-      /\b(?:remind me to|please remember to|i need to|i must)\s+([^.!?\n]{3,150})/i,
-    );
-    if (commitmentMatch) {
-      const dueAt = this.parseDueAt(text, Date.now());
-      const normalizedLeadIn = commitmentMatch[0].toLowerCase();
-      candidates.push({
-        layer: "commitments",
-        text: commitmentMatch[0].trim(),
-        confidence:
-          normalizedLeadIn.startsWith("i need to") || normalizedLeadIn.startsWith("i must")
-            ? 0.74
-            : 0.82,
-        source: "conversation",
-        status: "open",
-        dueAt,
-        lastTaskId: taskId,
-      });
-    }
-
-    for (const candidate of candidates.slice(0, 4)) {
-      this.upsert(candidate);
-    }
-  }
-
-  static ingestUserFeedback(decision?: string, reason?: string, taskId?: string): void {
-    const feedback = String(reason || "").trim();
-    if (!feedback) return;
-
-    const lowered = feedback.toLowerCase();
-    if (/\b(concise|shorter|brief|more detail|detailed|tone|format)\b/.test(lowered)) {
-      this.upsert({
-        layer: "preferences",
-        text: `Feedback preference: ${feedback}`.slice(0, MAX_TEXT_LENGTH),
-        confidence: 0.86,
-        source: "feedback",
-        lastTaskId: taskId,
-      });
-    }
-
-    if (decision && /\b(reject|deny|denied)\b/i.test(decision)) {
-      this.upsert({
-        layer: "history",
-        text: `Rejected approach: ${feedback}`.slice(0, MAX_TEXT_LENGTH),
-        confidence: 0.72,
-        source: "feedback",
-        lastTaskId: taskId,
-      });
-    }
-  }
-
   static recordTaskCompletion(
     title: string,
     resultSummary?: string,
@@ -301,7 +221,7 @@ export class RelationshipMemoryService {
         layer: "context",
         text,
         confidence: 0.7,
-        source: "task",
+        source: "mailbox",
         lastTaskId: params.taskId,
         contactIdentityId: params.contactIdentityId,
         companyId: params.companyId,
@@ -315,7 +235,7 @@ export class RelationshipMemoryService {
         layer: "commitments",
         text,
         confidence: 0.82,
-        source: "task",
+        source: "mailbox",
         lastTaskId: params.taskId,
         status: "open",
         dueAt: commitment.dueAt,
@@ -377,13 +297,17 @@ export class RelationshipMemoryService {
     const maxPerLayer = Math.max(1, options.maxPerLayer ?? 2);
     const maxChars = Math.max(300, options.maxChars ?? 1200);
     const includeDueSoon = options.includeDueSoon !== false;
+    const includeThirdParty = options.includeThirdParty === true;
     const profile = this.load();
     const scopedItems = this.filterByScope(
       profile.items,
       options.contactIdentityId,
       options.companyId,
-    );
+    ).filter((item) => includeThirdParty || !this.isThirdPartyItem(item));
     if (!scopedItems.length) return "";
+    // Stored text is rendered inside tagged prompt blocks; keep each item on one
+    // line and unable to close or open tags.
+    const render = (text: string) => InputSanitizer.sanitizeInlineMemoryLine(text);
 
     const lines: string[] = ["RELATIONSHIP MEMORY (continuity context, not hard constraints):"];
 
@@ -396,7 +320,7 @@ export class RelationshipMemoryService {
       if (!selected.length) return;
       lines.push(`${label}:`);
       for (const item of selected) {
-        lines.push(`- ${item.text}`);
+        lines.push(`- ${render(item.text)}`);
       }
     };
 
@@ -408,12 +332,14 @@ export class RelationshipMemoryService {
       const dueSoon = this.listDueSoonCommitments(72, Date.now(), {
         contactIdentityId: options.contactIdentityId,
         companyId: options.companyId,
-      }).slice(0, maxPerLayer);
+      })
+        .filter((item) => includeThirdParty || !this.isThirdPartyItem(item))
+        .slice(0, maxPerLayer);
       if (dueSoon.length > 0) {
         lines.push("Due soon reminders:");
         for (const item of dueSoon) {
           const dueText = item.dueAt ? new Date(item.dueAt).toISOString() : "soon";
-          lines.push(`- ${item.text} (due: ${dueText})`);
+          lines.push(`- ${render(item.text)} (due: ${dueText})`);
         }
       }
     }
@@ -424,6 +350,11 @@ export class RelationshipMemoryService {
       text = `${text.slice(0, maxChars - 16)}\n[... truncated]`;
     }
     return text;
+  }
+
+  /** True for items whose text came from a third party (e.g. an email sender). */
+  static isThirdPartyItem(item: Pick<RelationshipMemoryItem, "source">): boolean {
+    return item.source === "mailbox";
   }
 
   private static upsert(
@@ -445,7 +376,11 @@ export class RelationshipMemoryService {
     if (existing) {
       existing.updatedAt = now;
       existing.confidence = Math.max(existing.confidence, clamp(input.confidence, 0, 1));
-      existing.source = input.source;
+      // A mailbox write of the same text must not demote an item the user
+      // stated themselves; any other source re-labels as before.
+      if (!(input.source === "mailbox" && existing.source !== "mailbox")) {
+        existing.source = input.source;
+      }
       existing.lastTaskId = input.lastTaskId ?? existing.lastTaskId;
       existing.status = input.status ?? existing.status;
       existing.dueAt = typeof input.dueAt === "number" ? Math.floor(input.dueAt) : existing.dueAt;
@@ -510,30 +445,6 @@ export class RelationshipMemoryService {
       if (b.confidence !== a.confidence) return b.confidence - a.confidence;
       return b.updatedAt - a.updatedAt;
     });
-  }
-
-  private static parseDueAt(text: string, nowMs: number): number | undefined {
-    const lower = text.toLowerCase();
-    const dayMs = 24 * 60 * 60 * 1000;
-    if (/\btoday\b/.test(lower)) return nowMs + 8 * 60 * 60 * 1000;
-    if (/\btomorrow\b/.test(lower)) return nowMs + dayMs;
-    if (/\bthis week\b/.test(lower)) return nowMs + 3 * dayMs;
-    if (/\bnext week\b/.test(lower)) return nowMs + 7 * dayMs;
-
-    const inDaysMatch = lower.match(/\bin\s+(\d{1,2})\s+days?\b/);
-    if (inDaysMatch) {
-      const days = Number(inDaysMatch[1]);
-      if (Number.isFinite(days) && days > 0) return nowMs + days * dayMs;
-    }
-
-    const isoDateMatch = lower.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
-    if (isoDateMatch) {
-      const parsed = Date.parse(
-        `${isoDateMatch[1]}-${isoDateMatch[2]}-${isoDateMatch[3]}T17:00:00`,
-      );
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    return undefined;
   }
 
   private static normalizeText(value: string): string {
@@ -651,14 +562,12 @@ export class RelationshipMemoryService {
                 layer: item.layer,
                 text: cleanedIdentityText,
                 confidence: clamp(Number(item.confidence ?? 0.65), 0, 1),
-                source:
-                  item.source === "feedback" || item.source === "task"
-                    ? item.source
-                    : "conversation",
+                source: this.normalizeSource(item),
                 createdAt: Number(item.createdAt || Date.now()),
                 updatedAt: Number(item.updatedAt || Date.now()),
               };
 
+              if (sanitizedItem.source !== item.source) profileWasSanitized = true;
               if (typeof item.lastTaskId === "string") {
                 sanitizedItem.lastTaskId = item.lastTaskId;
               }
@@ -690,6 +599,19 @@ export class RelationshipMemoryService {
     return normalizedProfile;
   }
 
+  /**
+   * Older builds stored mailbox insights with source "task". Only mailbox writes
+   * ever produced "task" items outside the history layer (task completion writes
+   * history only), so those are re-labelled "mailbox" on load.
+   */
+  private static normalizeSource(item: RelationshipMemoryItem): RelationshipSource {
+    if (item.source === "mailbox" || item.source === "feedback") return item.source;
+    if (item.source === "task") {
+      return item.layer === "context" || item.layer === "commitments" ? "mailbox" : "task";
+    }
+    return "conversation";
+  }
+
   private static save(profile: RelationshipMemoryProfile): void {
     const next: RelationshipMemoryProfile = {
       items: this.sort(profile.items).slice(0, MAX_ITEMS),
@@ -697,6 +619,7 @@ export class RelationshipMemoryService {
     };
 
     this.inMemoryProfile = next;
+    bumpHotMemoryVersion();
     if (!SecureSettingsRepository.isInitialized()) return;
     try {
       const repo = SecureSettingsRepository.getInstance();

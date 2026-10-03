@@ -18,6 +18,10 @@ import { assertResolvedHostAllowed } from "../../security/address-classes";
 import { LLMTool } from "../llm/types";
 import { MemoryService } from "../../memory/MemoryService";
 import { MemoryObservationService } from "../../memory/MemoryObservationService";
+import {
+  isAgentVisiblePrivacyState,
+  sanitizeAgentPrivacyStates,
+} from "../../memory/memory-visibility";
 import { SessionRecallService } from "../../memory/SessionRecallService";
 import { LayeredMemoryIndexService } from "../../memory/LayeredMemoryIndexService";
 import { QuoteRecallService } from "../../memory/QuoteRecallService";
@@ -66,6 +70,16 @@ function topicMemoryEnabled(): boolean {
 
 function verbatimRecallEnabled(): boolean {
   return MemoryFeaturesManager.loadSettings().verbatimRecallEnabled !== false;
+}
+
+/**
+ * Error text for a recall tool that failed. Returning it (instead of an empty
+ * result list) tells the model that recall did not run, so it does not conclude
+ * that nothing was ever recorded (RECALL-3).
+ */
+function recallFailureMessage(tool: string, error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error ?? "unknown error");
+  return `${tool} failed: ${detail.slice(0, 300)}. Recall did not run; do not treat this as "no results".`;
 }
 
 function progressiveRecallEnabled(): boolean {
@@ -1592,6 +1606,8 @@ export class SystemTools {
       path?: string;
     }>;
     totalFound: number;
+    success?: false;
+    error?: string;
   }> {
     this.daemon.logEvent(this.taskId, "tool_call", {
       tool: "search_memories",
@@ -1671,7 +1687,12 @@ export class SystemTools {
         success: false,
         error: String(error),
       });
-      return { results: [], totalFound: 0 };
+      return {
+        success: false,
+        error: recallFailureMessage("search_memories", error),
+        results: [],
+        totalFound: 0,
+      };
     }
   }
 
@@ -1706,7 +1727,8 @@ export class SystemTools {
       query: input.query,
       limit: Math.min(input.limit || 20, 50),
       observationTypes: input.observationTypes,
-      privacyStates: input.privacyStates,
+      // The model may narrow to normal/private, never widen to deleted or redacted rows.
+      privacyStates: sanitizeAgentPrivacyStates(input.privacyStates),
     });
     const mapped = results.map((result) => ({
       id: result.memoryId,
@@ -1794,10 +1816,9 @@ export class SystemTools {
     if (!progressiveRecallEnabled()) {
       throw new Error("Progressive memory recall is disabled in Memory settings.");
     }
-    const details = await MemoryObservationService.details(
-      (input.ids || []).slice(0, 10),
-      this.workspace.id,
-    );
+    const details = (
+      await MemoryObservationService.details((input.ids || []).slice(0, 10), this.workspace.id)
+    ).filter((detail) => isAgentVisiblePrivacyState(detail.privacyState));
     const mapped = details.map((detail) => ({
       id: detail.memoryId,
       title: detail.title,
@@ -1835,6 +1856,8 @@ export class SystemTools {
       seq?: number;
     }>;
     totalFound: number;
+    success?: false;
+    error?: string;
   }> {
     this.daemon.logEvent(this.taskId, "tool_call", {
       tool: "search_sessions",
@@ -1880,7 +1903,12 @@ export class SystemTools {
         success: false,
         error: String(error),
       });
-      return { results: [], totalFound: 0 };
+      return {
+        success: false,
+        error: recallFailureMessage("search_sessions", error),
+        results: [],
+        totalFound: 0,
+      };
     }
   }
 
@@ -1908,6 +1936,8 @@ export class SystemTools {
       memoryType?: string;
     }>;
     totalFound: number;
+    success?: false;
+    error?: string;
   }> {
     this.daemon.logEvent(this.taskId, "tool_call", {
       tool: "search_quotes",
@@ -1964,7 +1994,12 @@ export class SystemTools {
         success: false,
         error: String(error),
       });
-      return { results: [], totalFound: 0 };
+      return {
+        success: false,
+        error: recallFailureMessage("search_quotes", error),
+        results: [],
+        totalFound: 0,
+      };
     }
   }
 
@@ -1977,6 +2012,8 @@ export class SystemTools {
       source: "memory" | "markdown";
     }>;
     totalFound: number;
+    success?: false;
+    error?: string;
   }> {
     this.daemon.logEvent(this.taskId, "tool_call", {
       tool: "memory_topics_load",
@@ -2045,6 +2082,8 @@ export class SystemTools {
         error: String(error),
       });
       return {
+        success: false,
+        error: recallFailureMessage("memory_topics_load", error),
         indexPath: path.relative(
           this.workspace.path,
           LayeredMemoryIndexService.resolveMemoryIndexPath(this.workspace.path),
@@ -2071,6 +2110,8 @@ export class SystemTools {
       sourceMessageCount?: number;
     }>;
     totalFound: number;
+    success?: false;
+    error?: string;
   }> {
     this.daemon.logEvent(this.taskId, "tool_call", {
       tool: "context_grep",
@@ -2123,7 +2164,12 @@ export class SystemTools {
         success: false,
         error: String(error),
       });
-      return { results: [], totalFound: 0 };
+      return {
+        success: false,
+        error: recallFailureMessage("context_grep", error),
+        results: [],
+        totalFound: 0,
+      };
     }
   }
 
@@ -2148,6 +2194,8 @@ export class SystemTools {
         text: string;
       }>;
     } | null;
+    success?: false;
+    error?: string;
   }> {
     this.daemon.logEvent(this.taskId, "tool_call", {
       tool: "context_describe",
@@ -2210,7 +2258,11 @@ export class SystemTools {
         success: false,
         error: String(error),
       });
-      return { result: null };
+      return {
+        success: false,
+        error: recallFailureMessage("context_describe", error),
+        result: null,
+      };
     }
   }
 
@@ -2312,8 +2364,9 @@ export class SystemTools {
                 },
                 privacyStates: {
                   type: "array",
-                  items: { type: "string", enum: ["normal", "private", "redacted", "suppressed"] },
-                  description: "Optional privacy-state filters",
+                  items: { type: "string", enum: ["normal", "private"] },
+                  description:
+                    "Optional privacy-state filters. Deleted and redacted memories are never returned.",
                 },
               },
               required: ["query"],
@@ -2360,6 +2413,11 @@ export class SystemTools {
           },
         ]
       : [];
+    // Point at the progressive recall tools only when they are registered.
+    const progressiveRecallHint =
+      progressiveMemoryTools.length > 0
+        ? " For step-by-step recall of captured observations, use memory_search_index, then memory_timeline or memory_details."
+        : "";
 
     // In headless/VPS mode, avoid exposing tools that require an interactive desktop session.
     // Keep informational tools and memory search available.
@@ -2404,7 +2462,8 @@ export class SystemTools {
             "Search the workspace memory database for past observations, decisions, and insights " +
             "from previous sessions and imported conversations (e.g. ChatGPT history). " +
             "Use this tool when the user asks about something discussed previously, " +
-            "or when you need to recall past context. For deep recall, prefer memory_search_index, memory_timeline, then memory_details.",
+            "or when you need to recall past context." +
+            progressiveRecallHint,
           input_schema: {
             type: "object",
             properties: {
@@ -2717,7 +2776,8 @@ export class SystemTools {
           "for past observations, decisions, insights, and errors from previous sessions " +
           "and imported conversations (e.g. ChatGPT history). " +
           "Use this proactively when starting a task to check for relevant prior context, " +
-          "or when you need to recall past decisions and their rationale. For deep recall, prefer memory_search_index, memory_timeline, then memory_details.",
+          "or when you need to recall past decisions and their rationale." +
+          progressiveRecallHint,
         input_schema: {
           type: "object",
           properties: {

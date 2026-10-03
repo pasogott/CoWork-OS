@@ -3346,6 +3346,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   openaiOAuthStart: (options?: { persist?: boolean }) =>
     ipcRenderer.invoke(IPC_CHANNELS.LLM_OPENAI_OAUTH_START, options),
   openaiOAuthLogout: () => ipcRenderer.invoke(IPC_CHANNELS.LLM_OPENAI_OAUTH_LOGOUT),
+  openaiSiwcStart: () => ipcRenderer.invoke(IPC_CHANNELS.LLM_OPENAI_SIWC_START),
   getBedrockModels: (config?: {
     region?: string;
     accessKeyId?: string;
@@ -4161,9 +4162,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_SAVE_SETTINGS, data),
   searchMemories: (data: { workspaceId: string; query: string; limit?: number }) =>
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_SEARCH, data),
-  getMemoryTimeline: (data: { memoryId: string; windowSize?: number }) =>
+  getMemoryTimeline: (data: { workspaceId: string; memoryId: string; windowSize?: number }) =>
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_GET_TIMELINE, data),
-  getMemoryDetails: (ids: string[]) => ipcRenderer.invoke(IPC_CHANNELS.MEMORY_GET_DETAILS, ids),
+  getMemoryDetails: (data: { workspaceId: string; ids: string[] }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MEMORY_GET_DETAILS, data),
   searchMemoryObservations: (data: MemoryObservationSearchQuery) =>
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_OBSERVATIONS_SEARCH, data),
   getMemoryObservationTimeline: (data: {
@@ -4201,11 +4203,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getMemoryStats: (workspaceId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_GET_STATS, workspaceId),
   clearMemory: (workspaceId: string) => ipcRenderer.invoke(IPC_CHANNELS.MEMORY_CLEAR, workspaceId),
-  onMemoryEvent: (callback: (event: { type: string; workspaceId: string }) => void) => {
-    const subscription = (_: Electron.IpcRendererEvent, data: Any) => callback(data);
-    ipcRenderer.on(IPC_CHANNELS.MEMORY_EVENT, subscription);
-    return () => ipcRenderer.removeListener(IPC_CHANNELS.MEMORY_EVENT, subscription);
-  },
 
   // Imported Memory APIs
   getImportedMemoryStats: (workspaceId: string) =>
@@ -6490,6 +6487,13 @@ export interface ElectronAPI {
     };
   }>;
   openaiOAuthLogout: () => Promise<{ success: boolean }>;
+  /** Official Sign in with ChatGPT; persists the session on success. */
+  openaiSiwcStart: () => Promise<{
+    success: boolean;
+    error?: string;
+    email?: string;
+    recommendedModel?: string;
+  }>;
   getBedrockModels: (config?: {
     region?: string;
     accessKeyId?: string;
@@ -7751,10 +7755,11 @@ export interface ElectronAPI {
     limit?: number;
   }) => Promise<MemorySearchResult[]>;
   getMemoryTimeline: (data: {
+    workspaceId: string;
     memoryId: string;
     windowSize?: number;
   }) => Promise<MemoryTimelineEntry[]>;
-  getMemoryDetails: (ids: string[]) => Promise<Memory[]>;
+  getMemoryDetails: (data: { workspaceId: string; ids: string[] }) => Promise<Memory[]>;
   searchMemoryObservations: (
     data: MemoryObservationSearchQuery,
   ) => Promise<MemoryObservationSearchResult[]>;
@@ -7794,8 +7799,13 @@ export interface ElectronAPI {
   getMemoryObservationBackfillStatus: () => Promise<MemoryObservationBackfillStatus>;
   getRecentMemories: (data: { workspaceId: string; limit?: number }) => Promise<Memory[]>;
   getMemoryStats: (workspaceId: string) => Promise<MemoryStats>;
-  clearMemory: (workspaceId: string) => Promise<{ success: boolean }>;
-  onMemoryEvent: (callback: (event: { type: string; workspaceId: string }) => void) => () => void;
+  clearMemory: (workspaceId: string) => Promise<{
+    success: boolean;
+    /** Rows/files removed per memory store (see MemoryWorkspacePurgeService). */
+    counts?: Record<string, number>;
+    errors?: Record<string, string>;
+    notes?: string[];
+  }>;
 
   // Imported Memories
   getImportedMemoryStats: (workspaceId: string) => Promise<{ count: number; totalTokens: number }>;

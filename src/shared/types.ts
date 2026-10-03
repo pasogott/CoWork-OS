@@ -47,6 +47,8 @@ export interface AppearanceSettings {
 }
 
 // Tray (Menu Bar) Settings
+export type DesktopNotificationStyle = "system" | "near-dock";
+
 export interface TraySettings {
   enabled: boolean;
   showDockIcon: boolean;
@@ -54,6 +56,7 @@ export interface TraySettings {
   closeToTray: boolean;
   showNotifications: boolean;
   showApprovalSavedNotifications: boolean;
+  notificationStyle?: DesktopNotificationStyle;
 }
 
 // Global memory feature toggles (applies across workspaces)
@@ -70,8 +73,6 @@ export interface MemoryFeaturesSettings {
   wakeUpLayersEnabled?: boolean;
   /** Track KG edge validity windows and time-aware historical recall. */
   temporalKnowledgeEnabled?: boolean;
-  /** Rebuild execution prompts from explicit prompt-stack layers. */
-  promptStackV2Enabled?: boolean;
   /** Serve memory via file-backed index/topic layers under `.cowork/memory/`. */
   layeredMemoryEnabled?: boolean;
   /** Persist append-only transcript spans and lightweight checkpoints. */
@@ -80,20 +81,12 @@ export interface MemoryFeaturesSettings {
   durableContextEnabled?: boolean;
   /** Rollout mode for durable context. */
   durableContextMode?: "off" | "experimental" | "on";
-  /** Fraction of model context that should trigger durable compaction. */
-  durableContextThreshold?: number;
-  /** Number of recent messages protected from durable compaction. */
-  durableContextFreshTailCount?: number;
   /** Token threshold above which large payloads should be stored by reference. */
   durableContextLargePayloadThreshold?: number;
-  /** Optional model override key for durable context summaries. */
-  durableContextSummaryModel?: string;
   /** Run background memory consolidation after meaningful task activity. */
   backgroundConsolidationEnabled?: boolean;
   /** Route execution turns through the extracted query orchestrator. */
   queryOrchestratorEnabled?: boolean;
-  /** Enable session lineage metadata and session forking flows. */
-  sessionLineageEnabled?: boolean;
   /** Keep a small curated hot-memory layer always available for prompt injection. */
   curatedMemoryEnabled?: boolean;
   /** Allow transcript/session recall as an explicit tool surface. */
@@ -1883,6 +1876,25 @@ export const TOOL_GROUPS = {
     "search_sessions",
     "memory_topics_load",
     "email_imap_unread",
+    // Recall over the archive, verbatim task messages, durable context and the
+    // knowledge graph. These were missing here, which let group/public gateway
+    // chats search private (and imported cross-workspace) memory. (SEC-4)
+    "search_memories",
+    "search_quotes",
+    "context_grep",
+    "context_describe",
+    "kg_search",
+    "kg_get_neighbors",
+    "kg_get_subgraph",
+    // Knowledge-graph writes: a shared chat must not be able to plant or erase
+    // facts in the owner's graph either.
+    "kg_create_entity",
+    "kg_update_entity",
+    "kg_delete_entity",
+    "kg_create_edge",
+    "kg_delete_edge",
+    "kg_invalidate_edge",
+    "kg_add_observation",
   ],
   // Image generation - requires API access
   "group:image": ["generate_image"],
@@ -1891,6 +1903,27 @@ export const TOOL_GROUPS = {
 } as const;
 
 export type ToolGroupName = keyof typeof TOOL_GROUPS;
+
+/**
+ * Tools that persist or erase long-term memory (local archive, curated memory,
+ * Supermemory, knowledge graph). They do not touch workspace files, so they are
+ * not in group:write, but they are still writes: read-only lanes (plan/analyze
+ * modes, verifier/researcher workers) must deny them like any other mutation.
+ * (SEC-12)
+ */
+export const MEMORY_WRITE_TOOL_NAMES: readonly string[] = [
+  "memory_save",
+  "memory_curate",
+  "supermemory_remember",
+  "supermemory_forget",
+  "kg_create_entity",
+  "kg_update_entity",
+  "kg_delete_entity",
+  "kg_create_edge",
+  "kg_delete_edge",
+  "kg_invalidate_edge",
+  "kg_add_observation",
+];
 
 /**
  * Maps each tool to its risk level
@@ -5420,7 +5453,19 @@ export type CoreMemoryCandidateType =
   | "ignored_noise"
   | "invalidates_prior";
 
-export type CoreMemoryCandidateStatus = "proposed" | "accepted" | "rejected" | "merged";
+/**
+ * Candidate lifecycle. `applied` means the distiller wrote it to memory (exactly once);
+ * `skipped` means it could not be written (for example no workspace); `dismissed` means an
+ * unreviewed candidate expired.
+ */
+export type CoreMemoryCandidateStatus =
+  | "proposed"
+  | "accepted"
+  | "rejected"
+  | "merged"
+  | "applied"
+  | "skipped"
+  | "dismissed";
 
 export interface CoreTrace {
   id: string;
@@ -8300,7 +8345,6 @@ export interface EverydayRetentionSettings {
   receiptsDays: number;
   previewsDays: number;
   connectorCacheDays: number;
-  memoryCandidateDays: number;
   routineProvenanceDays: number;
 }
 
@@ -8588,7 +8632,6 @@ export const DEFAULT_EVERYDAY_AGENT_PROFILE: EverydayAgentProfile = {
     receiptsDays: 180,
     previewsDays: 30,
     connectorCacheDays: 30,
-    memoryCandidateDays: 90,
     routineProvenanceDays: 180,
   },
   browserProfilePolicy: {
@@ -9157,6 +9200,7 @@ export const IPC_CHANNELS = {
   LLM_DISCOVER_ATOMIC_CHAT_MODELS: "llm:discoverAtomicChatModels",
   LLM_OPENAI_OAUTH_START: "llm:openaiOAuthStart",
   LLM_OPENAI_OAUTH_LOGOUT: "llm:openaiOAuthLogout",
+  LLM_OPENAI_SIWC_START: "llm:openaiSiwcStart",
   LLM_GET_BEDROCK_MODELS: "llm:getBedrockModels",
   LLM_GET_PROVIDER_MODELS: "llm:getProviderModels",
 
@@ -9616,7 +9660,6 @@ export const IPC_CHANNELS = {
   MEMORY_GET_RECENT: "memory:getRecent",
   MEMORY_GET_STATS: "memory:getStats",
   MEMORY_CLEAR: "memory:clear",
-  MEMORY_EVENT: "memory:event",
   MEMORY_OBSERVATIONS_SEARCH: "memoryObservations:search",
   MEMORY_OBSERVATIONS_TIMELINE: "memoryObservations:timeline",
   MEMORY_OBSERVATIONS_DETAILS: "memoryObservations:details",
@@ -10147,6 +10190,20 @@ export interface LLMSettingsData {
     authMethod?: "api_key" | "oauth";
     /** ChatGPT plan from the sign-in token ("free", "go", "plus", ...), used for default models. */
     chatgptPlanType?: string;
+    /**
+     * Which ChatGPT sign-in produced the OAuth tokens: "siwc" is the official
+     * Sign in with ChatGPT flow (public Responses API); unset/"codex" is the legacy
+     * Codex-client flow (chatgpt.com backend).
+     */
+    oauthVariant?: "codex" | "siwc";
+    /** Stable opaque SIWC host identifier (`urn:uuid:...`); kept across sign-outs. */
+    siwcHostId?: string;
+    /** Issued SIWC client ID (`oaiapp_...`) bound to `siwcSubject`; kept across sign-outs. */
+    siwcClientId?: string;
+    /** Validated ID-token `sub` for the SIWC registration. */
+    siwcSubject?: string;
+    /** Last SIWC ID token, used only as `id_token_hint` on reauthorization. */
+    siwcIdToken?: string;
   } & Omit<ProviderRoutingSettings, "reasoningEffort">;
   azure?: {
     apiKey?: string;

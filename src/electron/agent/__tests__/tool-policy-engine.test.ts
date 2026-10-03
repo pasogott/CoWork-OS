@@ -19,6 +19,42 @@ describe("tool-policy-engine background process tools", () => {
   });
 });
 
+describe("tool-policy-engine memory writes (SEC-12)", () => {
+  const MEMORY_WRITES = [
+    "memory_save",
+    "memory_curate",
+    "supermemory_remember",
+    "supermemory_forget",
+    "kg_create_entity",
+    "kg_update_entity",
+    "kg_delete_entity",
+    "kg_create_edge",
+    "kg_delete_edge",
+    "kg_invalidate_edge",
+    "kg_add_observation",
+  ];
+
+  it.each(MEMORY_WRITES)("denies %s in plan and analyze modes", (tool) => {
+    expect(evaluateToolPolicy(tool, { executionMode: "plan" }).decision).toBe("deny");
+    expect(evaluateToolPolicy(tool, { executionMode: "analyze" }).decision).toBe("deny");
+    expect(evaluateToolPolicy(tool, { executionMode: "execute" }).decision).toBe("allow");
+  });
+
+  it.each([
+    "search_memories",
+    "search_quotes",
+    "memory_search_index",
+    "memory_details",
+    "memory_curated_read",
+    "supermemory_search",
+    "kg_search",
+    "kg_get_neighbors",
+  ])("keeps memory read %s allowed in plan and analyze modes", (tool) => {
+    expect(evaluateToolPolicy(tool, { executionMode: "plan" }).decision).toBe("allow");
+    expect(evaluateToolPolicy(tool, { executionMode: "analyze" }).decision).toBe("allow");
+  });
+});
+
 describe("tool-policy-engine request_user_input gating", () => {
   it.each(["auto", "code", "operations"] as const)(
     "requires shell for execute_code in %s",
@@ -328,11 +364,20 @@ describe("evaluateToolAvailability exact MCP references", () => {
     recentlyUsedTools: undefined as Iterable<string> | undefined,
   };
 
-  it("allows only the currently evaluated MCP tool when its exact name is requested", () => {
+  it("makes connected MCP tools discoverable without restricting them to named tools", () => {
     expect(evaluateToolAvailability("mcp_qa_echo", baseCtx).decision).toBe("allow");
-    expect(evaluateToolAvailability("mcp_qa_admin_reset", baseCtx).decision).toBe("defer");
-    expect(evaluateToolAvailability("mcp_qa_echo_extra", baseCtx).decision).toBe("defer");
+    expect(evaluateToolAvailability("mcp_qa_admin_reset", baseCtx).decision).toBe("allow");
+    expect(evaluateToolAvailability("mcp_qa_echo_extra", baseCtx).decision).toBe("allow");
   });
+
+  it.each(["İşçinin ücret alacağı zamanaşımı hakkında karar bul.", "Find relevant case law.", ""])(
+    "exposes MCP tools for ordinary requests: %s",
+    (taskText) => {
+      expect(
+        evaluateToolAvailability("mcp_search_yargitay", { ...baseCtx, taskText }).decision,
+      ).toBe("allow");
+    },
+  );
 });
 
 describe("evaluateToolAvailability open_application", () => {
@@ -471,4 +516,26 @@ describe("Messages app intent", () => {
   ])("recognizes an explicit Messages app request: %s", (text) => {
     expect(hasNativeDesktopGuiIntent(text)).toBe(true);
   });
+});
+
+describe("tool-policy-engine memory recall lane", () => {
+  it.each(["memory_search_index", "memory_timeline", "memory_details"])(
+    "exposes %s in the memory lane without system wording",
+    (tool) => {
+      const result = evaluateToolAvailability(tool, {
+        taskText: "Fix the failing login test we discussed last week",
+      });
+      expect(result.decision).toBe("allow");
+      expect(result.metadata.lane).toBe("memory");
+    },
+  );
+
+  it.each(["kg_search", "kg_get_neighbors", "kg_get_subgraph"])(
+    "puts knowledge-graph read %s in the memory lane",
+    (tool) => {
+      const result = evaluateToolAvailability(tool, { taskText: "Who owns the billing service?" });
+      expect(result.metadata.lane).toBe("memory");
+      expect(result.decision).toBe("allow");
+    },
+  );
 });

@@ -6,10 +6,10 @@
  */
 
 import { WorkspaceRepository } from "../database/repository-facades";
+import { isSafeExcludedPattern } from "./excluded-patterns";
 import { MemoryEmbeddingRepository, MemoryRepository } from "../database/repository-facades";
 import { MemorySettingsRepository, MemorySummaryRepository } from "../database/repository-facades";
 import { createMemoryStatementPort, type MemoryStatementPort } from "./memory-statement-port";
-import { EventEmitter } from "events";
 import { isGeneratedPlaybookContent } from "./playbook-markers";
 import { randomUUID } from "crypto";
 import type { DatabaseManager } from "../database/schema";
@@ -23,7 +23,8 @@ import {
   onMemoryEmbeddingChange,
 } from "../database/repositories";
 import type { MemoryEmbeddingRow } from "../database/memory-embedding-sql";
-import type { CapturedMemoryWrite } from "./memory-capture-sql";
+import type { CapturedMemoryResult, CapturedMemoryWrite } from "./memory-capture-sql";
+import { observationContentHash } from "./memory-observation-sql";
 import { LLMProviderFactory } from "../agent/llm";
 import { recordLlmCallError, recordLlmCallSuccess } from "../agent/llm/usage-telemetry";
 import { estimateTokens } from "../agent/context-manager";
@@ -42,31 +43,11 @@ import type { CoreMemoryScopeKind } from "../../shared/types";
 import { MemoryFeaturesManager } from "../settings/memory-features-manager";
 import { createLogger } from "../utils/logger";
 import { containsNoMemoryDirective } from "./no-memory-directive";
+import { redactSecrets } from "./sensitive-content";
+import { neutralizeReservedImportPrefix } from "./memory-visibility";
 
-// Privacy patterns to exclude - matches common sensitive data patterns
-const SENSITIVE_PATTERNS = [
-  /api[_-]?key/i,
-  /secret/i,
-  /password/i,
-  /passwd/i,
-  /token/i,
-  /credential/i,
-  /auth/i,
-  /bearer\s+[a-zA-Z0-9\-_]+/i,
-  /ssh[_-]?key/i,
-  /private[_-]?key/i,
-  /\.env/i,
-  /aws[_-]?access/i,
-  /aws[_-]?secret/i,
-  /-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----/i,
-  /ghp_[a-zA-Z0-9]+/i, // GitHub personal access token
-  /gho_[a-zA-Z0-9]+/i, // GitHub OAuth token
-  /sk-[a-zA-Z0-9]+/i, // OpenAI API key format
-  /xox[baprs]-[a-zA-Z0-9-]+/i, // Slack tokens
-];
-
-// Events for reactive updates
-const memoryEvents = new EventEmitter();
+// Secret values are redacted before storage by `redactSecrets` (./sensitive-content);
+// merely mentioning auth, tokens or `.env` no longer hides a memory.
 
 // Minimum tokens before compression is worthwhile
 const MIN_TOKENS_FOR_COMPRESSION = 100;
@@ -89,13 +70,12 @@ const MAX_COMPRESSION_RETRIES = 3;
 const MAX_TEXT_IMPORT_ENTRIES = 3000;
 const MAX_TEXT_IMPORT_ENTRY_CHARS = 12000;
 const PROMPT_RECALL_IGNORE_MARKER = "[cowork:prompt_recall=ignore]";
-const HEARTBEAT_BATCH_WINDOW_MS = 5 * 60 * 1000;
+const COMPRESSION_BATCH_WINDOW_MS = 5 * 60 * 1000;
 const LOCAL_SUMMARY_MAX_CHARS = 220;
 const logger = createLogger("MemoryService");
 
 type MemoryCaptureOrigin =
   | "task"
-  | "heartbeat"
   | "tool"
   | "chronicle"
   | "playbook"
@@ -118,7 +98,11 @@ export interface MemoryCaptureOptions {
   scopeKind?: CoreMemoryScopeKind;
   scopeRef?: string;
   skipMemoryWriteGate?: boolean;
-  /** Allow an explicit, user-enabled source sync to write even when auto-capture is off. */
+  /**
+   * Allow an explicit write to proceed when auto-capture is off: a user-enabled source
+   * sync, or an explicit agent save (`memory_save`). Auto-capture only governs automatic
+   * archiving of task activity.
+   */
   forceCapture?: boolean;
   /** Permit the optional external-memory mirror for this capture. */
   allowExternalMirror?: boolean;
@@ -238,6 +222,8 @@ export class MemoryService {
     this.settingsRepo = new MemorySettingsRepository(db);
     this.markdownIndex = new MarkdownMemoryIndexService(db);
     MemoryObservationService.initialize(db);
+    // Inspector edits (delete, redact, privacy changes) must not be served from cache.
+    MemoryObservationService.onVisibilityChanged(() => this.clearPromptRecallCache());
     this.initialized = true;
 
     // Start periodic cleanup
@@ -246,7 +232,53 @@ export class MemoryService {
       void this.runCleanup();
     }, CLEANUP_INTERVAL_MS);
 
+    this.scheduleArchiveCleanupMigration();
+
     logger.info("[MemoryService] Initialized");
+  }
+
+  private static archiveCleanupTimer?: ReturnType<typeof setTimeout>;
+  private static readonly ARCHIVE_CLEANUP_DELAY_MS = 90_000;
+
+  /**
+   * The one-time archive cleanup (MemoryCleanupMigration) runs well after startup so it
+   * never competes with the first task; it records a marker and is a no-op afterwards.
+   */
+  private static scheduleArchiveCleanupMigration(): void {
+    if (this.archiveCleanupTimer) return;
+    this.archiveCleanupTimer = setTimeout(() => {
+      this.archiveCleanupTimer = undefined;
+      void this.runArchiveCleanupMigration();
+    }, MemoryService.ARCHIVE_CLEANUP_DELAY_MS);
+    this.archiveCleanupTimer.unref?.();
+  }
+
+  /** Run the one-time archive cleanup now (idempotent); exposed for tests and tooling. */
+  static async runArchiveCleanupMigration(): Promise<void> {
+    const db = this.db;
+    if (!this.initialized || !db) return;
+    try {
+      const { runMemoryCleanupMigration } = await import("./MemoryCleanupMigration");
+      const result = await runMemoryCleanupMigration(db, {
+        yieldBetweenPhases: () => new Promise((resolve) => setImmediate(resolve)),
+      });
+      if (!result.ran) return;
+      logger.info("[MemoryService] Archive cleanup migration completed", result.counts);
+      if (result.memoryIds.length > 0) {
+        this.ftsWorker?.invalidateEmbeddings({ kind: "memories", memoryIds: result.memoryIds });
+      }
+      for (const workspaceId of result.workspaceIds) {
+        this.memoryEmbeddingsByWorkspace.delete(workspaceId);
+        this.embeddingsLoadedForWorkspace.delete(workspaceId);
+        this.embeddingBackfillInProgress.delete(workspaceId);
+        this.storageEstimateByWorkspace.delete(workspaceId);
+      }
+      for (const memoryId of result.memoryIds) this.importedEmbeddings.delete(memoryId);
+      this.embeddingCacheGeneration += 1;
+      this.promptRecallCache.clear();
+    } catch (error) {
+      logger.warn("[MemoryService] Archive cleanup migration failed:", error);
+    }
   }
 
   /** The profile database, for narrow indexes kept beside memories (Playbook evidence). */
@@ -306,36 +338,6 @@ export class MemoryService {
     }
   }
 
-  static async getRecentWorkspaceMarkdownSnippets(
-    workspaceId: string,
-    workspacePath: string,
-    limit = 3,
-    readGuard?: MarkdownMemoryReadGuard,
-  ): Promise<MemorySearchResult[]> {
-    this.ensureInitialized();
-    if (!this.markdownIndex) return [];
-    try {
-      return await this.markdownIndex.getRecentSnippets(
-        workspaceId,
-        workspacePath,
-        limit,
-        readGuard,
-      );
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Subscribe to memory events
-   */
-  static onMemoryChanged(
-    callback: (data: { type: string; workspaceId: string }) => void,
-  ): () => void {
-    memoryEvents.on("memoryChanged", callback);
-    return () => memoryEvents.off("memoryChanged", callback);
-  }
-
   /**
    * Capture an observation from task execution
    */
@@ -364,20 +366,22 @@ export class MemoryService {
       return null;
     }
 
+    const compressionOrigin = options?.origin ?? (taskId ? "task" : "unknown");
     const privacyPrepared = this.applyInlinePrivacy(content);
+    // Secret values never reach storage; the rest of the text is kept.
+    privacyPrepared.content = redactSecrets(privacyPrepared.content).text;
+    // Only importers may write rows that read as imported (those are global).
+    if (compressionOrigin !== "import") {
+      privacyPrepared.content = neutralizeReservedImportPrefix(privacyPrepared.content);
+    }
 
     // Check excluded patterns
     if (this.shouldExclude(privacyPrepared.content, settings)) {
       return null;
     }
 
-    // Check for sensitive content
-    const containsSensitive = this.containsSensitiveData(privacyPrepared.content);
     const finalIsPrivate =
-      isPrivate ||
-      privacyPrepared.hadPrivateBlock ||
-      containsSensitive ||
-      settings.privacyMode === "strict";
+      isPrivate || privacyPrepared.hadPrivateBlock || settings.privacyMode === "strict";
 
     // Estimate tokens
     const tokens = estimateTokens(privacyPrepared.content);
@@ -388,7 +392,6 @@ export class MemoryService {
         ? privacyPrepared.content.slice(0, 10000) + "\n[... truncated]"
         : privacyPrepared.content;
 
-    const compressionOrigin = options?.origin ?? (taskId ? "task" : "unknown");
     if (!options?.skipMemoryWriteGate) {
       const gate = await MemoryWriteGate.evaluate({
         workspaceId,
@@ -442,7 +445,6 @@ export class MemoryService {
       compressionOrigin,
       memory.createdAt,
       options?.batchKey,
-      options?.signalFamily,
     );
 
     // Best-effort: keep a concise local summary immediately so retrieval and prompts
@@ -489,7 +491,7 @@ export class MemoryService {
       }
     }
 
-    await this.writeCapture({
+    const captureResult = await this.writeCapture({
       memory: {
         id: memory.id,
         workspaceId,
@@ -505,7 +507,16 @@ export class MemoryService {
       },
       ...(embedding ? { embedding } : {}),
       ...(observation ? { observation } : {}),
+      // An identical capture inside the retention window is not stored again (DATA-2).
+      dedupe: {
+        contentHash: observationContentHash(truncatedContent),
+        since: createdAt - Math.max(1, settings.retentionDays || 0) * 24 * 60 * 60 * 1000,
+      },
     });
+    if (captureResult?.duplicateOf) {
+      const existing = await this.memoryRepo.findById(captureResult.duplicateOf);
+      if (existing) return existing;
+    }
     if (embedding) {
       this.cacheEmbedding(workspaceId, memory.id, embedding.values, embedding.updatedAt);
     }
@@ -534,9 +545,6 @@ export class MemoryService {
     } else {
       this.recordCompressionDiagnostic(workspaceId, compressionOrigin, "skipped");
     }
-
-    // Emit event
-    memoryEvents.emit("memoryChanged", { type: "created", workspaceId });
 
     if (
       !finalIsPrivate &&
@@ -592,7 +600,9 @@ export class MemoryService {
     limit = 20,
   ): Promise<MemorySearchResult[]> {
     this.ensureInitialized();
-    const results = await this.searchInternal(workspaceId, query, limit);
+    const results = await this.withoutHiddenMemories(
+      await this.searchInternal(workspaceId, query, limit),
+    );
     if (this.sql && results.length > 0) {
       // Best-effort bookkeeping; it logs its own failures and never delays the search.
       void MemoryTierService.recordReferenceBatch(
@@ -659,9 +669,14 @@ export class MemoryService {
         importedEmbeddings: this.importedEmbeddings.entries(),
       });
       if ("results" in plan) return plan.results as MemorySearchResult[];
-      return plan.rank(
-        await this.memoryRepo.getFullDetails(plan.candidateIds),
-      ) as MemorySearchResult[];
+      // Semantic candidates come from embedding caches that do not track privacy: keep
+      // this workspace's rows and other workspaces' non-private imported rows only.
+      const details = (await this.memoryRepo.getFullDetails(plan.candidateIds)).filter(
+        (memory) =>
+          memory.workspaceId === workspaceId ||
+          (!memory.isPrivate && this.isImportedMemoryContent(memory.content)),
+      );
+      return plan.rank(details) as MemorySearchResult[];
     } catch {
       return this.mergeLexicalOnly(lexicalLocal, lexicalImportedGlobal, limit);
     }
@@ -671,7 +686,6 @@ export class MemoryService {
     switch (origin) {
       case "tool":
         return "agent_tool";
-      case "heartbeat":
       case "proactive":
         return "background";
       case "system":
@@ -848,17 +862,18 @@ export class MemoryService {
    * one host transaction. Neither path goes through the embedding repository, so the FTS
    * worker's cache is told about the new embedding here.
    */
-  private static async writeCapture(write: CapturedMemoryWrite): Promise<void> {
+  private static async writeCapture(
+    write: CapturedMemoryWrite,
+  ): Promise<CapturedMemoryResult | undefined> {
     const { getDatabaseClient } = await import("../database/async/runtime");
     const client = await getDatabaseClient();
-    if (client) {
-      await client.execute("memory.capture", { write });
-    } else {
-      await this.memoryRepo.insertCaptured(write);
-    }
-    if (write.embedding) {
+    const result: CapturedMemoryResult | undefined = client
+      ? await client.execute("memory.capture", { write })
+      : await this.memoryRepo.insertCaptured(write);
+    if (write.embedding && !result?.duplicateOf) {
       this.ftsWorker?.invalidateEmbeddings({ kind: "memories", memoryIds: [write.memory.id] });
     }
+    return result;
   }
 
   private static normalizeForEmbedding(summary: string | undefined, content: string): string {
@@ -1012,14 +1027,6 @@ export class MemoryService {
   }
 
   /**
-   * Get memories for a specific task
-   */
-  static async getByTask(taskId: string): Promise<Memory[]> {
-    this.ensureInitialized();
-    return this.memoryRepo.findByTask(taskId);
-  }
-
-  /**
    * Get recent memories for a workspace
    */
   static async getRecent(workspaceId: string, limit = 20): Promise<Memory[]> {
@@ -1027,9 +1034,14 @@ export class MemoryService {
     return this.memoryRepo.getRecentForWorkspace(workspaceId, limit, true);
   }
 
+  /**
+   * Recent memories injected into prompts. Private rows are excluded (they are shown on
+   * request through search tools, not pushed into every turn), as are suppressed and
+   * redacted rows.
+   */
   static async getRecentForPromptRecall(workspaceId: string, limit = 20): Promise<Memory[]> {
     this.ensureInitialized();
-    const recent = await this.memoryRepo.getRecentForWorkspace(workspaceId, limit, true);
+    const recent = await this.memoryRepo.getRecentForWorkspace(workspaceId, limit, false);
     const suppressed = await MemoryObservationService.suppressedIds(recent.map((m) => m.id));
     return recent.filter(
       (memory) =>
@@ -1054,6 +1066,7 @@ export class MemoryService {
       details
         .filter(
           (memory) =>
+            memory.isPrivate ||
             this.isPromptRecallIgnoredContent(memory.content) ||
             isGeneratedPlaybookContent(memory.content) ||
             suppressed.has(memory.id),
@@ -1193,6 +1206,13 @@ export class MemoryService {
     this.promptRecallCache.clear();
   }
 
+  /** Drop results whose observation is suppressed (deleted) or redacted. */
+  private static async withoutHiddenMemories<T extends { id: string }>(results: T[]): Promise<T[]> {
+    if (results.length === 0) return results;
+    const hidden = await MemoryObservationService.suppressedIds(results.map((r) => r.id));
+    return hidden.size === 0 ? results : results.filter((r) => !hidden.has(r.id));
+  }
+
   static getPromptRecallDiagnostics(): PromptRecallDiagnostics {
     return { ...this.promptRecallDiagnostics };
   }
@@ -1257,13 +1277,82 @@ export class MemoryService {
         `Memory search is unavailable: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    results = await this.withoutHiddenMemories(results);
     if (results.length > 0 && this.sql) {
-      await MemoryTierService.recordReferenceBatch(
+      // Best-effort bookkeeping; it logs its own failures and never delays the search.
+      void MemoryTierService.recordReferenceBatch(
         this.sql,
         results.map((r) => r.id),
       );
     }
     return results;
+  }
+
+  /**
+   * Memory search for the daily briefing (audit SEC-14). The briefing can be delivered to
+   * a channel, so it only sees this workspace's own rows that are neither private nor
+   * suppressed / redacted: no imported rows from other workspaces, no private rows. It
+   * records no references (a briefing is not a use of the memory).
+   */
+  static async searchForBriefingAsync(
+    workspaceId: string,
+    query: string,
+    limit = 5,
+  ): Promise<Array<MemorySearchResult & { workspaceId: string }>> {
+    this.ensureInitialized();
+    const candidateLimit = Math.max(limit * 3, 10);
+    const candidates = this.ftsWorker
+      ? await this.ftsWorker.hybridSearch(workspaceId, query, candidateLimit, true)
+      : await this.searchInternal(workspaceId, query, candidateLimit);
+    const visible = await this.withoutHiddenMemories(candidates);
+    if (visible.length === 0) return [];
+    const details = new Map(
+      (await this.memoryRepo.getFullDetails(visible.map((result) => result.id))).map((memory) => [
+        memory.id,
+        memory,
+      ]),
+    );
+    return visible
+      .filter((result) => {
+        const memory = details.get(result.id);
+        return Boolean(memory && memory.workspaceId === workspaceId && !memory.isPrivate);
+      })
+      .slice(0, limit)
+      .map((result) => ({ ...result, workspaceId }));
+  }
+
+  private static pendingPromptReferences = new Set<string>();
+  private static promptReferenceFlushTimer?: ReturnType<typeof setTimeout>;
+  private static readonly PROMPT_REFERENCE_FLUSH_DELAY_MS = 2_000;
+
+  /**
+   * Count a reference for memories actually injected into a prompt (audit DATA-1), so
+   * retention and tier promotion see memories that recall keeps using. Ids are batched
+   * into one UPDATE of reference_count / last_referenced_at; that update touches neither
+   * content nor summary, so it does not rewrite the FTS index.
+   */
+  static recordPromptInjection(memoryIds: Iterable<string>): void {
+    for (const id of memoryIds) {
+      if (typeof id === "string" && id) this.pendingPromptReferences.add(id);
+    }
+    if (this.pendingPromptReferences.size === 0 || this.promptReferenceFlushTimer) return;
+    this.promptReferenceFlushTimer = setTimeout(() => {
+      this.promptReferenceFlushTimer = undefined;
+      void this.flushPromptReferences();
+    }, MemoryService.PROMPT_REFERENCE_FLUSH_DELAY_MS);
+    this.promptReferenceFlushTimer.unref?.();
+  }
+
+  /** Write the pending prompt-injection references now. */
+  static async flushPromptReferences(): Promise<void> {
+    if (this.promptReferenceFlushTimer) {
+      clearTimeout(this.promptReferenceFlushTimer);
+      this.promptReferenceFlushTimer = undefined;
+    }
+    const ids = [...this.pendingPromptReferences];
+    this.pendingPromptReferences.clear();
+    if (ids.length === 0 || !this.sql) return;
+    await MemoryTierService.recordReferenceBatch(this.sql, ids);
   }
 
   static async getContextForInjectionAsync(
@@ -1299,6 +1388,10 @@ export class MemoryService {
     if (recentMemories.length === 0 && relevantMemories.length === 0) {
       return "";
     }
+    this.recordPromptInjection([
+      ...recentMemories.map((memory) => memory.id),
+      ...relevantMemories.map((memory) => memory.id),
+    ]);
 
     const parts: string[] = ["<memory_context>"];
     parts.push("The following memories from previous sessions may be relevant:");
@@ -1363,76 +1456,6 @@ export class MemoryService {
   }
 
   /**
-   * Get context for injection at task start
-   * Returns a formatted string suitable for system prompt
-   */
-  static async getContextForInjection(workspaceId: string, taskPrompt: string): Promise<string> {
-    this.ensureInitialized();
-    const featureSettings = MemoryFeaturesManager.loadSettings();
-    if (featureSettings.defaultArchiveInjectionEnabled !== true) {
-      return "";
-    }
-
-    const settings = await this.settingsRepo.getOrCreate(workspaceId);
-    if (!settings.enabled) {
-      return "";
-    }
-
-    // Get recent memories (summaries preferred)
-    // Include private memories — they are private from external sharing, not from local agent context
-    const recentMemories = await this.getRecentForPromptRecall(workspaceId, 5);
-
-    // Search for relevant memories based on task prompt
-    let relevantMemories: MemorySearchResult[] = [];
-    if (taskPrompt && taskPrompt.length > 10) {
-      try {
-        const query = taskPrompt.slice(0, 2500);
-        relevantMemories = await this.searchForPromptRecallFast(workspaceId, query, 10);
-
-        // Filter out memories that are already in recent
-        const recentIds = new Set(recentMemories.map((m) => m.id));
-        relevantMemories = relevantMemories.filter((m) => !recentIds.has(m.id)).slice(0, 7);
-      } catch {
-        // Search failed, continue without relevant memories
-      }
-    }
-
-    if (recentMemories.length === 0 && relevantMemories.length === 0) {
-      return "";
-    }
-
-    const parts: string[] = ["<memory_context>"];
-    parts.push("The following memories from previous sessions may be relevant:");
-
-    // Add recent memories (summaries only for token efficiency)
-    if (recentMemories.length > 0) {
-      parts.push("\n## Recent Activity");
-      for (const memory of recentMemories) {
-        const rawText = memory.summary || this.truncate(memory.content, 150);
-        // Sanitize memory content to prevent injection via stored memories
-        const text = InputSanitizer.sanitizeMemoryContent(rawText);
-        const date = new Date(memory.createdAt).toLocaleDateString();
-        parts.push(`- [${memory.type}] (${date}) ${text}`);
-      }
-    }
-
-    // Add relevant memories (hybrid semantic + lexical)
-    if (relevantMemories.length > 0) {
-      parts.push("\n## Relevant to Current Task (Hybrid Recall)");
-      for (const result of relevantMemories) {
-        const date = new Date(result.createdAt).toLocaleDateString();
-        // Sanitize memory content to prevent injection via stored memories
-        const sanitizedSnippet = InputSanitizer.sanitizeMemoryContent(result.snippet);
-        parts.push(`- [${result.type}] (${date}) ${sanitizedSnippet}`);
-      }
-    }
-
-    parts.push("</memory_context>");
-
-    return parts.join("\n");
-  }
-
-  /**
    * Get or create settings for a workspace
    */
   static async getSettings(workspaceId: string): Promise<MemorySettings> {
@@ -1449,7 +1472,6 @@ export class MemoryService {
   ): Promise<void> {
     this.ensureInitialized();
     await this.settingsRepo.update(workspaceId, updates);
-    memoryEvents.emit("memoryChanged", { type: "settingsUpdated", workspaceId });
   }
 
   /**
@@ -1499,7 +1521,7 @@ export class MemoryService {
     this.embeddingsLoadedForWorkspace.delete(workspaceId);
     this.embeddingCacheGeneration += 1;
     this.embeddingBackfillInProgress.delete(workspaceId);
-    memoryEvents.emit("memoryChanged", { type: "importedEntryDeleted", workspaceId });
+    this.promptRecallCache.clear();
     return true;
   }
 
@@ -1533,7 +1555,7 @@ export class MemoryService {
     this.importedEmbeddings.delete(memoryId);
     const updated = await this.memoryRepo.findById(memoryId);
     if (updated) {
-      memoryEvents.emit("memoryChanged", { type: "importedEntryUpdated", workspaceId });
+      this.promptRecallCache.clear();
       return updated;
     }
     return null;
@@ -1561,7 +1583,7 @@ export class MemoryService {
     this.embeddingsLoadedForWorkspace.delete(workspaceId);
     this.embeddingCacheGeneration += 1;
     this.embeddingBackfillInProgress.delete(workspaceId);
-    memoryEvents.emit("memoryChanged", { type: "importedDeleted", workspaceId });
+    this.promptRecallCache.clear();
     return deleted;
   }
 
@@ -1614,7 +1636,7 @@ export class MemoryService {
       seen.add(signature);
 
       try {
-        const sanitized = InputSanitizer.sanitizeMemoryContent(entry).trim();
+        const sanitized = redactSecrets(InputSanitizer.sanitizeMemoryContent(entry)).text.trim();
         if (!sanitized) {
           duplicatesSkipped += 1;
           continue;
@@ -1664,7 +1686,6 @@ export class MemoryService {
     }
 
     if (memoriesCreated > 0) {
-      memoryEvents.emit("memoryChanged", { type: "created", workspaceId: options.workspaceId });
       await this.enforceStorageLimit(options.workspaceId, settings.maxStorageMb, { force: true });
     }
 
@@ -1696,7 +1717,7 @@ export class MemoryService {
     this.embeddingCacheGeneration += 1;
     this.embeddingBackfillInProgress.delete(workspaceId);
     this.clearCompressionStateForWorkspace(workspaceId);
-    memoryEvents.emit("memoryChanged", { type: "cleared", workspaceId });
+    this.promptRecallCache.clear();
   }
 
   static async deleteEntries(workspaceId: string, ids: string[]): Promise<number> {
@@ -1713,7 +1734,7 @@ export class MemoryService {
       }
     }
     if (deleted > 0) {
-      memoryEvents.emit("memoryChanged", { type: "deleted", workspaceId });
+      this.promptRecallCache.clear();
     }
     return deleted;
   }
@@ -1739,8 +1760,12 @@ export class MemoryService {
 
     const current = await this.memoryRepo.findById(memoryId);
     if (!current || current.workspaceId !== workspaceId) return null;
+    // A memory the user deleted or redacted in the Inspector stays that way: a source
+    // re-sync must not restore its content (returning it also stops a fresh capture).
+    if ((await MemoryObservationService.suppressedIds([memoryId])).has(memoryId)) return current;
 
     const privacyPrepared = this.applyInlinePrivacy(content);
+    privacyPrepared.content = redactSecrets(privacyPrepared.content).text;
     if (this.shouldExclude(privacyPrepared.content, settings)) return null;
     const truncatedContent =
       privacyPrepared.content.length > 10000
@@ -1790,7 +1815,6 @@ export class MemoryService {
     }
 
     this.promptRecallCache.clear();
-    memoryEvents.emit("memoryChanged", { type: "updated", workspaceId });
     return updated;
   }
 
@@ -1985,10 +2009,6 @@ export class MemoryService {
     const structured = this.isStructuredLowValueContent(input.content);
     if (structured && input.type === "observation") return false;
 
-    if (input.origin === "heartbeat") {
-      return input.tokens >= MIN_TOKENS_FOR_OBSERVATION_COMPRESSION || input.priority === "high";
-    }
-
     if (
       input.type === "observation" ||
       input.type === "insight" ||
@@ -2035,9 +2055,6 @@ export class MemoryService {
         ? "normal"
         : "low";
     }
-    if (origin === "heartbeat") {
-      return tokens >= MIN_TOKENS_FOR_OBSERVATION_COMPRESSION ? "normal" : "low";
-    }
     if (
       this.isStructuredLowValueContent(content) &&
       tokens < MIN_TOKENS_FOR_OBSERVATION_COMPRESSION
@@ -2054,15 +2071,10 @@ export class MemoryService {
     origin: MemoryCaptureOrigin,
     createdAt: number,
     explicitBatchKey?: string,
-    signalFamily?: string,
   ): string {
     if (explicitBatchKey) return explicitBatchKey;
     if (taskId) return `task:${taskId}`;
-    if (origin === "heartbeat") {
-      const family = signalFamily?.trim() || "heartbeat";
-      return `heartbeat:${workspaceId}:${family}:${Math.floor(createdAt / HEARTBEAT_BATCH_WINDOW_MS)}`;
-    }
-    return `${origin}:${workspaceId}:${Math.floor(createdAt / HEARTBEAT_BATCH_WINDOW_MS)}`;
+    return `${origin}:${workspaceId}:${Math.floor(createdAt / COMPRESSION_BATCH_WINDOW_MS)}`;
   }
 
   private static isHighSignalMemoryType(type: MemoryType): boolean {
@@ -2577,7 +2589,7 @@ export class MemoryService {
     summaryText: string,
     compressed: boolean,
   ): Promise<void> {
-    const summary = this.normalizeSummaryStorageText(summaryText);
+    const summary = neutralizeReservedImportPrefix(this.normalizeSummaryStorageText(summaryText));
     if (!summary) return;
 
     const taskId = this.extractSharedTaskId(memories);
@@ -2679,7 +2691,7 @@ export class MemoryService {
         await this.enforceStorageLimit(workspaceId, settings.maxStorageMb, { force: true });
       }
 
-      // Tier promotion pass: promote short→medium→long, evict stale short-tier memories
+      // Tier promotion pass: promote short→medium→long (tiers never delete rows)
       if (this.sql) {
         await MemoryTierService.runPromotionPass(this.sql);
       }
@@ -2737,7 +2749,6 @@ export class MemoryService {
       const deleted = await this.memoryRepo.deleteByIds(workspaceId, idsToDelete);
       if (deleted > 0) {
         await this.embeddingRepo.deleteByMemoryIds(idsToDelete);
-        memoryEvents.emit("memoryChanged", { type: "pruned", workspaceId });
       } else {
         break;
       }
@@ -2862,6 +2873,8 @@ export class MemoryService {
     }
 
     for (const pattern of settings.excludedPatterns) {
+      // Stored patterns may predate IPC validation; never run a ReDoS-prone one (SEC-11).
+      if (!isSafeExcludedPattern(pattern)) continue;
       try {
         const regex = new RegExp(pattern, "i");
         if (regex.test(content)) {
@@ -2872,18 +2885,6 @@ export class MemoryService {
       }
     }
 
-    return false;
-  }
-
-  /**
-   * Check if content contains sensitive data
-   */
-  private static containsSensitiveData(content: string): boolean {
-    for (const pattern of SENSITIVE_PATTERNS) {
-      if (pattern.test(content)) {
-        return true;
-      }
-    }
     return false;
   }
 
@@ -2938,7 +2939,15 @@ export class MemoryService {
       clearTimeout(this.compressionDrainTimer);
       this.compressionDrainTimer = undefined;
     }
-    memoryEvents.removeAllListeners();
+    if (this.archiveCleanupTimer) {
+      clearTimeout(this.archiveCleanupTimer);
+      this.archiveCleanupTimer = undefined;
+    }
+    if (this.promptReferenceFlushTimer) {
+      clearTimeout(this.promptReferenceFlushTimer);
+      this.promptReferenceFlushTimer = undefined;
+    }
+    this.pendingPromptReferences.clear();
     this.storageEstimateByWorkspace.clear();
     this.memoryEmbeddingsByWorkspace.clear();
     this.importedEmbeddings.clear();

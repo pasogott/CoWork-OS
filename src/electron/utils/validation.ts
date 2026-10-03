@@ -2384,6 +2384,9 @@ export const CoreMemoryCandidateStatusSchema = z.enum([
   "accepted",
   "rejected",
   "merged",
+  "applied",
+  "skipped",
+  "dismissed",
 ] as const satisfies readonly CoreMemoryCandidateStatus[]);
 export const CoreFailureCategorySchema = z.enum([
   "wake_timing",
@@ -2603,14 +2606,6 @@ export const SubconsciousSettingsSchema = z
       .max(24 * 30),
     autonomyMode: z.enum(["recommendation_first", "balanced_autopilot", "strong_autonomy"]),
     trustedTargetKeys: z.array(z.string().trim().min(1).max(1024)).max(1000),
-    phaseModels: z
-      .object({
-        collectingEvidence: z.string().max(200).optional(),
-        ideation: z.string().max(200).optional(),
-        critique: z.string().max(200).optional(),
-        synthesis: z.string().max(200).optional(),
-      })
-      .strict(),
     dispatchDefaults: z
       .object({
         autoDispatch: z.boolean(),
@@ -2837,6 +2832,10 @@ export const MCPServerConfigSchema = z.object({
   // Timeouts
   connectionTimeout: z.number().int().min(1000).max(120000).optional(),
   requestTimeout: z.number().int().min(1000).max(300000).optional(),
+  defaultToolsApprovalMode: z.enum(["auto", "prompt", "writes", "approve"]).optional(),
+  toolApprovals: z
+    .record(z.string().min(1).max(200), z.enum(["auto", "prompt", "writes", "approve"]))
+    .optional(),
 
   // Metadata
   version: z.string().max(100).optional(),
@@ -2846,9 +2845,11 @@ export const MCPServerConfigSchema = z.object({
   license: z.string().max(100).optional(),
 });
 
-export const MCPServerUpdateSchema = MCPServerConfigSchema.partial().omit({
-  id: true,
-});
+export const MCPServerUpdateSchema = MCPServerConfigSchema.partial()
+  .omit({ id: true })
+  // Create defaults must not silently re-enable a disabled server during an
+  // unrelated update (including approval-policy edits).
+  .extend({ enabled: z.boolean().optional() });
 
 export const MCPSettingsSchema = z.object({
   servers: z.array(MCPServerConfigSchema).max(50),
