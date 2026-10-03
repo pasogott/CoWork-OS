@@ -1,3 +1,5 @@
+import { isFullAccessProfile } from "../../../shared/access-profiles";
+import { isCodexComputerUseServer } from "../../mcp/codex-computer-use";
 import { AgentRoleRepository } from "../../agents/agent-repository-facades";
 import { ChannelStore } from "../../database/repositories";
 import {
@@ -22,6 +24,7 @@ import {
   Task,
   TaskEvent,
   TOOL_GROUPS,
+  LEGACY_MEMORY_TOOL_ALIASES,
   ToolGroupName,
   RuntimeToolApprovalKind,
   RuntimeToolSideEffectLevel,
@@ -167,6 +170,12 @@ import {
   ChronicleSettingsManager,
 } from "../../chronicle";
 import { taskDisablesMemoryCapture } from "../../memory/no-memory-directive";
+import { MemoryWriter } from "../../memory/MemoryWriter";
+import {
+  MEMORY_LANE_STORES,
+  preferredNameCandidate,
+  responseStyleCandidate,
+} from "../../memory/memory-items-lanes";
 import { CitationTracker } from "../citation/CitationTracker";
 import { OrchestrationRepository } from "../orchestration-repository-facades";
 import {
@@ -1492,11 +1501,10 @@ export class ToolRegistry {
       allTools.push(...KnowledgeGraphTools.getToolDefinitions());
     }
 
-    // Memory tools (explicit save during task execution)
+    // Memory tools: memory_recall, memory_remember, memory_forget, context_recall (audit
+    // §8.3). The tools they replaced stay executable as hidden aliases (registered below,
+    // LEGACY_MEMORY_TOOL_ALIASES) but are not offered to the model.
     allTools.push(...MemoryTools.getToolDefinitions());
-    if (SupermemoryTools.isEnabled()) {
-      allTools.push(...SupermemoryTools.getToolDefinitions());
-    }
 
     // Scraping tools (Scrapling integration - JS rendering, structured extraction)
     // Only add when scraping is enabled in settings
@@ -1940,7 +1948,24 @@ export class ToolRegistry {
       return "network_access";
     }
     if (canonicalToolName.startsWith("mcp_")) return "external_service";
-    if (EXTERNAL_SERVICE_BOUNDARY_TOOLS.has(canonicalToolName)) return "external_service";
+    // Raw name too: the deprecated supermemory_* aliases canonicalize to memory tools.
+    if (
+      EXTERNAL_SERVICE_BOUNDARY_TOOLS.has(canonicalToolName) ||
+      EXTERNAL_SERVICE_BOUNDARY_TOOLS.has(toolName)
+    ) {
+      return "external_service";
+    }
+    // memory_recall / memory_forget reach Supermemory only when asked to (scope or id).
+    if (
+      (canonicalToolName === "memory_recall" &&
+        Array.isArray(input?.scopes) &&
+        input.scopes.includes("external")) ||
+      (canonicalToolName === "memory_forget" &&
+        typeof input?.id === "string" &&
+        input.id.trim().startsWith("external:"))
+    ) {
+      return "external_service";
+    }
     if (canonicalToolName.endsWith("_action") || canonicalToolName === "voice_call")
       return "external_service";
     if (canonicalToolName === "open_application" || isComputerUseToolName(canonicalToolName)) {
@@ -1948,6 +1973,59 @@ export class ToolRegistry {
     }
     if (NETWORK_TOOL_NAMES.has(canonicalToolName)) return "network_access";
     return null;
+  }
+
+  // These grants live only in this task's registry. They are never saved as workspace rules.
+  private codexTaskConsents = new Map<string, string>();
+  private codexConsentClosed = false;
+
+  private getCodexConsentServer(toolName: string) {
+    const settings = MCPSettingsManager.loadSettings();
+    const prefix = settings.toolNamePrefix || "mcp_";
+    if (!toolName.startsWith(prefix)) return null;
+    const rawName = toolName.slice(prefix.length);
+    if (rawName !== "js" && rawName !== "js_reset") return null;
+    const manager = MCPClientManager.getInstance();
+    if (typeof manager.getServerIdForTool !== "function") return null;
+    const id = manager.getServerIdForTool(rawName);
+    const server = settings.servers?.find((entry) => entry.id === id);
+    return isCodexComputerUseServer(server) ? server! : null;
+  }
+
+  private async requestCodexTaskConsent(
+    description: string,
+    details: Any,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (signal?.aborted || this.codexConsentClosed) {
+      this.codexTaskConsents?.clear();
+      return false;
+    }
+    this.codexTaskConsents ??= new Map();
+    const snapshot =
+      typeof (this.daemon as Any).getTaskConsentAuthority === "function"
+        ? this.daemon.getTaskConsentAuthority.bind(this.daemon)
+        : undefined;
+    const key = JSON.stringify(details);
+    const authority = snapshot ? await snapshot(this.taskId, details) : null;
+    if (snapshot && !authority) {
+      this.codexTaskConsents.clear();
+      return false;
+    }
+    if (authority && this.codexTaskConsents.get(key) === authority) return true;
+    this.codexTaskConsents.delete(key);
+    const approved = await this.daemon.requestApproval(
+      this.taskId,
+      "external_service",
+      description,
+      details,
+      { allowAutoApprove: false, requireExplicitApproval: true, signal },
+    );
+    if (!approved || signal?.aborted || this.codexConsentClosed) return false;
+    const current = snapshot ? await snapshot(this.taskId, details) : null;
+    if (snapshot && current !== authority) return false;
+    if (current) this.codexTaskConsents.set(key, current);
+    return true;
   }
 
   private toolHandlesApprovalInternally(toolName: string): boolean {
@@ -1994,6 +2072,25 @@ export class ToolRegistry {
       query,
       matches: searchService.search(query, limit),
     };
+  }
+
+  /**
+   * A deprecated memory tool name (LEGACY_MEMORY_TOOL_ALIASES), routed to the tool that
+   * replaced it. Supermemory writes keep their legacy implementation, which needs the
+   * external integration to be configured.
+   */
+  private executeLegacyMemoryAlias(name: string, input: Any): Promise<unknown> {
+    const supermemory = SupermemoryTools.isEnabled() ? this.supermemoryTools : null;
+    return this.memoryTools.executeLegacyAlias(
+      name,
+      input ?? {},
+      supermemory
+        ? {
+            supermemoryRemember: (value: Any) => supermemory.remember(value),
+            supermemoryForget: (value: Any) => supermemory.forget(value),
+          }
+        : {},
+    );
   }
 
   private buildBrowserUseApprovalDetails(toolName: string, input: Any) {
@@ -2180,25 +2277,33 @@ export class ToolRegistry {
       const hasExplicitNonInteractiveAuthority =
         effectiveAccessProfile?.permissionMode === "bypass_permissions" &&
         effectiveAccessProfile?.definition?.approval === "never";
+      const codexFullAccess =
+        hasExplicitNonInteractiveAuthority &&
+        isFullAccessProfile(effectiveAccessProfile.definition) &&
+        this.getCodexConsentServer(context.request.name) !== null;
+      let hasMatchedPermissionRule = false;
       const pipeline = await evaluateToolPolicyPipeline({
         workspace: this.workspace,
         toolName: context.request.name,
         toolInput: context.request.input,
         gatewayContext: this.gatewayContext,
         policyContext: context.request.runtime?.toolPolicyContext as Any,
-        approvalRequired: runtimeApprovalRequired,
-        runtimeApprovalType: runtimeApprovalRequired ? runtimeApprovalType : null,
+        approvalRequired: runtimeApprovalRequired && !codexFullAccess,
+        runtimeApprovalType:
+          runtimeApprovalRequired && !codexFullAccess ? runtimeApprovalType : null,
         permissionApprovalType: effectiveApprovalType,
         permissionEvaluation:
           typeof permissionEvaluation === "function"
-            ? (policy) => {
+            ? async (policy) => {
                 const approvalTypeForPermission = policy?.approvalType ?? effectiveApprovalType;
-                return permissionEvaluation.call(this.daemon, this.taskId, {
+                const result = await permissionEvaluation.call(this.daemon, this.taskId, {
                   ...(approvalTypeForPermission ? { approvalType: approvalTypeForPermission } : {}),
                   toolName: context.request.name,
                   details: approvalDetails,
                   allowPersistence: approvalTypeForPermission !== "location_access",
                 });
+                hasMatchedPermissionRule ||= Boolean(result.matchedRule);
+                return result;
               }
             : undefined,
         agentSecurityEvaluation: getNumbatService()
@@ -2281,8 +2386,30 @@ export class ToolRegistry {
               pipeline.approvalSource === "runtime_metadata",
           };
           const authorizer = (this.daemon as Any)?.authorizeToolAction;
-          const approved =
-            typeof authorizer === "function"
+          const codexServer =
+            effectiveApprovalType === "external_service" &&
+            pipeline.approvalSource !== "semantic_review" &&
+            !hasMatchedPermissionRule
+              ? this.getCodexConsentServer(context.request.name)
+              : null;
+          const approved = codexServer
+            ? await this.requestCodexTaskConsent(
+                `Allow ${codexServer.name} computer-use engine for this task?`,
+                {
+                  tool: context.request.name,
+                  serverName: codexServer.name,
+                  params: {
+                    serverId: codexServer.id,
+                    configuration: createHash("sha256")
+                      .update(JSON.stringify(codexServer))
+                      .digest("hex"),
+                  },
+                  taskConsentScope:
+                    "calls to this computer-use engine; each app requires separate consent",
+                },
+                options.signal,
+              )
+            : typeof authorizer === "function"
               ? await authorizer.call(this.daemon, this.taskId, {
                   toolName: context.request.name,
                   approvalType: effectiveApprovalType || "external_service",
@@ -2701,80 +2828,34 @@ export class ToolRegistry {
     register("get_current_location", async ({ request }) =>
       this.systemTools.getCurrentLocation(request.input),
     );
-    register("search_memories", async ({ request }) =>
-      this.systemTools.searchMemories(request.input),
-    );
     register(
-      "memory_search_index",
-      async ({ request }) => this.systemTools.searchMemoryIndex(request.input),
+      "memory_recall",
+      async ({ request }) => this.memoryTools.recall(request.input),
       readParallelSchedulerSpec,
     );
     register(
-      "memory_timeline",
-      async ({ request }) => this.systemTools.memoryTimeline(request.input),
-      readParallelSchedulerSpec,
-    );
-    register(
-      "memory_details",
-      async ({ request }) => this.systemTools.memoryDetails(request.input),
-      readParallelSchedulerSpec,
-    );
-    register(
-      "search_quotes",
-      async ({ request }) => this.systemTools.searchQuotes(request.input),
-      readParallelSchedulerSpec,
-    );
-    register(
-      "search_sessions",
-      async ({ request }) => this.systemTools.searchSessions(request.input),
-      readParallelSchedulerSpec,
-    );
-    register(
-      "memory_topics_load",
-      async ({ request }) => this.systemTools.loadMemoryTopics(request.input),
-      readParallelSchedulerSpec,
-    );
-    register(
-      "context_grep",
-      async ({ request }) => this.systemTools.contextGrep(request.input),
-      readParallelSchedulerSpec,
-    );
-    register(
-      "context_describe",
-      async ({ request }) => this.systemTools.contextDescribe(request.input),
-      readParallelSchedulerSpec,
-    );
-    register("memory_save", async ({ request }) => this.memoryTools.save(request.input));
-    register(
-      "memory_curate",
-      async ({ request }) => this.memoryTools.curate(request.input),
+      "memory_remember",
+      async ({ request }) => this.memoryTools.remember(request.input),
       exclusiveSchedulerSpec,
     );
     register(
-      "memory_curated_read",
-      async ({ request }) => this.memoryTools.readCurated(request.input),
+      "memory_forget",
+      async ({ request }) => this.memoryTools.forget(request.input),
+      exclusiveSchedulerSpec,
+    );
+    register(
+      "context_recall",
+      async ({ request }) => this.memoryTools.contextRecall(request.input),
       readParallelSchedulerSpec,
     );
-    if (SupermemoryTools.isEnabled()) {
+    // Deprecated memory tool names: hidden, routed to the tool that replaced them.
+    for (const [aliasName, replacement] of Object.entries(LEGACY_MEMORY_TOOL_ALIASES)) {
       register(
-        "supermemory_profile",
-        async ({ request }) => this.supermemoryTools.profile(request.input),
-        readParallelSchedulerSpec,
-      );
-      register(
-        "supermemory_search",
-        async ({ request }) => this.supermemoryTools.search(request.input),
-        readParallelSchedulerSpec,
-      );
-      register(
-        "supermemory_remember",
-        async ({ request }) => this.supermemoryTools.remember(request.input),
-        exclusiveSchedulerSpec,
-      );
-      register(
-        "supermemory_forget",
-        async ({ request }) => this.supermemoryTools.forget(request.input),
-        exclusiveSchedulerSpec,
+        aliasName,
+        async ({ request }) => this.executeLegacyMemoryAlias(request.name, request.input),
+        replacement === "memory_recall" || replacement === "context_recall"
+          ? readParallelSchedulerSpec
+          : exclusiveSchedulerSpec,
       );
     }
     register("scratchpad_write", async ({ request }) => this.scratchpadTools.write(request.input));
@@ -3399,7 +3480,7 @@ export class ToolRegistry {
         const prefix = settings.toolNamePrefix || "mcp_";
         return name.startsWith(prefix);
       },
-      async ({ request }) => this.tryExecuteMCPTool(request.name, request.input),
+      async ({ request }) => this.tryExecuteMCPTool(request.name, request.input, request.runtime),
     );
   }
 
@@ -3424,7 +3505,14 @@ export class ToolRegistry {
         const serverName = server?.name;
         const policy = server ? resolveMcpToolPolicy(tool, server) : undefined;
         const readOnly = policy?.readOnly === true;
-        const baseDescription = tool.description || `MCP tool: ${tool.name}`;
+        // Identify the installed driver from local configuration, not untrusted tool prose.
+        const codexComputerUse =
+          isCodexComputerUseServer(server) && (tool.name === "js" || tool.name === "js_reset");
+        const desktopGuide =
+          codexComputerUse && tool.name === "js"
+            ? 'Codex desktop computer use: at the start of each new task call await cua.rewriteDocumentation() alone and read its output. Bind a native app with let app = await cua.getApp("App name"). Use app.click(index), app.typeText(text), app.pressKey(key), app.getAXState(), and app.getScreenshot() as documented. Read fresh UI state after actions before choosing further indices. '
+            : "";
+        const baseDescription = desktopGuide + (tool.description || `MCP tool: ${tool.name}`);
 
         return {
           name: `${prefix}${tool.name}`,
@@ -3445,6 +3533,18 @@ export class ToolRegistry {
             capabilityTags: ["mcp" as const, "integration" as const],
             exposure: "always" as const,
             resultKind: "integration" as const,
+            ...(codexComputerUse
+              ? {
+                  capabilityTags: ["system" as const, "mcp" as const],
+                  exposure: "conditional" as const,
+                  alwaysExpose: false,
+                  concurrencyClass: "serial_only" as const,
+                  interruptBehavior: "cancel" as const,
+                  readOnly: false,
+                  sideEffectLevel: "high" as const,
+                  supportsContextMutation: true,
+                }
+              : {}),
           },
         };
       });
@@ -4127,24 +4227,14 @@ System Tools:
 - list_macos_launch_agents: Inspect LaunchAgents/LaunchDaemons that may relaunch an app
 - disable_macos_launch_agents: Unload and move matching user LaunchAgent plists aside after approval
 - run_applescript: Execute exact AppleScript on macOS (explicit AppleScript requests or low-level fallback only)
-- search_memories: Search workspace memories, .cowork/ knowledge files, and imported conversations for past context
-- search_quotes: Search exact quoted wording across transcripts, task messages, imported memories, and workspace notes
-- search_sessions: Search recent task/session transcripts and checkpoints for prior run context
-- memory_topics_load: Load topical memory packs from \`.cowork/memory/topics\`
-- memory_save: Save an observation, decision, insight, or error to workspace memory for future recall
-- memory_curate: Add, replace, or remove curated hot-memory facts that should stay prompt-visible
-- memory_curated_read: Inspect the current curated hot-memory entries
 ${
-  hasAnyVisibleTools(
-    "supermemory_profile",
-    "supermemory_search",
-    "supermemory_remember",
-    "supermemory_forget",
-  )
-    ? `- supermemory_profile: Load the workspace-scoped external Supermemory profile and relevant facts
-- supermemory_search: Search external Supermemory memories for this workspace or approved container
-- supermemory_remember: Persist a high-signal fact into external Supermemory
-- supermemory_forget: Remove an outdated external Supermemory entry by ID or exact content`
+  hasAnyVisibleTools("memory_recall", "memory_remember", "memory_forget", "context_recall")
+    ? `
+Memory Tools:
+- memory_recall: Search saved facts, earlier tasks, workspace notes and the knowledge graph; index first, then ids with detail "full"
+- memory_remember: Save a durable fact (preference, rule, project fact, decision, commitment) for later tasks
+- memory_forget: Delete a wrong or unwanted memory by id or exact match
+- context_recall: Recover this task's earlier details after context compaction`
     : ""
 }
 ${
@@ -4684,26 +4774,13 @@ ${skillDescriptions}`;
 
     // System tools
     if (name === "system_info") return await this.systemTools.getSystemInfo();
-    if (name === "search_memories") return await this.systemTools.searchMemories(input);
-    if (name === "memory_search_index") return await this.systemTools.searchMemoryIndex(input);
-    if (name === "memory_timeline") return await this.systemTools.memoryTimeline(input);
-    if (name === "memory_details") return await this.systemTools.memoryDetails(input);
-    if (name === "search_quotes") return await this.systemTools.searchQuotes(input);
-    if (name === "search_sessions") return await this.systemTools.searchSessions(input);
-    if (name === "memory_topics_load") return await this.systemTools.loadMemoryTopics(input);
-    if (name === "context_grep") return await this.systemTools.contextGrep(input);
-    if (name === "context_describe") return await this.systemTools.contextDescribe(input);
-    if (name === "memory_save") return await this.memoryTools.save(input);
-    if (name === "memory_curate") return await this.memoryTools.curate(input);
-    if (name === "memory_curated_read") return await this.memoryTools.readCurated(input);
-    if (name === "supermemory_profile" && SupermemoryTools.isEnabled())
-      return await this.supermemoryTools.profile(input);
-    if (name === "supermemory_search" && SupermemoryTools.isEnabled())
-      return await this.supermemoryTools.search(input);
-    if (name === "supermemory_remember" && SupermemoryTools.isEnabled())
-      return await this.supermemoryTools.remember(input);
-    if (name === "supermemory_forget" && SupermemoryTools.isEnabled())
-      return await this.supermemoryTools.forget(input);
+    if (name === "memory_recall") return await this.memoryTools.recall(input);
+    if (name === "memory_remember") return await this.memoryTools.remember(input);
+    if (name === "memory_forget") return await this.memoryTools.forget(input);
+    if (name === "context_recall") return await this.memoryTools.contextRecall(input);
+    if (Object.prototype.hasOwnProperty.call(LEGACY_MEMORY_TOOL_ALIASES, name)) {
+      return await this.executeLegacyMemoryAlias(name, input);
+    }
     if (name === "scratchpad_write") return this.scratchpadTools.write(input);
     if (name === "scratchpad_read") return this.scratchpadTools.read(input);
     if (name === "read_clipboard") return await this.systemTools.readClipboard();
@@ -5178,7 +5255,11 @@ ${skillDescriptions}`;
   /**
    * Try to execute an MCP tool if the name matches
    */
-  private async tryExecuteMCPTool(name: string, input: Any): Promise<Any | null> {
+  private async tryExecuteMCPTool(
+    name: string,
+    input: Any,
+    runtime?: Record<string, unknown>,
+  ): Promise<Any | null> {
     const settings = MCPSettingsManager.loadSettings();
     const prefix = settings.toolNamePrefix || "mcp_";
 
@@ -5259,7 +5340,80 @@ ${skillDescriptions}`;
     console.log(`[ToolRegistry] Executing MCP tool: ${mcpToolName}`);
 
     try {
-      const result = await mcpManager.callTool(mcpToolName, input);
+      const signal = runtime?.signal instanceof AbortSignal ? runtime.signal : undefined;
+      const result = await mcpManager.callTool(mcpToolName, input, {
+        signal,
+        onElicitation: async (request) => {
+          const server = request.computerUseApp ? this.getCodexConsentServer(name) : null;
+          if (server && request.computerUseApp) {
+            const permission = await this.daemon.evaluateToolPermission(this.taskId, {
+              approvalType: "external_service",
+              toolName: name,
+              details: { tool: name, serverName: server.name, params: input },
+              allowPersistence: false,
+            });
+            if (permission.decision === "deny" || signal?.aborted) {
+              this.codexTaskConsents?.clear();
+              return { action: "decline" };
+            }
+            if (permission.decision === "ask" && permission.matchedRule) {
+              const approved = await this.daemon.requestApproval(
+                this.taskId,
+                "external_service",
+                request.message,
+                { tool: name, serverName: server.name, params: input },
+                { allowAutoApprove: false, requireExplicitApproval: true, signal },
+              );
+              return approved ? { action: "accept", content: {} } : { action: "decline" };
+            }
+            const app = request.computerUseApp;
+            // The SDK asks for every app action. Full access is the user's existing
+            // authority for routine app control, not a reason to manufacture a new ask.
+            if (
+              !this.codexConsentClosed &&
+              !signal?.aborted &&
+              typeof (this.daemon as Any).canAutoApproveComputerUseApp === "function" &&
+              (await this.daemon.canAutoApproveComputerUseApp(this.taskId, {
+                tool: name,
+                serverName: server.name,
+                params: { ...input, app: app.id },
+              }))
+            ) {
+              return signal?.aborted || this.codexConsentClosed
+                ? { action: "cancel" }
+                : { action: "accept", content: {} };
+            }
+
+            const approved = await this.requestCodexTaskConsent(
+              `Allow Computer Use to use "${app.name}" for this task?`,
+              {
+                tool: name,
+                serverName: server.name,
+                params: {
+                  app: app.id,
+                  serverId: server.id,
+                  configuration: createHash("sha256").update(JSON.stringify(server)).digest("hex"),
+                },
+                taskConsentScope: `reading, clicking, typing, and dragging in ${app.name}`,
+              },
+              signal,
+            );
+            return approved ? { action: "accept", content: {} } : { action: "decline" };
+          }
+          const approved = await this.daemon.requestApproval(
+            this.taskId,
+            "external_service",
+            request.message,
+            {
+              tool: name,
+              serverName: this.getMcpServerName(name) || undefined,
+              reason: "MCP server requests explicit operation consent",
+            },
+            { allowAutoApprove: false, requireExplicitApproval: true, signal },
+          );
+          return approved === true ? { action: "accept", content: {} } : { action: "decline" };
+        },
+      });
       // Format MCP result and process any generated files
       return await this.formatMCPResult(result, mcpToolName, input);
     } catch (error: Any) {
@@ -5467,6 +5621,8 @@ ${skillDescriptions}`;
    * Cleanup resources (call when task is done)
    */
   async cleanup(): Promise<void> {
+    this.codexConsentClosed = true;
+    this.codexTaskConsents?.clear();
     await this.browserTools.cleanup();
     await this.qaTools.execute("qa_cleanup", {}).catch(() => {});
 
@@ -10096,6 +10252,16 @@ ${skillDescriptions}`;
 
     // Save the user's name
     PersonalityManager.setUserName(userName);
+    // Also the user-stated `preferred_name` memory item (memory engine dual write).
+    const nameCandidate = preferredNameCandidate(userName, { source: "user_stated" });
+    MemoryWriter.dualWrite(
+      nameCandidate && {
+        ...nameCandidate,
+        taskId: this.taskId,
+        originWorkspaceId: this.workspace.id,
+      },
+      "set_user_name",
+    );
 
     console.log(`[ToolRegistry] User name set to: ${userName}`);
 
@@ -10180,6 +10346,21 @@ ${skillDescriptions}`;
 
     PersonalityManager.setResponseStyle(style);
     console.log(`[ToolRegistry] Response style updated:`, changes);
+    // The user asked for this style: a user-stated `response_style` memory item, which
+    // inferred style adaptations do not override (memory engine dual write).
+    let fullStyle = style;
+    try {
+      fullStyle = { ...PersonalityManager.loadSettings().responseStyle, ...style };
+    } catch {
+      // Settings unavailable; record the dimensions that were set.
+    }
+    MemoryWriter.dualWrite(
+      responseStyleCandidate(fullStyle, {
+        source: "user_stated",
+        store: MEMORY_LANE_STORES.personality,
+      }),
+      "set_response_style",
+    );
 
     return {
       success: true,

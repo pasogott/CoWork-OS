@@ -1,6 +1,7 @@
 import {
   ConversationMode,
   ExecutionMode,
+  LEGACY_MEMORY_TOOL_ALIASES,
   TaskDomain,
   ToolDecision,
   type HumanInputPolicy,
@@ -163,17 +164,28 @@ const CONDITIONAL_SYSTEM_TOOLS = new Set([
 ]);
 
 /**
- * Read-only recall tools that belong to the memory lane. The progressive recall
- * trio is always exposed; the knowledge-graph reads are deferred-load tools
- * (see runtime-tool-definition.ts) that `tool_search` surfaces on demand.
+ * The memory lane (audit §8.3): the four memory tools, their deprecated aliases (hidden
+ * but still executable) and the knowledge-graph tools. All of them are "always" exposure:
+ * memory used to fall through to the conditional system lane and was shown only for
+ * clipboard/application/screenshot wording (RECALL-1). The knowledge-graph tools are also
+ * deferred-load (runtime-tool-definition.ts), so tool_search surfaces them on demand.
  */
-const MEMORY_RECALL_LANE_TOOLS = new Set([
-  "memory_search_index",
-  "memory_timeline",
-  "memory_details",
+const MEMORY_LANE_TOOLS = new Set([
+  "memory_recall",
+  "memory_remember",
+  "memory_forget",
+  "context_recall",
+  ...Object.keys(LEGACY_MEMORY_TOOL_ALIASES),
   "kg_search",
   "kg_get_neighbors",
   "kg_get_subgraph",
+  "kg_create_entity",
+  "kg_update_entity",
+  "kg_delete_entity",
+  "kg_create_edge",
+  "kg_delete_edge",
+  "kg_invalidate_edge",
+  "kg_add_observation",
 ]);
 
 const ALWAYS_VISIBLE_TOOLS = new Set([
@@ -203,19 +215,10 @@ const ALWAYS_VISIBLE_TOOLS = new Set([
   "task_history",
   "scratchpad_write",
   "scratchpad_read",
-  "search_memories",
-  "search_quotes",
-  "search_sessions",
-  "memory_topics_load",
-  "context_grep",
-  "context_describe",
-  "memory_save",
-  "memory_curate",
-  "memory_curated_read",
-  "supermemory_profile",
-  "supermemory_search",
-  "supermemory_remember",
-  "supermemory_forget",
+  "memory_recall",
+  "memory_remember",
+  "memory_forget",
+  "context_recall",
   "system_info",
   "Skill",
 ]);
@@ -375,26 +378,7 @@ function inferToolExposureMetadata(
             : undefined;
     return { lane: "artifact", exposure: "conditional", overlapGroup };
   }
-  if (
-    toolName === "search_memories" ||
-    // Progressive recall and knowledge-graph reads are memory recall, not system
-    // interaction; they used to fall through to the conditional system lane and
-    // were shown only for clipboard/application/screenshot wording (RECALL-1).
-    MEMORY_RECALL_LANE_TOOLS.has(toolName) ||
-    toolName === "search_quotes" ||
-    toolName === "search_sessions" ||
-    toolName === "memory_topics_load" ||
-    toolName === "context_grep" ||
-    toolName === "context_describe" ||
-    toolName === "memory_save" ||
-    toolName === "memory_curate" ||
-    toolName === "memory_curated_read" ||
-    toolName === "supermemory_profile" ||
-    toolName === "supermemory_search" ||
-    toolName === "supermemory_remember" ||
-    toolName === "supermemory_forget" ||
-    toolName.startsWith("scratchpad_")
-  ) {
+  if (MEMORY_LANE_TOOLS.has(toolName) || toolName.startsWith("scratchpad_")) {
     return { lane: "memory", exposure: "always", overlapGroup: "memory" };
   }
   if (CONDITIONAL_SYSTEM_TOOLS.has(toolName)) {
@@ -428,6 +412,11 @@ export function getToolExposureMetadata(toolName: string): ToolExposureMetadata 
   return inferToolExposureMetadata(String(toolName || "").trim());
 }
 
+/** Host-classified desktop MCP tools; tags are never taken from server descriptions. */
+export function isMcpComputerUseRuntime(runtime?: RuntimeToolMetadata): boolean {
+  return runtime?.capabilityTags[0] === "system" && runtime.capabilityTags.includes("mcp");
+}
+
 export function evaluateToolAvailability(
   toolName: string,
   ctx: ToolAvailabilityContext,
@@ -441,7 +430,12 @@ export function evaluateToolAvailability(
 
   // A connected MCP catalog is already an explicit user configuration. Tool
   // discovery must work in any language without requiring protocol keywords.
-  if (normalizedToolName.startsWith("mcp_") || runtime?.capabilityTags.includes("mcp")) {
+  // The configured desktop driver is the exception: it drives native apps, so it
+  // stays in the system lane and is exposed only for native GUI requests.
+  if (
+    (normalizedToolName.startsWith("mcp_") || runtime?.capabilityTags.includes("mcp")) &&
+    !isMcpComputerUseRuntime(runtime)
+  ) {
     return { decision: "allow", metadata };
   }
 
@@ -541,7 +535,7 @@ export function evaluateToolAvailability(
           ? { decision: "allow", metadata: { ...metadata, overlapGroup: "chronicle" } }
           : { decision: "defer", reason: "screen_context_intent_missing", metadata };
       }
-      if (isComputerUseToolName(normalizedToolName)) {
+      if (isComputerUseToolName(normalizedToolName) || isMcpComputerUseRuntime(runtime)) {
         if (WEB_SURFACE_PATTERN.test(taskText) && !COMPUTER_USE_INTENT_PATTERN.test(taskText)) {
           return {
             decision: "defer",

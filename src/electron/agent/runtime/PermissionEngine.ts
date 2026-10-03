@@ -80,6 +80,8 @@ export interface PermissionEngineRequest {
   };
   /** Internal/test override for the rollout gate; callers normally use the env default. */
   accessPolicyVersion?: AccessPolicyVersion;
+  /** Host classification from the installed local driver configuration, never tool input. */
+  trustedLocalComputerUse?: boolean;
 }
 
 type PermissionFacts = {
@@ -783,6 +785,26 @@ export class PermissionEngine {
     if (!profile) return null;
 
     if (
+      request.trustedLocalComputerUse === true &&
+      request.mode === "bypass_permissions" &&
+      profile.sandbox === "danger-full-access" &&
+      profile.approval === "never" &&
+      facts.isMcp &&
+      request.approvalType === "external_service" &&
+      !facts.isProtectedCredential &&
+      !facts.isDataExport &&
+      !facts.isLocationAccess
+    ) {
+      return {
+        decision: "allow",
+        reason: {
+          type: "other",
+          summary: "Full access authorizes the configured local computer-use driver.",
+        },
+      };
+    }
+
+    if (
       facts.isExplicitConsentRequired ||
       this.externalFileCrossesBoundary(request, facts) ||
       facts.isNonWorkspaceInteraction
@@ -1306,7 +1328,6 @@ export class PermissionEngine {
       "take_screenshot",
       "git_commit",
       "git_merge_to_base",
-      "memory_curate",
       "skill_create",
       "skill_duplicate",
       "skill_update",

@@ -286,14 +286,23 @@ describe("PermissionEngine", () => {
     expect(result.matchedRule?.scope.kind).toBe("mcp_server");
   });
 
-  it.each(["memory_save", "supermemory_remember", "supermemory_forget", "kg_create_entity", "kg_add_observation"])(
+  it.each([
+    "memory_remember",
+    "memory_forget",
+    "memory_save",
+    "memory_curate",
+    "supermemory_remember",
+    "supermemory_forget",
+    "kg_create_entity",
+    "kg_add_observation",
+  ])(
     "treats memory write %s as a mutation in plan mode (SEC-12)",
     (toolName) => {
       expect(evaluate({ toolName, mode: "plan" }).decision).toBe("deny");
     },
   );
 
-  it.each(["search_memories", "kg_search", "memory_details"])(
+  it.each(["memory_recall", "context_recall", "search_memories", "kg_search", "memory_details"])(
     "keeps memory read %s allowed in plan mode",
     (toolName) => {
       expect(evaluate({ toolName, mode: "plan" }).decision).toBe("allow");
@@ -1502,4 +1511,69 @@ describe("PermissionEngine", () => {
       }
     });
   });
+});
+
+it("honors Full access for the host-classified local driver without widening generic MCP consent", () => {
+  const fullWorkspace = {
+    ...workspace,
+    permissions: {
+      ...workspace.permissions,
+      accessProfileId: "full_access",
+      accessSandboxMode: "danger-full-access" as const,
+      accessApprovalPolicy: "never" as const,
+      accessNetworkMode: "enabled" as const,
+    },
+  };
+  const request = {
+    workspace: fullWorkspace,
+    mode: "bypass_permissions" as const,
+    toolName: "mcp_js",
+    approvalType: "external_service" as const,
+    toolInput: { code: "await app.getAXState()", trustedLocalComputerUse: true },
+    rules: [],
+  };
+  expect(PermissionEngine.evaluate(request).decision).toBe("deny");
+  expect(PermissionEngine.evaluate({ ...request, trustedLocalComputerUse: true }).decision).toBe(
+    "allow",
+  );
+  for (const effect of ["deny", "ask"] as const) {
+    const result = PermissionEngine.evaluate({
+      ...request,
+      trustedLocalComputerUse: true,
+      rules: [{ source: "profile", effect, scope: { kind: "tool", toolName: "mcp_js" } }],
+    });
+    expect(result.decision).toBe("deny");
+  }
+  expect(
+    PermissionEngine.evaluate({
+      ...request,
+      trustedLocalComputerUse: true,
+      approvalType: "protected_credential",
+    }).decision,
+  ).toBe("deny");
+  expect(
+    PermissionEngine.evaluate({
+      ...request,
+      trustedLocalComputerUse: true,
+      workspace: {
+        ...fullWorkspace,
+        permissions: { ...fullWorkspace.permissions, accessSandboxMode: "read-only" },
+      },
+    }).decision,
+  ).toBe("deny");
+  expect(
+    PermissionEngine.evaluate({
+      ...request,
+      trustedLocalComputerUse: true,
+      workspace: {
+        ...fullWorkspace,
+        permissions: {
+          ...fullWorkspace.permissions,
+          accessApprovalPolicy: "on-request",
+          accessSandboxMode: "workspace-write",
+        },
+      },
+      mode: "default",
+    }).decision,
+  ).toBe("ask");
 });
