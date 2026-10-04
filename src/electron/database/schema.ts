@@ -7,6 +7,8 @@ import { createLogger } from "../utils/logger";
 import { ensureEverydayAgentSchema } from "../everyday-agent/schema";
 import { runMemoryPayloadMigration } from "../memory/memory-payload-migration-sql";
 import { ensureMemoryItemsSchema } from "../memory/memory-items-sql";
+import { ensureSupermemoryRemoteRefsSchema } from "../memory/supermemory-remote-refs-sql";
+import { ensureMemoryCurationSchema } from "../memory/memory-curation-log-sql";
 import type { DatabaseClient } from "./async/DatabaseClient";
 import { ensureSecureSettingsSchema } from "./secure-settings-sql";
 import { ensurePulseSchema } from "../telemetry/pulse-store-sql";
@@ -2729,6 +2731,7 @@ export class DatabaseManager {
     ensureEverydayAgentSchema(this.db);
     this.migrateMemoryPayloadTables();
     this.initializeMemoryItems();
+    this.ensureForeignKeyChildIndexes();
 
     // Seed default models if table is empty
     this.seedDefaultModels();
@@ -8289,6 +8292,49 @@ export class DatabaseManager {
   }
 
   /**
+   * SQLite enforces a foreign key on parent delete by looking up child rows by the child
+   * column. Without an index on that column every deleted parent row scans the whole child
+   * table: deleting one temp workspace's 54 work-session items took ~4.8 s against a
+   * 63k-row `work_session_items` (self-referencing `causal_parent_item_id`), and deleting
+   * tasks scanned `activity_feed`, `llm_call_events` and others once per task.
+   * Full (not partial) indexes, so foreign-key enforcement can always use them. Tables
+   * created lazily by their owning service may not exist yet; those are skipped here and
+   * picked up on a later start.
+   */
+  private ensureForeignKeyChildIndexes(): void {
+    const childKeys: Array<[table: string, column: string]> = [
+      ["work_session_items", "causal_parent_item_id"],
+      ["work_session_constraints", "source_item_id"],
+      ["work_session_constraints", "turn_id"],
+      ["work_session_evidence", "item_id"],
+      ["work_session_activity_leases", "turn_id"],
+      ["work_session_wait_states", "turn_id"],
+      ["work_session_wait_states", "task_id"],
+      ["work_session_turns", "task_id"],
+      ["work_session_outcome_contracts", "task_id"],
+      ["activity_feed", "task_id"],
+      ["llm_call_events", "task_id"],
+      ["pending_memory_writes", "task_id"],
+      ["managed_session_events", "source_task_id"],
+      ["tasks", "branch_from_task_id"],
+      ["heartbeat_runs", "task_id"],
+      ["heartbeat_runs", "resumed_from_run_id"],
+      ["memory_observation_metadata", "task_id"],
+      ["core_failure_cluster_members", "failure_record_id"],
+      ["agent_team_thoughts", "team_item_id"],
+    ];
+    for (const [table, column] of childKeys) {
+      try {
+        this.db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_fk_${table}_${column} ON ${table}(${column})`,
+        );
+      } catch {
+        // Table or column not created yet (lazy schema); the next start adds the index.
+      }
+    }
+  }
+
+  /**
    * LIFE-4: `dreaming_runs.source_task_id` and `pending_memory_writes.task_id` referenced
    * tasks(id) without an ON DELETE action, so deleting a task failed the foreign key check
    * whenever either row existed. Rebuild both tables with ON DELETE SET NULL (the SQLite
@@ -8492,6 +8538,18 @@ export class DatabaseManager {
       ensureMemoryItemsSchema(this.db);
     } catch (error) {
       schemaLogger.warn("[DatabaseManager] memory_items schema initialization failed:", error);
+    }
+    // SEC-17: remote ids of Supermemory copies, so local deletes can forget them remotely.
+    try {
+      ensureSupermemoryRemoteRefsSchema(this.db);
+    } catch (error) {
+      schemaLogger.warn("[DatabaseManager] Supermemory remote refs schema failed:", error);
+    }
+    // Phase 3: the memory curator's audit log and Dreaming columns (memory-curation-log-sql).
+    try {
+      ensureMemoryCurationSchema(this.db);
+    } catch (error) {
+      schemaLogger.warn("[DatabaseManager] memory curation schema initialization failed:", error);
     }
   }
 
