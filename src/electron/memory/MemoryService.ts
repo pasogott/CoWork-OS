@@ -37,15 +37,23 @@ import {
 import { MemoryTierService } from "./MemoryTierService";
 import { SupermemoryService } from "./SupermemoryService";
 import { SupermemoryRemoteRefRepository } from "./SupermemoryRemoteRefRepository";
-import { MemoryWriter } from "./MemoryWriter";
+import { MemoryWriter, memoryTextSalience } from "./MemoryWriter";
+import { InFlightWork } from "../utils/in-flight-work";
 import { MemoryObservationService } from "./MemoryObservationService";
 import { MemoryWriteGate, type MemoryWriteOrigin } from "./MemoryWriteGate";
-import type { CoreMemoryScopeKind } from "../../shared/types";
 import { MemoryFeaturesManager } from "../settings/memory-features-manager";
 import { createLogger } from "../utils/logger";
 import { containsNoMemoryDirective } from "./no-memory-directive";
-import { redactSecrets } from "./sensitive-content";
+import { REDACTED_SECRET, redactSecrets } from "./sensitive-content";
+import type { MemoryItemKind } from "./memory-items-types";
 import { neutralizeReservedImportPrefix } from "./memory-visibility";
+import {
+  PROMPT_RECALL_IGNORE_MARKER,
+  buildDeterministicSummary,
+  informativeMemoryText,
+  memoryEmbeddingText,
+} from "./memory-summary";
+import { MemoryCompressionBudget } from "./MemoryCompressionBudget";
 
 // Secret values are redacted before storage by `redactSecrets` (./sensitive-content);
 // merely mentioning auth, tokens or `.env` no longer hides a memory.
@@ -70,9 +78,12 @@ const COMPRESSION_RETRY_BASE_DELAY_MS = 5_000;
 const MAX_COMPRESSION_RETRIES = 3;
 const MAX_TEXT_IMPORT_ENTRIES = 3000;
 const MAX_TEXT_IMPORT_ENTRY_CHARS = 12000;
-const PROMPT_RECALL_IGNORE_MARKER = "[cowork:prompt_recall=ignore]";
 const COMPRESSION_BATCH_WINDOW_MS = 5 * 60 * 1000;
-const LOCAL_SUMMARY_MAX_CHARS = 220;
+// Output cap of one AI compression call: a one-line summary or a short digest.
+const COMPRESSION_MAX_OUTPUT_TOKENS = 160;
+// Content excerpt the model sees: one memory, or each memory of a batch.
+const COMPRESSION_SINGLE_EXCERPT_CHARS = 4000;
+const COMPRESSION_BATCH_EXCERPT_CHARS = 600;
 const logger = createLogger("MemoryService");
 
 type MemoryCaptureOrigin =
@@ -93,11 +104,6 @@ export interface MemoryCaptureOptions {
   priority?: MemoryCompressionPriority;
   signalFamily?: string;
   batchable?: boolean;
-  profileId?: string;
-  coreTraceId?: string;
-  candidateId?: string;
-  scopeKind?: CoreMemoryScopeKind;
-  scopeRef?: string;
   skipMemoryWriteGate?: boolean;
   /**
    * Allow an explicit write to proceed when auto-capture is off: a user-enabled source
@@ -107,6 +113,8 @@ export interface MemoryCaptureOptions {
   forceCapture?: boolean;
   /** Permit the optional external-memory mirror for this capture. */
   allowExternalMirror?: boolean;
+  /** The caller knows the task or message opted out with `<no-memory>`: store nothing. */
+  noMemory?: boolean;
 }
 
 interface CompressionQueueEntry {
@@ -114,6 +122,16 @@ interface CompressionQueueEntry {
   batchKey: string;
   origin: MemoryCaptureOrigin;
   priority: MemoryCompressionPriority;
+  requestedAt: number;
+}
+
+/** Queued rows compressed together (one task, or one origin in a time window). */
+interface CompressionGroup {
+  workspaceId: string;
+  batchKey: string;
+  origin: MemoryCaptureOrigin;
+  priority: MemoryCompressionPriority;
+  memoryIds: string[];
   requestedAt: number;
 }
 
@@ -137,6 +155,56 @@ export interface PromptRecallDiagnostics {
   workerHits: number;
   lastFailureAt: number | null;
   lastFailureMessage: string | null;
+}
+
+/** `source_ref.store` of facts written by the import API; `id` is the archive row. */
+export const IMPORT_FACT_STORE = "import";
+
+const IMPORT_HEADER_PREFIX = "[Imported from ";
+
+/** The text of an imported archive row without its `[Imported from …]` header line. */
+function importedBody(content: string): string {
+  const trimmed = String(content || "").trimStart();
+  if (!trimmed.startsWith(IMPORT_HEADER_PREFIX)) return trimmed.trim();
+  const newline = trimmed.indexOf("\n");
+  return newline === -1 ? "" : trimmed.slice(newline + 1).trim();
+}
+
+/** One line, starting with the reserved import prefix (only importers may write it). */
+function normalizeImportHeader(header: string): string {
+  const line = String(header || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+  if (line.startsWith(IMPORT_HEADER_PREFIX)) return line;
+  return `${IMPORT_HEADER_PREFIX}${line.replace(/^\[|\]$/g, "") || "an import"}]`;
+}
+
+export interface MemoryImportEntry {
+  type: "observation" | "decision" | "insight";
+  /** The imported text; sanitized, redacted and deduplicated by the session. */
+  body: string;
+  /** Provenance line, `[Imported from <source> — "<title>"]`. */
+  header: string;
+  /** A fact about the user: also written to `memory_items` as an `import` item. */
+  fact?: { kind: MemoryItemKind; importer: string; conversationId?: string };
+}
+
+export type MemoryImportOutcome =
+  | { status: "created"; memory: Memory; factItemId?: string }
+  | { status: "duplicate" }
+  | {
+      status: "filtered";
+      reason: "no_memory" | "empty" | "low_salience" | "secret_only" | "excluded";
+    };
+
+export interface MemoryImportSession {
+  readonly workspaceId: string;
+  /** Rows of this session are private (forced, or strict privacy mode). */
+  readonly isPrivate: boolean;
+  add(entry: MemoryImportEntry): Promise<MemoryImportOutcome>;
+  /** Apply the storage cap; call once after the last entry. */
+  finish(): Promise<{ created: number }>;
 }
 
 export class MemoryService {
@@ -169,6 +237,8 @@ export class MemoryService {
   private static compressionInProgress = false;
   private static compressionPauseCount = 0;
   private static compressionDrainTimer?: ReturnType<typeof setTimeout>;
+  /** Pending compression retries; cleared at shutdown so none fires against a closed DB. */
+  private static compressionRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   private static compressionBudgetByWorkspace = new Map<string, number[]>();
   private static compressionDiagnosticsByWorkspace = new Map<string, CompressionDiagnostics>();
   private static sideChannelPolicyDepth = 0;
@@ -177,6 +247,15 @@ export class MemoryService {
   private static sideChannelCallsRemaining: number | null = null;
   private static sideChannelPolicyPaused = false;
   private static cleanupIntervalHandle?: ReturnType<typeof setInterval>;
+  /**
+   * Async work that writes to the database: compression batches, markdown index syncs,
+   * cleanup runs and the archive migration. `drain()` waits for it before shutdown.
+   */
+  private static inFlight = new InFlightWork();
+  /** Set by `drain()`: no new compression batch, markdown sync or cleanup starts. */
+  private static draining = false;
+  /** Bound for `drain()` at shutdown. */
+  static readonly DRAIN_TIMEOUT_MS = 5_000;
   private static db?: import("better-sqlite3").Database;
   /** The memory domain's statement port (DB6). */
   private static sql?: MemoryStatementPort;
@@ -207,10 +286,15 @@ export class MemoryService {
   };
 
   /**
-   * Initialize the memory service
+   * Initialize the memory service. `backgroundJobs: false` (desktop quiet mode) skips the
+   * periodic cleanup and the deferred one-time archive cleanup.
    */
-  static initialize(dbManager: DatabaseManager): void {
+  static initialize(
+    dbManager: DatabaseManager,
+    options: { backgroundJobs?: boolean } = {},
+  ): void {
     if (this.initialized) return;
+    this.draining = false;
 
     const db = dbManager.getDatabase();
     this.db = db;
@@ -237,10 +321,16 @@ export class MemoryService {
     });
     this.initialized = true;
 
+    if (options.backgroundJobs === false) {
+      logger.info("[MemoryService] Initialized (background cleanup not started)");
+      return;
+    }
+
     // Start periodic cleanup
     // runCleanup handles and logs its own errors.
     this.cleanupIntervalHandle = setInterval(() => {
-      void this.runCleanup();
+      if (this.draining) return;
+      void this.inFlight.track(this.runCleanup());
     }, CLEANUP_INTERVAL_MS);
 
     this.scheduleArchiveCleanupMigration();
@@ -259,7 +349,14 @@ export class MemoryService {
     if (this.archiveCleanupTimer) return;
     this.archiveCleanupTimer = setTimeout(() => {
       this.archiveCleanupTimer = undefined;
-      void this.runArchiveCleanupMigration();
+      if (this.draining) return;
+      // The summary re-index follows the cleanup, so it never re-indexes rows the
+      // cleanup deletes or redacts.
+      void this.inFlight.track(
+        this.runArchiveCleanupMigration().then(() => {
+          if (!this.draining) return this.runSummaryReindex();
+        }),
+      );
     }, MemoryService.ARCHIVE_CLEANUP_DELAY_MS);
     this.archiveCleanupTimer.unref?.();
   }
@@ -289,6 +386,49 @@ export class MemoryService {
       this.promptRecallCache.clear();
     } catch (error) {
       logger.warn("[MemoryService] Archive cleanup migration failed:", error);
+    }
+  }
+
+  private static readonly SUMMARY_REINDEX_PAUSE_MS = 50;
+
+  /**
+   * Run the one-time summary re-index now (DATA-5; idempotent, claimed and resumable,
+   * MemorySummaryReindex.ts): chunks of rows in the database worker with a pause between
+   * them; stops at shutdown and resumes on the next start. Exposed for tests and tooling.
+   */
+  static async runSummaryReindex(): Promise<void> {
+    const sql = this.sql;
+    if (!this.initialized || !sql) return;
+    // The FTS worker's cache is told per chunk; the host caches are dropped once at the
+    // end (until then they only hold the old vectors), so searches during the run do not
+    // reload them after every chunk.
+    const changedWorkspaces = new Set<string>();
+    try {
+      const { runMemorySummaryReindex } = await import("./MemorySummaryReindex");
+      const result = await runMemorySummaryReindex(sql, {
+        pause: () => new Promise((resolve) => setTimeout(resolve, this.SUMMARY_REINDEX_PAUSE_MS)),
+        shouldStop: () => !this.initialized || this.draining,
+        onChunk: (chunk) => {
+          if (chunk.memoryIds.length === 0) return;
+          this.ftsWorker?.invalidateEmbeddings({ kind: "memories", memoryIds: chunk.memoryIds });
+          for (const workspaceId of chunk.workspaceIds) changedWorkspaces.add(workspaceId);
+        },
+      });
+      if (result.ran) logger.info("[MemoryService] Summary re-index completed", result.counts);
+    } catch (error) {
+      logger.warn("[MemoryService] Summary re-index failed:", error);
+    } finally {
+      if (changedWorkspaces.size > 0 && this.initialized) {
+        for (const workspaceId of changedWorkspaces) {
+          this.memoryEmbeddingsByWorkspace.delete(workspaceId);
+          this.embeddingsLoadedForWorkspace.delete(workspaceId);
+          this.storageEstimateByWorkspace.delete(workspaceId);
+        }
+        this.importedEmbeddings.clear();
+        this.importedEmbeddingsLoaded = false;
+        this.embeddingCacheGeneration += 1;
+        this.promptRecallCache.clear();
+      }
     }
   }
 
@@ -325,8 +465,10 @@ export class MemoryService {
     readGuard?: MarkdownMemoryReadGuard,
   ): Promise<void> {
     this.ensureInitialized();
-    if (!this.markdownIndex) return;
-    await this.markdownIndex.syncWorkspace(workspaceId, workspacePath, force, undefined, readGuard);
+    if (!this.markdownIndex || this.draining) return;
+    await this.inFlight.track(
+      this.markdownIndex.syncWorkspace(workspaceId, workspacePath, force, undefined, readGuard),
+    );
   }
 
   /**
@@ -341,9 +483,12 @@ export class MemoryService {
     readGuard?: MarkdownMemoryReadGuard,
   ): Promise<MemorySearchResult[]> {
     this.ensureInitialized();
-    if (!this.markdownIndex) return [];
+    if (!this.markdownIndex || this.draining) return [];
     try {
-      return await this.markdownIndex.search(workspaceId, workspacePath, query, limit, readGuard);
+      // A search syncs the index first, so it is tracked like a sync.
+      return await this.inFlight.track(
+        this.markdownIndex.search(workspaceId, workspacePath, query, limit, readGuard),
+      );
     } catch {
       return [];
     }
@@ -362,7 +507,13 @@ export class MemoryService {
   ): Promise<Memory | null> {
     this.ensureInitialized();
 
-    if (containsNoMemoryDirective(content)) {
+    // The shared hygiene of every memory producer (docs/memory-engine.md §1): `<no-memory>`
+    // (in the text or known by the caller), the salience gate, then settings, redaction,
+    // privacy and content-hash dedupe below.
+    if (options?.noMemory || containsNoMemoryDirective(content)) {
+      return null;
+    }
+    if (memoryTextSalience(content)) {
       return null;
     }
 
@@ -460,21 +611,21 @@ export class MemoryService {
 
     // Best-effort: keep a concise local summary immediately so retrieval and prompts
     // do not need to consume the full raw payload for low-value entries.
+    // `tokens` stays the content's estimate: the compression gates compare it (DATA-7).
     const localSummary = this.buildDeterministicSummary(truncatedContent);
     let embedding: { values: number[]; updatedAt: number } | undefined;
-    const finalSummary = localSummary ? this.buildDeterministicSummary(localSummary) : "";
-    if (finalSummary) {
-      memory.summary = finalSummary;
-      memory.tokens = estimateTokens(finalSummary);
+    if (localSummary) {
+      memory.summary = localSummary;
       memory.isCompressed = true;
-      try {
-        embedding = {
-          values: createLocalEmbedding(this.normalizeForEmbedding(finalSummary, finalSummary)),
-          updatedAt: memory.updatedAt,
-        };
-      } catch {
-        // The embedding backfill computes it later.
-      }
+    }
+    try {
+      // Built from the content with the summary, not the summary alone (DATA-5).
+      embedding = {
+        values: createLocalEmbedding(this.normalizeForEmbedding(localSummary, truncatedContent)),
+        updatedAt: memory.updatedAt,
+      };
+    } catch {
+      // The embedding backfill computes it later.
     }
 
     let observation: ReturnType<typeof MemoryObservationService.buildMetadataFor> | undefined;
@@ -583,10 +734,35 @@ export class MemoryService {
 
     // Enforce per-workspace storage cap (best-effort).
     await this.enforceStorageLimit(workspaceId, settings.maxStorageMb, {
-      addedBytes: truncatedContent.length + (memory.summary?.length ?? 0),
+      addedBytes: this.captureBytes(truncatedContent, memory.summary, embedding, observation),
     });
 
     return memory;
+  }
+
+  /**
+   * Bytes a capture adds, counted the way `getApproxStorageBytes` measures them: content,
+   * summary, the embedding's stored JSON and the observation's text columns (DATA-7).
+   */
+  private static captureBytes(
+    content: string,
+    summary: string | undefined,
+    embedding: { values: number[] } | undefined,
+    observation: ReturnType<typeof MemoryObservationService.buildMetadataFor> | undefined,
+  ): number {
+    let bytes = content.length + (summary?.length ?? 0);
+    if (embedding) bytes += JSON.stringify(embedding.values).length;
+    if (observation) {
+      bytes +=
+        observation.title.length +
+        (observation.subtitle?.length ?? 0) +
+        observation.narrative.length +
+        JSON.stringify(observation.facts).length +
+        JSON.stringify(observation.concepts).length +
+        JSON.stringify(observation.filesRead).length +
+        JSON.stringify(observation.filesModified).length;
+    }
+    return bytes;
   }
 
   /**
@@ -751,11 +927,6 @@ export class MemoryService {
       batchKey: options.batchKey,
       priority: options.priority,
       signalFamily: options.signalFamily,
-      profileId: options.profileId,
-      coreTraceId: options.coreTraceId,
-      candidateId: options.candidateId,
-      scopeKind: options.scopeKind,
-      scopeRef: options.scopeRef,
       forceCapture: options.forceCapture,
     };
   }
@@ -918,13 +1089,13 @@ export class MemoryService {
     return result;
   }
 
+  /**
+   * The local embedding's input: the summary and the informative content, with import
+   * tags and constant preambles stripped and a bounded length (DATA-5). It used to be
+   * the summary alone, so rows sharing a first line shared a vector.
+   */
   private static normalizeForEmbedding(summary: string | undefined, content: string): string {
-    let text = (summary || content || "").trim();
-    // Strip import tags to reduce noise in semantic space.
-    text = text.replace(/^\[Imported from [^\]]+\]\s*/i, "");
-    // Keep a bounded prefix for speed and to avoid pathological inputs.
-    if (text.length > 12000) text = text.slice(0, 12000);
-    return text;
+    return memoryEmbeddingText(summary, content);
   }
 
   private static extractFirstCodeBlock(text: string): string | null {
@@ -1543,7 +1714,18 @@ export class MemoryService {
    */
   static async getStats(workspaceId: string): Promise<MemoryStats> {
     this.ensureInitialized();
-    return this.memoryRepo.getStats(workspaceId);
+    const stats = await this.memoryRepo.getStats(workspaceId);
+    // The AI compression's token use for the Memory settings notice (all workspaces).
+    try {
+      const usage = await MemoryCompressionBudget.usage(this.sql);
+      return {
+        ...stats,
+        compressionTokensLast24h: usage.tokensLast24h,
+        compressionDailyTokenBudget: usage.dailyTokenBudget,
+      };
+    } catch {
+      return stats;
+    }
   }
 
   /**
@@ -1579,6 +1761,7 @@ export class MemoryService {
 
     const deleted = await this.memoryRepo.deleteByIds(workspaceId, [memoryId]);
     if (deleted <= 0) return false;
+    await this.closeImportedFacts([memoryId], "deleted");
     SupermemoryService.scheduleOrphanSweep();
 
     this.importedEmbeddings.delete(memoryId);
@@ -1620,6 +1803,9 @@ export class MemoryService {
     this.importedEmbeddings.delete(memoryId);
     const updated = await this.memoryRepo.findById(memoryId);
     if (updated) {
+      // An ignored import is not recalled as a fact either; un-ignoring writes it again.
+      if (ignored) await this.closeImportedFacts([memoryId], "archived");
+      else await this.restoreImportedFact(updated);
       this.promptRecallCache.clear();
       return updated;
     }
@@ -1631,6 +1817,7 @@ export class MemoryService {
    */
   static async deleteImported(workspaceId: string): Promise<number> {
     this.ensureInitialized();
+    await this.deleteImportedFactsOfWorkspace(workspaceId);
     // Remove embeddings first (embeddings table references memories by id).
     try {
       await this.embeddingRepo.deleteImported(workspaceId);
@@ -1653,6 +1840,288 @@ export class MemoryService {
     return deleted;
   }
 
+  /**
+   * The one gated import API (docs/memory-engine.md §1): every importer (ChatGPT export,
+   * pasted memories) writes through a session. Opening one checks the workspace memory
+   * settings (memory off or privacy mode `disabled` refuse the import; strict privacy or
+   * `forcePrivate` make the rows private, which keeps them in their workspace). Each entry
+   * then passes `<no-memory>`, the salience gate, input sanitization, inline `<private>`
+   * blocks, secret redaction, excluded patterns and dedupe (against every imported row
+   * visible in the workspace, so a re-import or the same history imported in another
+   * workspace adds nothing), and is stored with its embedding and observation sidecar in one
+   * capture. Entries marked as facts about the user are also written to `memory_items` as
+   * `import` items through `MemoryWriter`. `finish` applies the storage cap. Imports are
+   * explicit user acts: auto-capture does not apply, and nothing is mirrored externally.
+   */
+  static async openImportSession(options: {
+    workspaceId: string;
+    forcePrivate?: boolean;
+  }): Promise<MemoryImportSession> {
+    this.ensureInitialized();
+    const workspaceId = options.workspaceId;
+    const settings = await this.settingsRepo.getOrCreate(workspaceId);
+    if (!settings.enabled) {
+      throw new Error("Memory system is disabled for this workspace. Enable it in settings first.");
+    }
+    if (settings.privacyMode === "disabled") {
+      throw new Error(
+        "Memory privacy mode is set to disabled for this workspace. Change it in settings first.",
+      );
+    }
+    const isPrivate = options.forcePrivate === true || settings.privacyMode === "strict";
+    const seen = new Set<string>();
+    try {
+      const rows = this.sql
+        ? await this.sql.all<{ content: string }>("import_visibleImportedContents", [workspaceId])
+        : [];
+      for (const row of rows) {
+        const body = importedBody(this.stripPromptRecallIgnoreMarker(row.content));
+        if (body) seen.add(observationContentHash(body));
+      }
+    } catch (error) {
+      // Within-session dedupe and the capture's own dedupe still apply.
+      logger.warn("[MemoryService] Could not load imported rows for dedupe:", error);
+    }
+
+    let created = 0;
+    const add = async (entry: MemoryImportEntry): Promise<MemoryImportOutcome> => {
+      if (containsNoMemoryDirective(entry.body)) return { status: "filtered", reason: "no_memory" };
+      const privacyPrepared = this.applyInlinePrivacy(
+        InputSanitizer.sanitizeMemoryContent(entry.body),
+      );
+      const redaction = redactSecrets(privacyPrepared.content);
+      const text = redaction.text.trim();
+      const salience = memoryTextSalience(text);
+      if (salience) return { status: "filtered", reason: salience };
+      if (
+        redaction.count > 0 &&
+        memoryTextSalience(text.split(REDACTED_SECRET).join(" ")) !== null
+      ) {
+        return { status: "filtered", reason: "secret_only" };
+      }
+      if (this.shouldExclude(text, settings)) return { status: "filtered", reason: "excluded" };
+      const bounded =
+        text.length > MAX_TEXT_IMPORT_ENTRY_CHARS
+          ? `${text.slice(0, MAX_TEXT_IMPORT_ENTRY_CHARS)}\n[... truncated]`
+          : text;
+      const bodyHash = observationContentHash(bounded);
+      if (seen.has(bodyHash)) return { status: "duplicate" };
+      seen.add(bodyHash);
+
+      const header = normalizeImportHeader(entry.header);
+      const content = `${header}\n${bounded}`;
+      const rowIsPrivate = isPrivate || privacyPrepared.hadPrivateBlock;
+      const createdAt = Date.now();
+      const summary = this.buildDeterministicSummary(bounded);
+      const memory: Memory = {
+        id: randomUUID(),
+        workspaceId,
+        type: entry.type,
+        content,
+        summary: summary || undefined,
+        tokens: estimateTokens(content),
+        isCompressed: Boolean(summary),
+        isPrivate: rowIsPrivate,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      let embedding: { values: number[]; updatedAt: number } | undefined;
+      try {
+        embedding = {
+          values: createLocalEmbedding(this.normalizeForEmbedding(summary, bounded)),
+          updatedAt: createdAt,
+        };
+      } catch {
+        // The imported-embedding backfill computes it later.
+      }
+      let observation: ReturnType<typeof MemoryObservationService.buildMetadataFor> | undefined;
+      if (MemoryFeaturesManager.loadSettings().structuredObservationsEnabled !== false) {
+        try {
+          observation = MemoryObservationService.buildMetadataFor(memory, {
+            origin: "import",
+            captureReason: "memory_import",
+            privacyState: rowIsPrivate
+              ? privacyPrepared.hadPrivateBlock
+                ? "redacted"
+                : "private"
+              : "normal",
+          });
+        } catch {
+          // Auxiliary index; the import still succeeds.
+        }
+      }
+      const result = await this.writeCapture({
+        memory: {
+          id: memory.id,
+          workspaceId,
+          taskId: null,
+          type: entry.type,
+          content,
+          summary: memory.summary ?? null,
+          tokens: memory.tokens,
+          isCompressed: memory.isCompressed,
+          isPrivate: rowIsPrivate,
+          createdAt,
+          updatedAt: createdAt,
+        },
+        ...(embedding ? { embedding } : {}),
+        ...(observation ? { observation } : {}),
+        // The same imported row already in this workspace, at any age.
+        dedupe: { contentHash: observationContentHash(content), since: 0 },
+      });
+      if (result?.duplicateOf) return { status: "duplicate" };
+      if (embedding) {
+        this.cacheEmbedding(workspaceId, memory.id, embedding.values, embedding.updatedAt);
+        if (this.importedEmbeddingsLoaded) {
+          this.importedEmbeddings.set(memory.id, {
+            updatedAt: embedding.updatedAt,
+            embedding: Float32Array.from(embedding.values),
+            workspaceId,
+          });
+        }
+      }
+      created += 1;
+      const factItemId = entry.fact
+        ? await this.writeImportedFact(workspaceId, memory.id, bounded, rowIsPrivate, entry.fact)
+        : undefined;
+      return { status: "created", memory, ...(factItemId ? { factItemId } : {}) };
+    };
+
+    return {
+      workspaceId,
+      isPrivate,
+      add,
+      finish: async () => {
+        if (created > 0) {
+          this.promptRecallCache.clear();
+          await this.enforceStorageLimit(workspaceId, settings.maxStorageMb, { force: true });
+        }
+        return { created };
+      },
+    };
+  }
+
+  /**
+   * An imported fact about the user as a `memory_items` item: source `import` (never
+   * `user_stated`), workspace scope (the import's workspace; Clear All Memories removes
+   * it), private when the imported row is. `source_ref` names the archive row
+   * (`{ store: "import", id }`), so deleting or ignoring the imported row forgets it.
+   */
+  private static async writeImportedFact(
+    workspaceId: string,
+    archiveId: string,
+    content: string,
+    isPrivate: boolean,
+    fact: NonNullable<MemoryImportEntry["fact"]>,
+  ): Promise<string | undefined> {
+    const writer = MemoryWriter.get();
+    if (!writer) return undefined;
+    try {
+      const result = await writer.ingest({
+        content,
+        kind: fact.kind,
+        scope: "workspace",
+        workspaceId,
+        source: "import",
+        sourceRef: {
+          store: IMPORT_FACT_STORE,
+          id: archiveId,
+          importer: fact.importer,
+          ...(fact.conversationId ? { conversationId: fact.conversationId } : {}),
+        },
+        confidence: 0.6,
+        ...(isPrivate ? { privacy: "private" as const } : {}),
+        originWorkspaceId: workspaceId,
+        originText: content,
+      });
+      return result.status === "written" ? result.item.id : undefined;
+    } catch (error) {
+      logger.warn("[MemoryService] Imported fact was not written:", error);
+      return undefined;
+    }
+  }
+
+  /**
+   * Close the `memory_items` facts that were imported with these archive rows (their
+   * primary source ref; a fact another source also holds is left alone).
+   */
+  private static async closeImportedFacts(
+    archiveIds: string[],
+    status: "deleted" | "archived",
+  ): Promise<void> {
+    const writer = MemoryWriter.get();
+    if (!writer || archiveIds.length === 0) return;
+    for (const archiveId of archiveIds) {
+      try {
+        const items = await writer.repository.findBySourceRef(
+          IMPORT_FACT_STORE,
+          archiveId,
+          status === "deleted" ? ["active", "archived", "superseded"] : ["active"],
+        );
+        for (const item of items) {
+          if (item.source !== "import" || item.sourceRef?.store !== IMPORT_FACT_STORE) continue;
+          if (item.sourceRef?.id !== archiveId) continue;
+          await writer.setStatus(item.id, status);
+        }
+      } catch (error) {
+        logger.warn("[MemoryService] Could not close imported facts:", error);
+      }
+    }
+  }
+
+  /** Write an un-ignored imported row's fact again (reactivation goes through ingest). */
+  private static async restoreImportedFact(memory: Memory): Promise<void> {
+    const writer = MemoryWriter.get();
+    if (!writer) return;
+    try {
+      const items = await writer.repository.findBySourceRef(IMPORT_FACT_STORE, memory.id, [
+        "archived",
+      ]);
+      const item = items.find(
+        (candidate) => candidate.source === "import" && candidate.sourceRef?.id === memory.id,
+      );
+      if (!item) return;
+      const body = importedBody(memory.content);
+      if (!body) return;
+      await this.writeImportedFact(memory.workspaceId, memory.id, body, memory.isPrivate, {
+        kind: item.kind,
+        importer: String(item.sourceRef?.importer || "import"),
+        ...(typeof item.sourceRef?.conversationId === "string"
+          ? { conversationId: item.sourceRef.conversationId }
+          : {}),
+      });
+    } catch (error) {
+      logger.warn("[MemoryService] Could not restore imported fact:", error);
+    }
+  }
+
+  /** Every fact the import API wrote for the workspace's imported rows. */
+  private static async deleteImportedFactsOfWorkspace(workspaceId: string): Promise<void> {
+    const writer = MemoryWriter.get();
+    if (!writer) return;
+    try {
+      // Pages of up to 5000; deleted items drop out of the next page.
+      for (let page = 0; page < 100; page += 1) {
+        const items = await writer.repository.list({
+          workspaceId,
+          scope: "workspace",
+          sourceStore: IMPORT_FACT_STORE,
+          statuses: ["active", "archived", "superseded"],
+          includePrivate: true,
+          limit: 5000,
+        });
+        let deleted = 0;
+        for (const item of items) {
+          if (item.source !== "import") continue;
+          deleted += (await writer.setStatus(item.id, "deleted")).length;
+        }
+        if (deleted === 0) break;
+      }
+    } catch (error) {
+      logger.warn("[MemoryService] Could not delete imported facts:", error);
+    }
+  }
+
   static async importFromText(options: {
     workspaceId: string;
     provider: string;
@@ -1668,17 +2137,23 @@ export class MemoryService {
   }> {
     this.ensureInitialized();
 
-    const settings = await this.settingsRepo.getOrCreate(options.workspaceId);
-    if (!settings.enabled) {
-      throw new Error("Memory system is disabled for this workspace. Enable it in settings first.");
-    }
-
-    const providerLabel = options.provider.trim().replace(/\s+/g, " ").slice(0, 80) || "Other AI";
+    const providerLabel =
+      InputSanitizer.sanitizeMemoryContent(options.provider)
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/[[\]]/g, "")
+        .slice(0, 80) || "Other AI";
     const parsedEntries = this.extractTextImportEntries(options.pastedText);
 
     if (parsedEntries.length === 0) {
       throw new Error("No memory entries found. Paste the exported memories and try again.");
     }
+
+    // Pasted memories are private unless the caller says otherwise.
+    const session = await this.openImportSession({
+      workspaceId: options.workspaceId,
+      forcePrivate: options.forcePrivate ?? true,
+    });
 
     const entries = parsedEntries.slice(0, MAX_TEXT_IMPORT_ENTRIES);
     const truncated = Math.max(0, parsedEntries.length - entries.length);
@@ -1686,74 +2161,21 @@ export class MemoryService {
     let memoriesCreated = 0;
     let duplicatesSkipped = 0;
     const errors: string[] = [];
-    const seen = new Set<string>();
-    const markPrivate = options.forcePrivate ?? true;
 
     for (const entry of entries) {
-      const signature = entry.replace(/\s+/g, " ").trim().toLowerCase();
-      if (!signature) {
-        duplicatesSkipped += 1;
-        continue;
-      }
-      if (seen.has(signature)) {
-        duplicatesSkipped += 1;
-        continue;
-      }
-      seen.add(signature);
-
       try {
-        const sanitized = redactSecrets(InputSanitizer.sanitizeMemoryContent(entry)).text.trim();
-        if (!sanitized) {
-          duplicatesSkipped += 1;
-          continue;
-        }
-
-        const bounded =
-          sanitized.length > MAX_TEXT_IMPORT_ENTRY_CHARS
-            ? `${sanitized.slice(0, MAX_TEXT_IMPORT_ENTRY_CHARS)}\n[... truncated]`
-            : sanitized;
-
-        const content = `[Imported from ${providerLabel} — "Memory export (pasted)"]\n${bounded}`;
-
-        const memory = await this.memoryRepo.create({
-          workspaceId: options.workspaceId,
-          taskId: undefined,
+        const outcome = await session.add({
           type: "insight",
-          content,
-          tokens: estimateTokens(content),
-          isCompressed: false,
-          isPrivate: markPrivate,
+          body: entry,
+          header: `[Imported from ${providerLabel} — "Memory export (pasted)"]`,
         });
-
-        // Best-effort: keep hybrid search quality high for imported memories.
-        try {
-          const embedText = this.normalizeForEmbedding(memory.summary, memory.content);
-          const embedding = createLocalEmbedding(embedText);
-          await this.embeddingRepo.upsert(
-            options.workspaceId,
-            memory.id,
-            embedding,
-            memory.updatedAt,
-          );
-          this.cacheEmbedding(options.workspaceId, memory.id, embedding, memory.updatedAt);
-        } catch {
-          // ignore
-        }
-
-        const importedSummary = this.buildDeterministicSummary(bounded);
-        if (importedSummary) {
-          await this.updateMemorySummary(memory, options.workspaceId, importedSummary, true);
-        }
-
-        memoriesCreated += 1;
+        if (outcome.status === "created") memoriesCreated += 1;
+        else duplicatesSkipped += 1;
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
       }
     }
-
-    if (memoriesCreated > 0) {
-      await this.enforceStorageLimit(options.workspaceId, settings.maxStorageMb, { force: true });
-    }
+    await session.finish();
 
     return {
       success: errors.length === 0,
@@ -1800,6 +2222,8 @@ export class MemoryService {
       }
     }
     if (deleted > 0) {
+      // Facts imported with these rows go with them.
+      await this.closeImportedFacts(uniqueIds, "deleted");
       this.promptRecallCache.clear();
       // Their Supermemory copies go too (SEC-17).
       SupermemoryService.scheduleOrphanSweep();
@@ -2004,7 +2428,8 @@ export class MemoryService {
   }
 
   private static isCompressionPaused(): boolean {
-    return this.compressionPauseCount > 0;
+    // While draining, a running batch stops at the next group and keeps the rest queued.
+    return this.compressionPauseCount > 0 || this.draining;
   }
 
   static applyExecutionSideChannelPolicy(
@@ -2180,20 +2605,9 @@ export class MemoryService {
     return false;
   }
 
+  /** The first informative line, at most 220 characters (memory-summary.ts, DATA-5). */
   private static buildDeterministicSummary(content: string): string {
-    const trimmed = this.stripPromptRecallIgnoreMarker(content).trim();
-    if (!trimmed) return "";
-
-    const lines = trimmed
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    let summary = lines.find((line) => !line.startsWith("```")) || lines[0] || trimmed;
-    summary = summary.replace(/\s+/g, " ").trim();
-    if (summary.length > LOCAL_SUMMARY_MAX_CHARS) {
-      summary = `${summary.slice(0, LOCAL_SUMMARY_MAX_CHARS - 3)}...`;
-    }
-    return summary;
+    return buildDeterministicSummary(content);
   }
 
   private static normalizeSummaryStorageText(content: string, maxChars = 1200): string {
@@ -2210,23 +2624,24 @@ export class MemoryService {
     summary: string,
     compressed: boolean,
   ): Promise<void> {
-    const finalSummary = this.buildDeterministicSummary(summary);
+    // A model-written summary is redacted again so it can never reintroduce a secret.
+    const finalSummary = this.buildDeterministicSummary(
+      neutralizeReservedImportPrefix(redactSecrets(summary).text),
+    );
     if (!finalSummary) return;
 
-    const summaryTokens = estimateTokens(finalSummary);
+    // `tokens` keeps the content's estimate (DATA-7); only the summary changes.
     const updatedAt = Date.now();
     await this.memoryRepo.update(memory.id, {
       summary: finalSummary,
-      tokens: summaryTokens,
       isCompressed: compressed,
     });
     memory.summary = finalSummary;
-    memory.tokens = summaryTokens;
     memory.isCompressed = compressed;
     memory.updatedAt = updatedAt;
 
     try {
-      const embedText = this.normalizeForEmbedding(finalSummary, finalSummary);
+      const embedText = this.normalizeForEmbedding(finalSummary, memory.content);
       const embedding = createLocalEmbedding(embedText);
       await this.embeddingRepo.upsert(workspaceId, memory.id, embedding, updatedAt);
       this.cacheEmbedding(workspaceId, memory.id, embedding, updatedAt);
@@ -2244,6 +2659,7 @@ export class MemoryService {
   }
 
   private static scheduleCompressionDrain(delayMs = COMPRESSION_DRAIN_DELAY_MS): void {
+    if (!this.initialized) return;
     if (this.compressionDrainTimer) {
       if (delayMs === 0) {
         clearTimeout(this.compressionDrainTimer);
@@ -2287,10 +2703,15 @@ export class MemoryService {
   }
 
   /**
-   * Process compression queue asynchronously
+   * Process compression queue asynchronously (tracked, so shutdown can wait for a batch).
    */
-  private static async processCompressionQueue(): Promise<void> {
+  private static processCompressionQueue(): Promise<void> {
+    return this.inFlight.track(this.runCompressionQueue());
+  }
+
+  private static async runCompressionQueue(): Promise<void> {
     if (
+      !this.initialized ||
       this.compressionInProgress ||
       this.compressionQueue.length === 0 ||
       this.isCompressionPaused()
@@ -2341,9 +2762,11 @@ export class MemoryService {
           continue;
         }
 
-        const memories = (
-          await Promise.all(group.memoryIds.map((memoryId) => this.memoryRepo.findById(memoryId)))
-        ).filter((memory): memory is Memory => Boolean(memory));
+        // Settings and privacy are checked again at drain time: they may have changed since
+        // the capture queued the rows.
+        const policy = await this.compressionPolicyFor(group.workspaceId);
+        const memories =
+          policy === "drop" ? [] : await this.loadCompressibleMemories(group.memoryIds);
 
         if (memories.length === 0) {
           for (const memoryId of group.memoryIds) {
@@ -2353,7 +2776,8 @@ export class MemoryService {
         }
 
         const budget = this.canSpendCompressionBudget(group.workspaceId);
-        const shouldUseLlm = this.shouldUseLlmForCompressionBatch(group, memories);
+        const shouldUseLlm =
+          policy === "llm" && this.shouldUseLlmForCompressionBatch(group, memories);
 
         if (!shouldUseLlm) {
           await this.finalizeCompressionBatchLocally(group, memories);
@@ -2370,8 +2794,8 @@ export class MemoryService {
           this.scheduleCompressionRetry(group, COMPRESSION_RETRY_DELAY_MS);
           continue;
         } else {
-          await this.compressMemoryBatch(group, memories);
-          this.recordCompressionBudgetUse(group.workspaceId);
+          const { calledModel } = await this.compressMemoryBatch(group, memories);
+          if (calledModel) this.recordCompressionBudgetUse(group.workspaceId);
         }
 
         for (const memoryId of group.memoryIds) {
@@ -2412,10 +2836,53 @@ export class MemoryService {
     if (!memory) return false;
     if (memory.type === "summary" || memory.type === "correction_rule") return false;
     if (this.isStructuredLowValueContent(memory.content)) return false;
+    // The content's estimate, not `memory.tokens`: rows written before DATA-7 stored the
+    // summary's estimate (≤ 55 tokens), so this path could never run.
+    const tokens = estimateTokens(memory.content);
     if (this.isHighSignalMemoryType(memory.type)) {
-      return memory.tokens >= MIN_TOKENS_FOR_COMPRESSION;
+      return tokens >= MIN_TOKENS_FOR_COMPRESSION;
     }
-    return memory.tokens >= MIN_TOKENS_FOR_OBSERVATION_COMPRESSION;
+    return tokens >= MIN_TOKENS_FOR_OBSERVATION_COMPRESSION;
+  }
+
+  /**
+   * What the compression may do for a workspace now: `drop` when memory is off or its
+   * privacy mode is `disabled`; `local` (deterministic only, no model call) when AI
+   * compression is off or privacy mode is `strict`; else `llm`.
+   */
+  private static async compressionPolicyFor(
+    workspaceId: string,
+  ): Promise<"drop" | "local" | "llm"> {
+    try {
+      const settings = await this.settingsRepo.getOrCreate(workspaceId);
+      if (!settings.enabled || settings.privacyMode === "disabled") return "drop";
+      if (!settings.compressionEnabled || settings.privacyMode === "strict") return "local";
+      return "llm";
+    } catch {
+      return "drop";
+    }
+  }
+
+  /**
+   * The queued rows that may still be compressed: present, not private, without a
+   * `<no-memory>` directive, and not deleted or redacted in the Inspector. Private rows
+   * never reach the model and never feed a digest.
+   */
+  private static async loadCompressibleMemories(memoryIds: string[]): Promise<Memory[]> {
+    const loaded = (
+      await Promise.all(memoryIds.map((memoryId) => this.memoryRepo.findById(memoryId)))
+    ).filter(
+      (memory): memory is Memory =>
+        memory != null && !memory.isPrivate && !containsNoMemoryDirective(memory.content),
+    );
+    if (loaded.length === 0) return [];
+    let hidden = new Set<string>();
+    try {
+      hidden = await MemoryObservationService.suppressedIds(loaded.map((memory) => memory.id));
+    } catch {
+      return [];
+    }
+    return loaded.filter((memory) => !hidden.has(memory.id));
   }
 
   private static async finalizeCompressionBatchLocally(
@@ -2442,7 +2909,7 @@ export class MemoryService {
 
     if (memories.length > 1) {
       const digest = this.buildBatchDigest(group, memories);
-      await this.createBatchSummaryMemory(group, memories, digest, false);
+      await this.createBatchSummaryMemory(group, memories, digest);
     }
 
     for (const memoryId of group.memoryIds) {
@@ -2471,35 +2938,57 @@ export class MemoryService {
       return `- [${memory.type}] ${summary}`;
     });
     const extraCount = memories.length - lines.length;
-    const header = `[${group.origin} digest] ${group.batchKey}`;
+    // A tag-only header line, so the digest's summary is its first item (DATA-5).
+    const header = `[${group.origin} digest: ${group.batchKey}]`;
     const suffix = extraCount > 0 ? `- ... ${extraCount} more` : "";
     return [header, ...lines, suffix].filter(Boolean).join("\n");
   }
 
+  /** A bounded excerpt of a memory for the compression prompt (preambles skipped). */
+  private static compressionExcerpt(content: string, maxChars: number): string {
+    const text = (informativeMemoryText(content) || content).trim();
+    return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
+  }
+
+  /**
+   * The compression prompt. One memory: a one-line summary of its content. Several: a
+   * short digest of their content excerpts. The model sees content, not only the
+   * first-line summaries (DATA-7).
+   */
   private static buildBatchSummaryPrompt(
-    group: {
-      workspaceId: string;
-      batchKey: string;
-      origin: MemoryCaptureOrigin;
-      priority: MemoryCompressionPriority;
-      memoryIds: string[];
-      requestedAt: number;
-    },
+    group: CompressionGroup,
     memories: Memory[],
   ): { system: string; user: string } {
+    if (memories.length === 1) {
+      const memory = memories[0];
+      return {
+        system:
+          "You write one-line summaries of an agent's memory entries. Be factual and specific, keep names, files and decisions, and avoid filler.",
+        user: [
+          `Memory type: ${memory.type}`,
+          "",
+          "Memory:",
+          this.compressionExcerpt(memory.content, COMPRESSION_SINGLE_EXCERPT_CHARS),
+          "",
+          "Write one factual sentence of at most 200 characters that says what this memory is about. Output only the sentence.",
+        ].join("\n"),
+      };
+    }
+
     const lines = memories.slice(0, 12).map((memory) => {
-      const summary = this.buildDeterministicSummary(memory.summary || memory.content);
-      return `- [${memory.type}] ${summary}`;
+      const excerpt = this.compressionExcerpt(memory.content, COMPRESSION_BATCH_EXCERPT_CHARS)
+        .replace(/\s+/g, " ")
+        .trim();
+      return `- [${memory.type}] ${excerpt}`;
     });
     const truncatedCount = Math.max(0, memories.length - lines.length);
     const user = [
-      `Workspace: ${group.workspaceId}`,
       `Batch key: ${group.batchKey}`,
       `Origin: ${group.origin}`,
       `Items: ${memories.length}`,
       truncatedCount > 0 ? `Additional items omitted: ${truncatedCount}` : "",
       "",
-      "Summaries:",
+      "Entries:",
       ...lines,
       "",
       "Write a concise durable memory digest with:",
@@ -2521,31 +3010,15 @@ export class MemoryService {
   }
 
   private static async compressMemoryBatch(
-    group: {
-      workspaceId: string;
-      batchKey: string;
-      origin: MemoryCaptureOrigin;
-      priority: MemoryCompressionPriority;
-      memoryIds: string[];
-      requestedAt: number;
-    },
+    group: CompressionGroup,
     memories: Memory[],
-  ): Promise<void> {
-    const { summaryText, usedLlm } = await this.generateBatchSummaryText(group, memories);
-    const storageSummary = this.normalizeSummaryStorageText(summaryText);
+  ): Promise<{ calledModel: boolean }> {
+    const { text, usedLlm, calledModel } = await this.generateCompressionText(group, memories);
     if (memories.length === 1) {
-      await this.updateMemorySummary(memories[0], group.workspaceId, storageSummary, true);
-      this.recordCompressionDiagnostic(group.workspaceId, group.origin, "batchSummaries");
-      if (usedLlm) {
-        this.recordCompressionDiagnostic(group.workspaceId, group.origin, "llmCalls");
-      }
-      for (const memoryId of group.memoryIds) {
-        this.compressionQueueEntries.delete(memoryId);
-      }
-      return;
+      await this.updateMemorySummary(memories[0], group.workspaceId, text, true);
+    } else {
+      await this.createBatchSummaryMemory(group, memories, text);
     }
-
-    await this.createBatchSummaryMemory(group, memories, storageSummary, true);
     for (const memoryId of group.memoryIds) {
       this.compressionQueueEntries.delete(memoryId);
     }
@@ -2556,57 +3029,55 @@ export class MemoryService {
     logger.info(
       `[MemoryService] Compression batch workspace=${group.workspaceId} origin=${group.origin} batchKey=${group.batchKey} items=${memories.length} mode=${usedLlm ? "llm" : "deterministic"}`,
     );
+    return { calledModel };
   }
 
-  private static async generateBatchSummaryText(
-    group: {
-      workspaceId: string;
-      batchKey: string;
-      origin: MemoryCaptureOrigin;
-      priority: MemoryCompressionPriority;
-      memoryIds: string[];
-      requestedAt: number;
-    },
+  /**
+   * One AI compression call on the configured provider (cheap profile), within the daily
+   * token budget (`memoryCompressionDailyTokenBudget`, rolling 24 hours across
+   * workspaces). Without budget, or when the call fails, the deterministic summary or
+   * digest is used. A failed call is charged its estimated input, so a failing provider
+   * cannot spend calls without limit.
+   */
+  private static async generateCompressionText(
+    group: CompressionGroup,
     memories: Memory[],
-  ): Promise<{ summaryText: string; usedLlm: boolean }> {
+  ): Promise<{ text: string; usedLlm: boolean; calledModel: boolean }> {
+    const fallback =
+      memories.length === 1
+        ? this.buildDeterministicSummary(memories[0].content)
+        : this.buildBatchDigest(group, memories);
     const { system, user } = this.buildBatchSummaryPrompt(group, memories);
-    let providerType = "";
-    let modelId = "";
-
-    try {
-      const provider = LLMProviderFactory.createProvider();
-      providerType = provider.type;
-      const settings = LLMProviderFactory.getSettings();
-      const azureDeployment = settings.azure?.deployment || settings.azure?.deployments?.[0];
-      const azureAnthropicDeployment =
-        settings.azureAnthropic?.deployment || settings.azureAnthropic?.deployments?.[0];
-      modelId = LLMProviderFactory.getModelId(
-        settings.modelKey,
-        settings.providerType,
-        settings.ollama?.model,
-        settings.gemini?.model,
-        settings.openrouter?.model,
-        settings.deepseek?.model,
-        settings.openai?.model,
-        azureDeployment,
-        azureAnthropicDeployment,
-        settings.groq?.model,
-        settings.xai?.model,
-        settings.kimi?.model,
-        settings.customProviders,
-        settings.bedrock?.model,
+    const estimatedInputTokens = estimateTokens(system) + estimateTokens(user);
+    const remaining = await MemoryCompressionBudget.remaining(this.sql);
+    if (remaining < estimatedInputTokens + COMPRESSION_MAX_OUTPUT_TOKENS) {
+      this.recordCompressionDiagnostic(group.workspaceId, group.origin, "dropped");
+      logger.info(
+        `[MemoryService] Compression budget exhausted; batch ${group.batchKey} kept local (remaining=${remaining})`,
       );
+      return { text: fallback, usedLlm: false, calledModel: false };
+    }
 
+    let providerType = "";
+    let modelKey = "";
+    let modelId = "";
+    let calledModel = false;
+    try {
+      // The configured provider only (no task override); the cheap profile's model.
+      const selection = LLMProviderFactory.resolveTaskModelSelection(undefined, {
+        forceProfile: "cheap",
+        allowProfileRouting: true,
+      });
+      providerType = selection.providerType;
+      modelKey = selection.modelKey;
+      modelId = selection.modelId;
+      const provider = LLMProviderFactory.createProvider();
+      calledModel = true;
       const response = await provider.createMessage({
         model: modelId,
-        maxTokens: 160,
+        maxTokens: COMPRESSION_MAX_OUTPUT_TOKENS,
         system,
-        messages: [
-          {
-            role: "user",
-            content: user,
-          },
-        ],
+        messages: [{ role: "user", content: user }],
       });
       recordLlmCallSuccess(
         {
@@ -2614,18 +3085,27 @@ export class MemoryService {
           sourceKind: "memory_batch_summary",
           sourceId: group.batchKey,
           providerType,
-          modelKey: modelId,
+          modelKey,
           modelId,
         },
         response.usage,
       );
 
-      let summary = "";
+      let output = "";
       for (const content of response.content) {
-        if (content.type === "text") summary += content.text;
+        if (content.type === "text") output += content.text;
       }
-      summary = this.buildDeterministicSummary(summary);
-      if (summary) return { summaryText: summary, usedLlm: true };
+      const usedTokens =
+        Math.max(0, Math.floor(response.usage?.inputTokens || 0)) +
+          Math.max(0, Math.floor(response.usage?.outputTokens || 0)) ||
+        estimatedInputTokens + estimateTokens(output);
+      await MemoryCompressionBudget.record(this.sql, group.workspaceId, usedTokens);
+
+      const text =
+        memories.length === 1
+          ? this.buildDeterministicSummary(output)
+          : this.normalizeSummaryStorageText(output);
+      if (text) return { text, usedLlm: true, calledModel };
     } catch (error) {
       recordLlmCallError(
         {
@@ -2633,46 +3113,47 @@ export class MemoryService {
           sourceKind: "memory_batch_summary",
           sourceId: group.batchKey,
           providerType,
-          modelKey: modelId,
+          modelKey,
           modelId,
         },
         error,
       );
+      if (calledModel) {
+        await MemoryCompressionBudget.record(this.sql, group.workspaceId, estimatedInputTokens);
+      }
       logger.warn("[MemoryService] Batch compression failed:", group.batchKey, error);
     }
 
-    return { summaryText: this.buildBatchDigest(group, memories), usedLlm: false };
+    return { text: fallback, usedLlm: false, calledModel };
   }
 
+  /**
+   * Store a batch digest through the normal capture path (DATA-7), so it gets the same
+   * settings checks, redaction, dedupe, embedding, observation sidecar and storage cap as
+   * every other archive row.
+   */
   private static async createBatchSummaryMemory(
-    group: {
-      workspaceId: string;
-      batchKey: string;
-      origin: MemoryCaptureOrigin;
-      priority: MemoryCompressionPriority;
-      memoryIds: string[];
-      requestedAt: number;
-    },
+    group: CompressionGroup,
     memories: Memory[],
     summaryText: string,
-    compressed: boolean,
   ): Promise<void> {
-    const summary = neutralizeReservedImportPrefix(this.normalizeSummaryStorageText(summaryText));
-    if (!summary) return;
+    const content = this.normalizeSummaryStorageText(summaryText);
+    if (!content) return;
 
     const taskId = this.extractSharedTaskId(memories);
-    const batchMemory = await this.memoryRepo.create({
-      workspaceId: group.workspaceId,
-      taskId,
-      type: "summary",
-      content: summary,
-      summary,
-      tokens: estimateTokens(summary),
-      isCompressed: compressed,
-      isPrivate: false,
+    await this.capture(group.workspaceId, taskId, "summary", content, false, {
+      origin: group.origin,
+      batchKey: group.batchKey,
+      batchable: false,
+      priority: "low",
+      signalFamily: "compression_digest",
+      // The write gate is skipped on purpose: every source row already passed the gate
+      // (or the user's approval) when it was captured, and the digest only restates those
+      // rows. Staging it again would ask the user to approve a summary of approved rows.
+      skipMemoryWriteGate: true,
+      // Some source rows may have been captured without the external mirror.
+      allowExternalMirror: false,
     });
-
-    await this.updateEmbeddingForMemory(batchMemory, group.workspaceId, summary);
   }
 
   private static extractSharedTaskId(memories: Memory[]): string | undefined {
@@ -2683,21 +3164,6 @@ export class MemoryService {
       if (memory.taskId !== firstTaskId) return undefined;
     }
     return firstTaskId;
-  }
-
-  private static async updateEmbeddingForMemory(
-    memory: Memory,
-    workspaceId: string,
-    summary: string,
-  ): Promise<void> {
-    try {
-      const embedText = this.normalizeForEmbedding(summary, summary);
-      const embedding = createLocalEmbedding(embedText);
-      await this.embeddingRepo.upsert(workspaceId, memory.id, embedding, memory.updatedAt);
-      this.cacheEmbedding(workspaceId, memory.id, embedding, memory.updatedAt);
-    } catch {
-      // ignore
-    }
   }
 
   private static scheduleCompressionRetry(
@@ -2723,7 +3189,9 @@ export class MemoryService {
 
     this.compressionRetryCounts.set(group.batchKey, attempts);
     const retryDelayMs = Math.max(delayMs, COMPRESSION_RETRY_BASE_DELAY_MS * 2 ** (attempts - 1));
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      this.compressionRetryTimers.delete(timer);
+      if (!this.initialized) return;
       for (const memoryId of group.memoryIds) {
         if (!this.compressionQueue.includes(memoryId)) {
           this.compressionQueue.push(memoryId);
@@ -2731,6 +3199,8 @@ export class MemoryService {
       }
       this.scheduleCompressionDrain(0);
     }, retryDelayMs);
+    timer.unref?.();
+    this.compressionRetryTimers.add(timer);
   }
 
   /**
@@ -3006,7 +3476,37 @@ export class MemoryService {
   }
 
   /**
-   * Shutdown the service
+   * Stop starting new work (cleanup, archive migration, compression batches, markdown
+   * syncs) and wait, at most `timeoutMs`, for what is running. Shutdown awaits this before
+   * `shutdown()` and before the database closes. Returns true when nothing is left running.
+   */
+  static async drain(timeoutMs = MemoryService.DRAIN_TIMEOUT_MS): Promise<boolean> {
+    this.draining = true;
+    if (this.cleanupIntervalHandle) {
+      clearInterval(this.cleanupIntervalHandle);
+      this.cleanupIntervalHandle = undefined;
+    }
+    if (this.compressionDrainTimer) {
+      clearTimeout(this.compressionDrainTimer);
+      this.compressionDrainTimer = undefined;
+    }
+    for (const timer of this.compressionRetryTimers) clearTimeout(timer);
+    this.compressionRetryTimers.clear();
+    if (this.archiveCleanupTimer) {
+      clearTimeout(this.archiveCleanupTimer);
+      this.archiveCleanupTimer = undefined;
+    }
+    const drained = await this.inFlight.drain(timeoutMs);
+    if (!drained) {
+      logger.warn(
+        `[MemoryService] ${this.inFlight.size} memory job(s) still running after ${timeoutMs}ms; shutting down anyway`,
+      );
+    }
+    return drained;
+  }
+
+  /**
+   * Shutdown the service. Call `drain()` first to let running work finish.
    */
   static shutdown(): void {
     if (this.cleanupIntervalHandle) {
@@ -3017,6 +3517,8 @@ export class MemoryService {
       clearTimeout(this.compressionDrainTimer);
       this.compressionDrainTimer = undefined;
     }
+    for (const timer of this.compressionRetryTimers) clearTimeout(timer);
+    this.compressionRetryTimers.clear();
     if (this.archiveCleanupTimer) {
       clearTimeout(this.archiveCleanupTimer);
       this.archiveCleanupTimer = undefined;
@@ -3044,6 +3546,8 @@ export class MemoryService {
     this.unsubscribeMemoryItemChanges?.();
     this.unsubscribeMemoryItemChanges = undefined;
     SupermemoryRemoteRefRepository.setInstance(null);
+    // Work that outlived drain() is abandoned; a later initialize starts with a fresh registry.
+    this.inFlight = new InFlightWork();
     this.initialized = false;
     logger.info("[MemoryService] Shutdown complete");
   }

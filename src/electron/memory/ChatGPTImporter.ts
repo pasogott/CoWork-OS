@@ -1,22 +1,26 @@
 /**
  * ChatGPT History Importer
  *
- * Securely parses a ChatGPT data export (conversations.json),
- * distils conversations into memory entries via LLM, and stores
- * them through the MemoryRepository directly (bypassing auto-capture
- * checks so imports always work regardless of settings).
+ * Securely parses a ChatGPT data export (conversations.json), distils conversations into
+ * memory entries via LLM, and stores them through the gated import API
+ * (`MemoryService.openImportSession`, docs/memory-engine.md §1). Imports are explicit user
+ * acts, so auto-capture does not apply; memory being off or privacy mode `disabled` still
+ * refuses the import.
  *
  * Security guarantees:
  * - Raw export is read once; the full file is never persisted to disk
  *   by CoWork OS.
  * - All content (including conversation titles) is sanitized through
- *   InputSanitizer before storage.
- * - Sensitive-data detection marks memories as private automatically.
+ *   InputSanitizer before storage, and secret values are redacted.
+ * - `<no-memory>`, excluded patterns, inline `<private>` blocks and strict privacy mode
+ *   are respected; a conversation or entry already imported (here or, when not private,
+ *   in another workspace) is not stored again. A conversation imported only into another
+ *   workspace, privately, is imported here from its stored entries without a new LLM call.
+ * - Facts about the user ("observation" entries) also become `import` items in
+ *   `memory_items` (never `user_stated`).
  * - After import the caller is reminded to delete the source file.
  */
 
-import { MemoryEmbeddingRepository, MemoryRepository } from "../database/repository-facades";
-import { MemorySettingsRepository } from "../database/repository-facades";
 import { createMemoryStatementPort } from "./memory-statement-port";
 import * as fs from "fs/promises";
 import * as crypto from "crypto";
@@ -25,11 +29,9 @@ import { LLMProviderFactory } from "../agent/llm";
 import { recordLlmCallError, recordLlmCallSuccess } from "../agent/llm/usage-telemetry";
 import type { LLMProviderType } from "../../shared/types";
 import { InputSanitizer } from "../agent/security";
-import { estimateTokens } from "../agent/context-manager";
 
 import { DatabaseManager } from "../database/schema";
-import { createLocalEmbedding } from "./local-embedding";
-import { redactSecrets } from "./sensitive-content";
+import { MemoryService } from "./MemoryService";
 
 // ── ChatGPT export format types ────────────────────────────────
 
@@ -152,11 +154,7 @@ export class ChatGPTImporter {
       signal,
     } = options;
 
-    // Get repository directly to bypass autoCapture check
     const db = DatabaseManager.getInstance().getDatabase();
-    const memoryRepo = new MemoryRepository(db);
-    const embeddingRepo = new MemoryEmbeddingRepository(db);
-    const settingsRepo = new MemorySettingsRepository(db);
 
     const result: ChatGPTImportResult = {
       success: false,
@@ -173,13 +171,9 @@ export class ChatGPTImporter {
         throw new Error("Import was cancelled.");
       }
 
-      // Verify memory system is enabled (but ignore autoCapture)
-      const settings = await settingsRepo.getOrCreate(workspaceId);
-      if (!settings.enabled) {
-        throw new Error(
-          "Memory system is disabled for this workspace. Enable it in settings first.",
-        );
-      }
+      // The gated import API: refuses when memory is off or privacy mode is `disabled`
+      // (auto-capture does not apply to an explicit import).
+      const session = await MemoryService.openImportSession({ workspaceId, forcePrivate });
 
       // ── 1. Validate & hash source file ────────────────────
       this.emitProgress({ phase: "parsing", current: 0, total: 0, memoriesCreated: 0 });
@@ -236,20 +230,12 @@ export class ChatGPTImporter {
       );
       conversations = conversations.slice(0, cap);
 
-      // ── 2b. Build set of already-imported conversation IDs for resume ──
-      const alreadyImported = new Set<string>();
-      try {
-        const rows = await createMemoryStatementPort(db).all<{ content: string }>(
-          "chatgpt_importedContents",
-          [workspaceId],
-        );
-        for (const row of rows) {
-          const match = row.content.match(/\(conv:([a-f0-9-]+)\)/);
-          if (match) alreadyImported.add(match[1]);
-        }
-      } catch {
-        // If query fails, proceed without dedup
-      }
+      // ── 2b. Conversations already imported, for resume ──
+      // Visible here (this workspace's rows, non-private imports): skipped. Imported only
+      // into another workspace (private there): its distilled entries are imported again
+      // here without a new LLM call, so a second workspace does not pay for the same
+      // history twice.
+      const { alreadyImported, reusable } = await this.loadImportedConversations(db, workspaceId);
 
       this.emitProgress({
         phase: "distilling",
@@ -275,6 +261,42 @@ export class ChatGPTImporter {
         // Skip already-imported conversations (resume support)
         if (convId && alreadyImported.has(convId)) {
           result.skipped++;
+          this.emitProgress({
+            phase: "distilling",
+            current: i + 1,
+            total: conversations.length,
+            conversationTitle: title,
+            memoriesCreated: result.memoriesCreated,
+          });
+          continue;
+        }
+
+        const previous = convId ? reusable.get(convId) : undefined;
+        if (previous && previous.length > 0) {
+          try {
+            const header = `[Imported from ChatGPT — "${title}" (conv:${convId})]`;
+            for (const entry of previous) {
+              const outcome = await session.add({
+                type: entry.type,
+                body: entry.body,
+                header,
+                ...(entry.type === "observation"
+                  ? {
+                      fact: {
+                        kind: "preference" as const,
+                        importer: "chatgpt",
+                        conversationId: convId,
+                      },
+                    }
+                  : {}),
+              });
+              if (outcome.status === "created") result.memoriesCreated++;
+            }
+            result.conversationsProcessed++;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            result.errors.push(`"${title}": ${msg}`);
+          }
           this.emitProgress({
             phase: "distilling",
             current: i + 1,
@@ -321,43 +343,37 @@ export class ChatGPTImporter {
             memoriesCreated: result.memoriesCreated,
           });
 
-          for (const entry of distilled) {
-            // Sanitize content before storage; secret values are redacted (shared
-            // detector with MemoryService), so the stored text holds no plaintext secret.
-            const sanitized = redactSecrets(
-              InputSanitizer.sanitizeMemoryContent(entry.content),
-            ).text;
-            if (!sanitized || sanitized.length < 10) continue;
-
-            const convTag = convId ? ` (conv:${convId})` : "";
-            const memoryContent = `[Imported from ChatGPT — "${title}"${convTag}]\n${sanitized}`;
-            const tokens = estimateTokens(memoryContent);
-
-            // Write directly to DB, bypassing MemoryService.capture()
-            // which checks autoCapture setting and would block imports
-            const isPrivate = forcePrivate || settings.privacyMode === "strict";
-
-            const created = await memoryRepo.create({
-              workspaceId,
-              taskId: undefined,
-              type: entry.type as "observation" | "decision" | "insight",
-              content: memoryContent,
-              tokens,
-              isCompressed: false,
-              isPrivate,
+          if (distilled === null) {
+            // The LLM call failed: not processed, so a later import retries it.
+            result.errors.push(`"${title}": distillation failed`);
+            this.emitProgress({
+              phase: "distilling",
+              current: i + 1,
+              total: conversations.length,
+              conversationTitle: title,
+              memoriesCreated: result.memoriesCreated,
             });
+            continue;
+          }
 
-            // Best-effort: store offline embedding so imported histories are immediately
-            // searchable with hybrid retrieval (no reindex step required).
-            try {
-              const embedText = sanitized;
-              const embedding = createLocalEmbedding(embedText);
-              await embeddingRepo.upsert(workspaceId, created.id, embedding, created.updatedAt);
-            } catch {
-              // ignore
-            }
-
-            result.memoriesCreated++;
+          const convTag = convId ? ` (conv:${convId})` : "";
+          for (const entry of distilled) {
+            const outcome = await session.add({
+              type: entry.type as "observation" | "decision" | "insight",
+              body: entry.content,
+              header: `[Imported from ChatGPT — "${title}"${convTag}]`,
+              // "observation" entries are facts about the user (the distillation prompt).
+              ...(entry.type === "observation"
+                ? {
+                    fact: {
+                      kind: "preference" as const,
+                      importer: "chatgpt",
+                      ...(convId ? { conversationId: convId } : {}),
+                    },
+                  }
+                : {}),
+            });
+            if (outcome.status === "created") result.memoriesCreated++;
           }
 
           result.conversationsProcessed++;
@@ -380,6 +396,7 @@ export class ChatGPTImporter {
         }
       }
 
+      await session.finish();
       result.success = !signal?.aborted;
       this.emitProgress({
         phase: "done",
@@ -403,6 +420,59 @@ export class ChatGPTImporter {
   }
 
   // ── Helpers ────────────────────────────────────────────────
+
+  /**
+   * ChatGPT conversations already imported: ids visible in `workspaceId` (skipped) and,
+   * for conversations imported only into other workspaces, their stored entries (type and
+   * distilled text after the provenance line), re-used instead of a new LLM call.
+   */
+  private static async loadImportedConversations(
+    db: Parameters<typeof createMemoryStatementPort>[0],
+    workspaceId: string,
+  ): Promise<{
+    alreadyImported: Set<string>;
+    reusable: Map<string, Array<{ type: "observation" | "decision" | "insight"; body: string }>>;
+  }> {
+    const alreadyImported = new Set<string>();
+    const reusable = new Map<
+      string,
+      Array<{ type: "observation" | "decision" | "insight"; body: string }>
+    >();
+    try {
+      const rows = await createMemoryStatementPort(db).all<{
+        workspace_id?: string | null;
+        type?: string | null;
+        content: string;
+        is_private?: number | null;
+      }>("chatgpt_importedContents", []);
+      const elsewhere: typeof rows = [];
+      for (const row of rows) {
+        const convId = String(row.content || "").match(/\(conv:([a-f0-9-]+)\)/)?.[1];
+        if (!convId) continue;
+        if (row.workspace_id === workspaceId || !row.is_private) alreadyImported.add(convId);
+        else elsewhere.push(row);
+      }
+      for (const row of elsewhere) {
+        const convId = String(row.content).match(/\(conv:([a-f0-9-]+)\)/)?.[1] as string;
+        if (alreadyImported.has(convId)) continue;
+        const type = row.type;
+        if (type !== "observation" && type !== "decision" && type !== "insight") continue;
+        const content = String(row.content);
+        const headerAt = content.indexOf("[Imported from ChatGPT");
+        const newline = headerAt === -1 ? -1 : content.indexOf("\n", headerAt);
+        const body = newline === -1 ? "" : content.slice(newline + 1).trim();
+        if (!body) continue;
+        const entries = reusable.get(convId) ?? [];
+        if (!entries.some((entry) => entry.type === type && entry.body === body)) {
+          entries.push({ type, body });
+        }
+        reusable.set(convId, entries);
+      }
+    } catch {
+      // If the query fails, proceed without resume (the session still dedupes).
+    }
+    return { alreadyImported, reusable };
+  }
 
   /**
    * Walk the mapping tree and extract human-readable messages.
@@ -482,7 +552,7 @@ export class ChatGPTImporter {
     _title: string,
     distillProvider?: string,
     distillModel?: string,
-  ): Promise<Array<{ type: string; content: string }>> {
+  ): Promise<Array<{ type: string; content: string }> | null> {
     let providerType = "";
     let modelId = "";
     try {
@@ -614,7 +684,7 @@ Rules:
         err,
       );
       console.warn("[ChatGPTImporter] Distillation failed:", err);
-      return [];
+      return null;
     }
   }
 
