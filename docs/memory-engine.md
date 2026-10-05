@@ -256,6 +256,9 @@ surface-level contract on top of it. Playbook capture uses the same task gate.
   curated or user-stated, or preferences that are named subjects or trusted at least as
   `curated`. Cached until the hot-memory version changes. `preferred_name` and
   `response_style` are left out because the identity and personality prompts render them.
+  Facts the agent saved on its own (`memory_remember` without the user asking: `inferred`,
+  `source_ref.store = "agent_tool"`) are L1 only, whatever their kind, until the user pins,
+  states or confirms them: one page the agent read could otherwise plant a standing rule.
   `memory_items` is the only source; without a writer (CLI) there is no memory layer.
 - **L1:** `memory_items_fts` match for the request (`memoryItems_contextSearch`,
   `memory-context-sql.ts`; the shared Unicode query builder; LIKE without FTS5), minus what L0
@@ -396,8 +399,9 @@ and the stored workspace.
 
 Agent tools (`agent/tools/memory-tools.ts`, audit §8.3): `memory_recall`, `memory_remember`
 (facts through `MemoryWriter` as `user_stated` only when the model sets `user_asked` and the
-user's latest message asks to remember, else `inferred`; `outcome`/`error`/`note` to the
-archive), `memory_forget` (Memory Hub delete path for items, own archive rows, Supermemory ids;
+user's latest message asks to remember, else `inferred`; `pin` only for `user_stated`;
+`outcome`/`error`/`note` to the archive; available in every plan step so the agent saves
+what it learns while it works, and its description says when to save), `memory_forget` (Memory Hub delete path for items, own archive rows, Supermemory ids;
 asks the user first through the permission engine as a `memory_delete` approval (classified as
 a delete; the dialog is titled "Forget a memory" and shows the memory and its source; channel
 approval messages leave the memory text out) — prompted in the default and dangerous-only
@@ -854,6 +858,15 @@ reindexes summary changes. The marker stores `scanned`, `summariesRewritten`,
   failures keep the mapping for the next sweep. 4xx answers (except 408 and 429) no longer count
   toward the circuit breaker. Copies sent before the table existed have no remote id and stay
   remote.
+
+## 7a. The memory repo (Phase 1, opt-in)
+
+With **Settings > Memory > Memory folder** (`memoryRepoEnabled`) on, facts the agent or the
+user saves with `memory_remember` go to a local git repo of markdown files in the Agent
+Memory Repo format instead of `memory_items`, and `MEMORY.md` plus the workspace's file are
+in every private prompt as `<cowork_memory_repo>`. Contact, task, private and strict-privacy
+facts stay in `memory_items`, as do the other producers. See
+[memory-repo-phase1-design.md](memory-repo-phase1-design.md).
 
 ## 8. Gaps and next steps
 

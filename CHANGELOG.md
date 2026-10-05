@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Memory folder (beta)**: turn on **Settings > Memory > Memory folder** to keep what CoWork learns about you and your workspaces as plain markdown notes in a local git repo (`~/CoWork Memory` by default), in the open [Agent Memory Repo](https://github.com/AgentMemoryRepo/agentmemoryrepo) format. The agent reads the folder and saves to it as it works (each change is a commit you can inspect); you can open and edit the notes in any editor. What the agent saves after reading web pages, email or other untrusted content goes to an unreviewed `inbox.md` that is never put in prompts. **Compact history** removes old versions so deleted memories are really gone. Off by default. See [Memory Repo design](docs/memory-repo-phase1-design.md).
+
 - **Memory Hub Sources and Health tabs**: **Sources** shows where CoWork's memory comes from (you, the agent, Dreaming, imports, other people, Chronicle, Supermemory, the knowledge graph) and opens the matching facts; **Health** runs the memory health checks with PASS/WARN results and a Refresh button.
 - **AI memory compression is on by default**: long memories get a one-line summary from your configured model and related ones are grouped into digests. It costs tokens: up to 20,000 a day across all workspaces (adjustable in **Settings > Memory**). Turn it off per workspace with **AI memory compression**. Private memories are never sent.
 - **Wider Mission Control recall**: recall also searches your memory items and, when connected and network access is on, Supermemory; older tasks and activity are found too.
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The agent saves what it learns as it works**: `memory_remember` is available in every plan step (it used to be offered only in steps planned for it, so the agent almost never saved anything), and its guidance says when to save: preferences, corrections, decisions, project facts and hard-won lessons you would otherwise repeat. Facts the agent saves on its own are recalled when relevant but not added to every prompt, and it cannot pin them; pin or edit them in **Settings > Memory > What CoWork knows** to keep them in every prompt.
 - **Kit files and memory stay in step**: hand edits to `.cowork/USER.md` and `MEMORY.md` sync back into memory shortly after you save. The desktop app and the node daemon no longer both rewrite workspace kit files (`CROSS_SIGNALS.md`, `MISTAKES.md`, `LORE.md`): one process owns them and the desktop app takes over when it starts.
 - **Memory housekeeping**: old superseded memory revisions are pruned after 180 days (the newest five per fact and anything still undoable are kept); shutdown waits briefly for memory work in progress; startup quiet mode no longer starts memory cleanup or kit writers.
 - **Four memory tools**: `memory_recall`, `memory_remember`, `memory_forget` and `context_recall` replace the 16 earlier memory tools (`search_memories`, `memory_save`, `memory_curate`, `supermemory_*`, `context_grep` and others), which are removed; skills or prompts that name them must switch. `memory_forget` asks before deleting a memory.
