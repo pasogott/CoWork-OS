@@ -214,6 +214,13 @@ import { ExternalMemoryProviderRegistry } from "../memory/ExternalMemoryProvider
 import { MemoryContextBuilderService } from "../memory/MemoryContextBuilder";
 import { MemoryRepoService } from "../memory/repo/MemoryRepoService";
 import {
+  buildSwarmContextBlock,
+  resolveSwarm,
+  swarmFolderPath,
+  swarmResolveDeps,
+  type ResolvedSwarm,
+} from "../memory/repo/memory-repo-swarm";
+import {
   getMemoryRepoContext,
   type MemoryRepoContextBlock,
 } from "../memory/repo/MemoryRepoContext";
@@ -250,7 +257,9 @@ import {
   buildWorkspaceKitContext,
   isDesignSystemRelevantTask,
 } from "../memory/WorkspaceKitContext";
-import { KitFileWatcher } from "../memory/KitFileWatcher";
+import { stripCuratedKitBlocksOnce } from "../memory/kit-block-strip";
+import { removeGeneratedMemoryBlocks } from "../memory/generated-kit-blocks";
+import { writableMemoryRepo } from "../memory/repo/memory-repo-producers";
 import {
   MEMORY_CONTEXT_SECTION_TOKENS,
   MEMORY_L1_COMPACT_TOKENS,
@@ -1113,6 +1122,11 @@ export class TaskExecutor {
   } | null = null;
   private readonly promptSectionCache = new Map<string, string | null>();
   private lastUserMessage: string;
+  /**
+   * The task's swarm while its `swarm` layer is on and it is not a verifier (phase 5 §2):
+   * swarm_note is offered and may cross the plan gate. Updated with every policy decision.
+   */
+  private swarmForTools: ResolvedSwarm | null = null;
   private appliedSkills: SkillApplication[] = [];
   private taskContextNotes: string[] = [];
   private recoveryRequestActive: boolean = false;
@@ -5104,6 +5118,7 @@ export class TaskExecutor {
     allowSharedContextInjection: boolean;
     allowMemoryInjection: boolean;
     allowMemoryRepoInjection?: boolean;
+    allowSwarmInjection?: boolean;
     memoryQuery: string;
     contextLabel: string;
     lastTurnMemoryRecallQuery: string;
@@ -5315,7 +5330,12 @@ export class TaskExecutor {
       }
     }
     if (mistakesRaw) {
-      const text = sanitize(clamp(mistakesRaw, maxSectionChars));
+      // Feedback patterns are corrections in the memory folder when it is writable; the
+      // retired generated block is then dropped (with the folder off it is the fallback).
+      const mistakesText = removeGeneratedMemoryBlocks(mistakesRaw, {
+        keepFeedbackPatterns: writableMemoryRepo() === null,
+      });
+      const text = sanitize(clamp(mistakesText, maxSectionChars));
       if (text) {
         sections.push(`## Mistakes / Preferences (.cowork/MISTAKES.md)\n${text}`);
       }
@@ -7089,6 +7109,7 @@ ${transcript}
       checkBudgets: () => this.checkBudgets(),
       buildUserProfileBlock: () => this.buildUserProfileBlock(),
       buildMemoryRepoBlock: () => this.buildMemoryRepoPinnedBlock(),
+      buildSwarmBlock: () => this.buildSwarmPinnedBlock(),
       upsertPinnedUserBlock: (messages: LLMMessage[], opts: Any) =>
         this.upsertPinnedUserBlock(messages, opts),
       removePinnedUserBlock: (messages: LLMMessage[], tag: string) =>
@@ -8746,7 +8767,10 @@ ${transcript}
       contextPackInjectionEnabled?: boolean;
       memoryRepoEnabled?: boolean;
     };
-    return resolveMemoryInjection(
+    const memoryRepoEnabled =
+      features.memoryRepoEnabled === true && MemoryRepoService.get()?.isReady() === true;
+    const swarm = memoryRepoEnabled ? await this.resolveTaskSwarm() : null;
+    const decision = resolveMemoryInjection(
       memoryPolicyInputForTask(this.task, {
         message,
         workspaceSettings: await this.loadWorkspaceMemoryPolicySettings(),
@@ -8755,10 +8779,46 @@ ${transcript}
         workspaceCanRead: !!this.workspace?.permissions?.read,
         externalNetworkAllowed:
           !!this.workspace?.permissions && this.isExternalMemoryAccessAllowed(),
-        memoryRepoEnabled:
-          features.memoryRepoEnabled === true && MemoryRepoService.get()?.isReady() === true,
+        memoryRepoEnabled,
+        swarmAvailable: swarm !== null,
       }),
     );
+    this.updateSwarmForTools(decision.layers.swarm ? swarm : null);
+    return decision;
+  }
+
+  /** The task's swarm (root of its parent chain with children or a team run), or null. */
+  private async resolveTaskSwarm(): Promise<ResolvedSwarm | null> {
+    try {
+      return await resolveSwarm(this.task, swarmResolveDeps(this.daemon));
+    } catch (error) {
+      logger.debug("[Executor] Swarm lookup failed:", (error as Error)?.message ?? error);
+      return null;
+    }
+  }
+
+  /** Offer swarm_note to swarm members that are not verifiers. */
+  private updateSwarmForTools(swarm: ResolvedSwarm | null): void {
+    this.swarmForTools = swarm && this.task.workerRole !== "verifier" ? swarm : null;
+    const registry = this.toolRegistry as ToolRegistry | undefined;
+    if (registry && typeof registry.setSwarmToolsAvailable === "function") {
+      registry.setSwarmToolsAvailable(this.swarmForTools !== null);
+    }
+  }
+
+  /** The pinned `<cowork_swarm>` block (phase 5 §2) under the `swarm` layer. */
+  private async buildSwarmPinnedBlock(): Promise<string> {
+    const decision = await this.resolveMemoryInjectionForPrompt(this.lastUserMessage);
+    if (!decision.layers.swarm) return "";
+    const service = MemoryRepoService.get();
+    const swarm = await this.resolveTaskSwarm();
+    if (!service?.isReady() || !swarm) return "";
+    try {
+      return await buildSwarmContextBlock(service, swarm);
+    } catch (error) {
+      logger.warn("[Executor] Swarm block build failed:", (error as Error)?.message ?? error);
+      return "";
+    }
   }
 
   /**
@@ -11362,16 +11422,21 @@ ${transcript}
       parentSignal.addEventListener("abort", onParentAbort, { once: true });
     }
 
-    // File tools read the memory repo only under this task's memoryRepo layer (design §6.4).
-    const memoryRepoReadAllowed =
-      MemoryRepoService.get()?.isReady() === true &&
-      (await this.resolveMemoryInjectionForPrompt(this.lastUserMessage)
-        .then((decision) => decision.layers.memoryRepo === true)
-        .catch(() => false));
+    // File tools read the memory repo only under this task's memoryRepo layer (design §6.4);
+    // with only the swarm layer, its own swarm folder (phase 5 §2).
+    const memoryRepoDecision =
+      MemoryRepoService.get()?.isReady() === true
+        ? await this.resolveMemoryInjectionForPrompt(this.lastUserMessage).catch(() => null)
+        : null;
+    const memoryRepoReadAllowed = memoryRepoDecision?.layers.memoryRepo === true;
+    const swarmPrefix =
+      memoryRepoDecision?.layers.swarm === true
+        ? await this.resolveTaskSwarm().then((swarm) => (swarm ? swarmFolderPath(swarm.slug) : null))
+        : null;
 
     try {
       const coordinated = await withTimeout(
-        runWithMemoryRepoAccess({ readAllowed: memoryRepoReadAllowed }, () =>
+        runWithMemoryRepoAccess({ readAllowed: memoryRepoReadAllowed, swarmPrefix }, () =>
           this.toolExecutionCoordinator.executeTool(
             toolName,
             input as Any,
@@ -17012,6 +17077,9 @@ ${transcript}
       if (!trimmed) continue;
       allowlist.add(trimmed);
     }
+    // Swarm members keep swarm_note under an inherited allowlist; explicit restrictions
+    // (verifiers) still win (phase 5 §2).
+    if (this.swarmForTools && !allowlist.has("*")) allowlist.add("swarm_note");
 
     return allowlist;
   }
@@ -17124,6 +17192,7 @@ ${transcript}
       botConversation: this.task.agentConfig?.botConversation === true,
       botTeamId: botMessagingContext?.botTeamId || this.task.agentConfig?.botTeamId,
       botMessagingAuthorized,
+      swarmMember: this.swarmForTools !== null,
     };
   }
 
@@ -17615,9 +17684,7 @@ ${transcript}
       return {
         contextPackInjectionEnabled: false,
         heartbeatMaintenanceEnabled: false,
-        layeredMemoryEnabled: false,
         transcriptStoreEnabled: false,
-        backgroundConsolidationEnabled: false,
         queryOrchestratorEnabled: false,
       };
     }
@@ -18484,8 +18551,6 @@ ${transcript}
     totalTokens: number;
     droppedSections: string[];
     truncatedSections: string[];
-    topicCount: number;
-    memoryIndexInjected: boolean;
   }> {
     const queryOrchestrator = new QueryOrchestrator(params.memoryFeatures);
     let transcriptContext = "";
@@ -18550,10 +18615,6 @@ ${transcript}
       taskDomain: params.taskDomain,
       webSearchModeContract: this.buildWebSearchModeContract(),
       worktreeBranch: this.task.worktreeBranch,
-      filesystemReadGuard: (candidatePath: string) => this.canReadWorkspacePath(candidatePath),
-      filesystemWriteGuard: (candidatePath: string) =>
-        evaluateWorkspaceFilesystemAccess(this.workspace, candidatePath, "write").decision ===
-        "allow",
       totalBudgetTokens: EXECUTION_SYSTEM_PROMPT_TOTAL_BUDGET,
       transcriptContext,
       sectionCache: this.promptSectionCache,
@@ -18843,6 +18904,11 @@ ${transcript}
 
     const isBotConversation = this.task.agentConfig?.botConversation === true;
     const botTeamDelegationRequested = this.hasExplicitBotTeamDelegationRequest(stepText);
+
+    if (this.swarmForTools) {
+      // Any step may share a finding with the other agents on the same goal (phase 5 §2).
+      always.add("swarm_note");
+    }
 
     if (isBotConversation) {
       // Team handoffs are part of the bot conversation contract. Keep the
@@ -30005,8 +30071,9 @@ You are continuing a previous conversation. The context from the previous conver
     try {
       const readGuard = (candidatePath: string) => this.canReadWorkspacePath(candidatePath);
       if (planningMemoryDecision.layers.workspaceKit) {
-        // Hand edits of the kit's generated blocks sync back on save from now on.
-        KitFileWatcher.watchWorkspace(this.workspace);
+        // Retired generated memory blocks are removed from USER.md / MEMORY.md once per
+        // workspace (fire-and-forget; the prompt strips them meanwhile).
+        void stripCuratedKitBlocksOnce(this.workspace);
         kitContext = buildWorkspaceKitContext(
           this.workspace.path,
           this.getContractPrompt(),
@@ -30180,8 +30247,6 @@ Return ONLY a JSON object:
       });
       this.emitEvent("log", {
         message: "Planning prompt built",
-        memoryIndexInjected: builtPrompt.memoryIndexInjected,
-        topicCount: builtPrompt.topicCount,
         droppedSections: builtPrompt.droppedSections,
         truncatedSections: builtPrompt.truncatedSections,
         totalTokens: builtPrompt.totalTokens,
@@ -32313,8 +32378,6 @@ Return ONLY a JSON object:
     });
     this.emitEvent("log", {
       message: "Execution prompt built",
-      memoryIndexInjected: builtPrompt.memoryIndexInjected,
-      topicCount: builtPrompt.topicCount,
       droppedSections: builtPrompt.droppedSections,
       truncatedSections: builtPrompt.truncatedSections,
       totalTokens: builtPrompt.totalTokens,
@@ -33180,6 +33243,7 @@ Return ONLY a JSON object:
               allowSharedContextInjection,
               allowMemoryInjection,
               allowMemoryRepoInjection: memoryDecision.layers.memoryRepo,
+              allowSwarmInjection: memoryDecision.layers.swarm,
               memoryQuery: `${this.task.title}\n${this.getMemoryQueryPrompt()}\nStep: ${step.description}`,
               contextLabel: `step:${step.id} ${step.description}`,
               lastTurnMemoryRecallQuery,
@@ -41182,8 +41246,6 @@ Return ONLY a JSON object:
     });
     this.emitEvent("log", {
       message: "Follow-up prompt built",
-      memoryIndexInjected: builtPrompt.memoryIndexInjected,
-      topicCount: builtPrompt.topicCount,
       droppedSections: builtPrompt.droppedSections,
       truncatedSections: builtPrompt.truncatedSections,
       totalTokens: builtPrompt.totalTokens,
@@ -41501,6 +41563,7 @@ Return ONLY a JSON object:
               allowSharedContextInjection,
               allowMemoryInjection,
               allowMemoryRepoInjection: memoryDecision.layers.memoryRepo,
+              allowSwarmInjection: memoryDecision.layers.swarm,
               memoryQuery: `${this.task.title}\n${message}\n${this.getMemoryQueryPrompt()}`,
               contextLabel: "follow-up message",
               lastTurnMemoryRecallQuery,

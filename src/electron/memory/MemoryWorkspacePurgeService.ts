@@ -30,6 +30,7 @@ import path from "path";
 import { createLogger } from "../utils/logger";
 import { ChronicleObservationRepository } from "../chronicle/ChronicleObservationRepository";
 import { CuratedMemoryService } from "./CuratedMemoryService";
+import { stripCuratedKitBlocksOnce } from "./kit-block-strip";
 import { DurableContextService } from "./DurableContextService";
 import { MemoryService } from "./MemoryService";
 import { SupermemoryService } from "./SupermemoryService";
@@ -176,6 +177,14 @@ export class MemoryWorkspacePurgeService {
         result.errors.push(`memory repo: ${errorMessage(error)}`);
       }
     }
+    // A deleted root task takes its swarm folder with it (docs/memory-repo-phase5-design.md §2).
+    if (SAFE_TASK_ID.test(params.taskId)) {
+      try {
+        await MemoryRepoService.get()?.purgeSwarm(params.taskId);
+      } catch (error) {
+        result.errors.push(`swarm notes: ${errorMessage(error)}`);
+      }
+    }
     const workspacePath = params.workspacePath;
     if (!workspacePath || !SAFE_TASK_ID.test(params.taskId)) return result;
 
@@ -281,15 +290,17 @@ export class MemoryWorkspacePurgeService {
     });
 
     if (workspacePath) {
-      // Rewrite the auto-managed blocks in .cowork/USER.md and .cowork/MEMORY.md from the
-      // now-empty curated table, so cleared facts stop being injected from the files.
+      // Remove leftover generated memory blocks from .cowork/USER.md and .cowork/MEMORY.md
+      // (retired views of memory_items), so cleared facts are not left quoted in the files.
       await step("curatedEntries", async () => {
-        await CuratedMemoryService.syncWorkspaceFiles(workspaceId);
+        const stored = await CuratedMemoryService.findWorkspace(workspaceId);
+        if (stored) await stripCuratedKitBlocksOnce({ ...stored, path: workspacePath });
         return 0;
       });
       await step("transcripts", async () =>
         transcriptDeletionCount(await TranscriptStore.deleteWorkspace(workspacePath)),
       );
+      // Leftover files of the retired topic packs and daily summaries.
       await step("topicFiles", async () => {
         const topics = await removeConfinedFiles(
           workspacePath,

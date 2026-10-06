@@ -18,7 +18,7 @@ import {
   parseDreamOutput,
   type DreamTaskInput,
 } from "./memory-repo-dream-plan";
-import { MEMORY_REPO_INBOX_FILE, parseMemoryRepoEntries } from "./memory-repo-format";
+import { MEMORY_REPO_INBOX_FILE, isSwarmRepoPath, parseMemoryRepoEntries } from "./memory-repo-format";
 import { MemoryRepoBusyError, withMemoryRepoLock } from "./memory-repo-lock";
 
 const logger = createLogger("MemoryRepoDreamer");
@@ -117,6 +117,8 @@ export class MemoryRepoDreamer {
     settings: { enabled: boolean; dailyTokenBudget: number },
   ): Promise<MemoryRepoDreamOutcome> {
     const startedAt = this.now();
+    // Dream over the latest memory: pull what other machines wrote first (Phase 4 sync).
+    if (service.isSyncConfigured()) await service.syncNow({ push: false }).catch(() => undefined);
     const previous = (await service.listDreams(50)).filter((record) => record.status !== "skipped");
     const last = previous[0];
     if (trigger === "daily" && last && startedAt - last.startedAt < DREAM_DAILY_INTERVAL_MS) {
@@ -127,6 +129,8 @@ export class MemoryRepoDreamer {
       startedAt - 7 * DAY_MS;
     const tasks = await this.deps.listRecentTasks(since, DREAM_MAX_TASKS);
     const files = await service.readAllFiles();
+    // Dreams never read swarm folders (agents' shared notes; phase 5 §2).
+    for (const file of [...files.keys()]) if (isSwarmRepoPath(file)) files.delete(file);
     const inboxEntries = parseMemoryRepoEntries(files.get(MEMORY_REPO_INBOX_FILE) ?? "").length;
     if (trigger === "daily" && tasks.length === 0 && inboxEntries === 0) {
       return { ran: false, reason: "nothing_new" };

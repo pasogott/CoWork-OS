@@ -18,9 +18,11 @@ import {
 } from "../access-profile-paths";
 import {
   getMemoryRepoRoot,
+  getTeamMemoryRepoRoots,
   isMemoryRepoReadAllowed,
   runWithMemoryRepoAccess,
   setMemoryRepoRoot,
+  setTeamMemoryRepoRoots,
 } from "../memory-repo-access";
 import { GrepTools } from "../../agent/tools/grep-tools";
 import { GlobTools } from "../../agent/tools/glob-tools";
@@ -109,6 +111,43 @@ describe("memory repo filesystem boundary", () => {
     expect(allowed(() => evaluateWorkspaceFilesystemAccess(workspace, repo, "read")).decision).toBe(
       "allow",
     );
+  });
+
+  it("lets a swarm-only scope read its own swarm folder and nothing else (phase 5 §2)", () => {
+    const swarm = path.join(repo, "swarms", "goal-a1b2c3d4");
+    fs.mkdirSync(swarm, { recursive: true });
+    fs.mkdirSync(path.join(repo, "swarms", "other-ffffffff"), { recursive: true });
+    fs.writeFileSync(path.join(swarm, "findings.md"), "# Findings\n");
+    fs.writeFileSync(path.join(repo, "swarms", "other-ffffffff", "findings.md"), "# Findings\n");
+    // A symlink inside the swarm folder must not reach the rest of the repo.
+    fs.symlinkSync(path.join(repo, "MEMORY.md"), path.join(swarm, "leak.md"));
+    const swarmOnly = <T>(fn: () => T): T =>
+      runWithMemoryRepoAccess({ readAllowed: false, swarmPrefix: "swarms/goal-a1b2c3d4" }, fn);
+    const read = (target: string) =>
+      swarmOnly(() => evaluateWorkspaceFilesystemAccess(workspace, target, "read"));
+    expect(read(path.join(swarm, "findings.md"))).toMatchObject({
+      decision: "allow",
+      reason: "memory_repo_read",
+    });
+    expect(read(swarm).decision).toBe("allow");
+    for (const target of [
+      path.join(repo, "MEMORY.md"),
+      path.join(repo, "swarms"),
+      path.join(repo, "swarms", "other-ffffffff", "findings.md"),
+      path.join(swarm, "..", "..", "MEMORY.md"),
+      path.join(swarm, "leak.md"),
+    ]) {
+      expect(read(target)).toMatchObject({ decision: "deny", reason: "memory_repo_unavailable" });
+    }
+    expect(
+      swarmOnly(() => evaluateWorkspaceFilesystemAccess(workspace, path.join(swarm, "findings.md"), "write")),
+    ).toMatchObject({ decision: "deny", reason: "protected_path" });
+    // A malformed prefix is ignored.
+    expect(
+      runWithMemoryRepoAccess({ readAllowed: false, swarmPrefix: "swarms/../" }, () =>
+        evaluateWorkspaceFilesystemAccess(workspace, path.join(repo, "MEMORY.md"), "read"),
+      ),
+    ).toMatchObject({ decision: "deny" });
   });
 
   it("never offers an approval for a refused read", async () => {
@@ -258,5 +297,137 @@ describe("memory repo filesystem boundary", () => {
     const globRefused = await glob.glob({ pattern: "**/*.md", path: repo });
     expect(globRefused.success).toBe(false);
     expect(globRefused.error).toContain("memory folder is not readable");
+  });
+});
+
+describe("team memory repo filesystem boundary", () => {
+  let team: string;
+  let workspace: Workspace;
+
+  beforeEach(() => {
+    team = tempDir("cowork-team-memory-");
+    fs.mkdirSync(path.join(team, ".git"));
+    fs.mkdirSync(path.join(team, "topics"));
+    fs.writeFileSync(path.join(team, "MEMORY.md"), "# Team\n\n- Releases ship on Tuesdays\n");
+    fs.writeFileSync(path.join(team, "topics", "ci.md"), "# CI\n\n- CI runs on buildkite\n");
+    fs.writeFileSync(path.join(team, ".git", "config"), "[core]\n");
+    // No personal folder: a team repo is protected on its own.
+    setMemoryRepoRoot(null);
+    setTeamMemoryRepoRoots([team]);
+    workspace = makeWorkspace(tempDir("cowork-team-ws-"));
+  });
+
+  afterEach(() => {
+    setTeamMemoryRepoRoots([]);
+    setMemoryRepoRoot(null);
+    while (cleanup.length > 0) {
+      const target = cleanup.pop();
+      if (target) fs.rmSync(target, { recursive: true, force: true });
+    }
+  });
+
+  it("registers and clears the roots", () => {
+    expect(getTeamMemoryRepoRoots()).toEqual([path.resolve(team)]);
+    setTeamMemoryRepoRoots([]);
+    expect(
+      evaluateWorkspaceFilesystemAccess(workspace, path.join(team, "MEMORY.md"), "read"),
+    ).toMatchObject({ decision: "deny", reason: "outside_workspace" });
+  });
+
+  it("reads only inside a task scope whose memory repo layer is on", () => {
+    const file = path.join(team, "MEMORY.md");
+    expect(evaluateWorkspaceFilesystemAccess(workspace, file, "read")).toMatchObject({
+      decision: "deny",
+      reason: "memory_repo_unavailable",
+    });
+    expect(refused(() => evaluateWorkspaceFilesystemAccess(workspace, file, "read"))).toMatchObject(
+      { decision: "deny", reason: "memory_repo_unavailable" },
+    );
+    expect(allowed(() => evaluateWorkspaceFilesystemAccess(workspace, file, "read"))).toMatchObject(
+      { decision: "allow", reason: "memory_repo_read" },
+    );
+  });
+
+  it("denies every mutation and any .git access with protected_path", () => {
+    const unrestricted = makeWorkspace(workspace.path, { unrestrictedFileAccess: true });
+    for (const target of [
+      path.join(team, "MEMORY.md"),
+      path.join(team, "new.md"),
+      path.join(team, "topics", "ci.md"),
+      path.join(team, "topics", "new-dir"),
+      team,
+    ]) {
+      for (const operation of ["write", "delete"] as const) {
+        expect(
+          allowed(() =>
+            evaluateWorkspaceFilesystemAccess(unrestricted, target, operation, {
+              externalApprovalGranted: true,
+            }),
+          ),
+        ).toMatchObject({ decision: "deny", reason: "protected_path" });
+      }
+    }
+    expect(
+      allowed(() =>
+        evaluateWorkspaceFilesystemAccess(workspace, path.join(team, ".git", "config"), "read"),
+      ),
+    ).toMatchObject({ decision: "deny", reason: "protected_path" });
+  });
+
+  it("applies next to the personal folder and catches symlinks into the team repo", () => {
+    const personal = tempDir("cowork-memory-repo-");
+    setMemoryRepoRoot(personal);
+    const link = path.join(workspace.path, "team-link");
+    fs.symlinkSync(team, link);
+    expect(
+      evaluateWorkspaceFilesystemAccess(workspace, path.join(link, "MEMORY.md"), "write"),
+    ).toMatchObject({ decision: "deny", reason: "protected_path" });
+    expect(
+      evaluateWorkspaceFilesystemAccess(workspace, path.join(link, "MEMORY.md"), "read"),
+    ).toMatchObject({ decision: "deny", reason: "memory_repo_unavailable" });
+    expect(
+      evaluateWorkspaceFilesystemAccess(workspace, path.join(personal, "MEMORY.md"), "write"),
+    ).toMatchObject({ decision: "deny", reason: "protected_path" });
+  });
+
+  it("denies writes when the workspace contains the team repo", () => {
+    const home = tempDir("cowork-team-home-");
+    const nested = path.join(home, "team-memory");
+    fs.mkdirSync(nested);
+    fs.writeFileSync(path.join(nested, "MEMORY.md"), "# Team\n");
+    setTeamMemoryRepoRoots([team, nested]);
+    const homeWorkspace = makeWorkspace(home, {
+      accessFilesystemRules: [{ path: nested, access: "write" }],
+    });
+    expect(
+      evaluateWorkspaceFilesystemAccess(homeWorkspace, path.join(nested, "MEMORY.md"), "write"),
+    ).toMatchObject({ decision: "deny", reason: "protected_path" });
+    expect(
+      evaluateWorkspaceFilesystemAccess(homeWorkspace, path.join(home, "notes.md"), "write")
+        .decision,
+    ).toBe("allow");
+  });
+
+  it("lets grep and glob search a team repo only under the task scope", async () => {
+    const daemon = { logEvent: vi.fn(), registerArtifact: vi.fn() } as Any;
+    const grep = new GrepTools(workspace, daemon, "task-1");
+    const glob = new GlobTools(workspace, daemon, "task-1");
+
+    const grepResult = await allowed(() => grep.grep({ pattern: "buildkite", path: team }));
+    expect(grepResult.success).toBe(true);
+    expect(grepResult.matches.map((match) => fs.realpathSync(match.file))).toEqual([
+      path.join(fs.realpathSync(team), "topics", "ci.md"),
+    ]);
+    const globResult = await allowed(() => glob.glob({ pattern: "**/*.md", path: team }));
+    expect(globResult.success).toBe(true);
+    expect(globResult.matches.map((match) => path.basename(match.path)).sort()).toEqual([
+      "MEMORY.md",
+      "ci.md",
+    ]);
+
+    const grepRefused = await refused(() => grep.grep({ pattern: "buildkite", path: team }));
+    expect(grepRefused.success).toBe(false);
+    const globRefused = await glob.glob({ pattern: "**/*.md", path: team });
+    expect(globRefused.success).toBe(false);
   });
 });

@@ -3,7 +3,12 @@ import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import type { AccessFilesystemRule } from "../../shared/access-profiles";
 import type { Workspace } from "../../shared/types";
-import { getMemoryRepoRoot, isMemoryRepoReadAllowed } from "./memory-repo-access";
+import {
+  getMemoryRepoRoot,
+  getMemoryRepoSwarmReadPrefix,
+  getTeamMemoryRepoRoots,
+  isMemoryRepoReadAllowed,
+} from "./memory-repo-access";
 
 export type AccessFilesystemOperation = "read" | "write" | "delete";
 export type AccessFilesystemDecision = "allow" | "deny" | "unmatched";
@@ -477,22 +482,28 @@ export function isProtectedWorkspacePath(
 }
 
 /**
- * Where a path sits relative to the memory repo root (design §6.4): outside, inside, or
- * inside its `.git`. Both the lexical and the canonical path are compared against both the
- * lexical and the canonical root, so neither a symlink into the repo nor `..` segments nor
- * the macOS /var alias can hide a path that is in it.
+ * Where a path sits relative to the memory repo roots (design §6.4): the personal memory
+ * folder and every team memory repo (docs/memory-repo-phase4-design.md §2, read-only under
+ * the same rule). Outside, inside, or inside a root's `.git`. Both the lexical and the
+ * canonical path are compared against both the lexical and the canonical root, so neither a
+ * symlink into a repo nor `..` segments nor the macOS /var alias can hide a path that is in it.
  */
 function classifyMemoryRepoPath(
   lexicalPath: string,
   canonicalPath: string,
 ): "outside" | "repo" | "repo_git" {
-  const root = getMemoryRepoRoot();
-  if (!root) return "outside";
-  const roots = new Set<string>([nodePath.resolve(root)]);
-  try {
-    roots.add(canonicalizeAccessPath(root));
-  } catch {
-    // The root may be missing; the lexical root still applies.
+  const configured = [getMemoryRepoRoot(), ...getTeamMemoryRepoRoots()].filter(
+    (root): root is string => Boolean(root),
+  );
+  if (configured.length === 0) return "outside";
+  const roots = new Set<string>();
+  for (const root of configured) {
+    roots.add(nodePath.resolve(root));
+    try {
+      roots.add(canonicalizeAccessPath(root));
+    } catch {
+      // The root may be missing; the lexical root still applies.
+    }
   }
   let inside = false;
   for (const base of roots) {
@@ -505,6 +516,30 @@ function classifyMemoryRepoPath(
     }
   }
   return inside ? "repo" : "outside";
+}
+
+/**
+ * Whether both the lexical and the canonical path are inside the personal memory repo's
+ * `swarms/<slug>/` folder the current tool call may read (docs/memory-repo-phase5-design.md
+ * §2). Both must be inside, so a symlink cannot reach the rest of the repo.
+ */
+function isWithinReadableSwarmFolder(lexicalPath: string, canonicalPath: string): boolean {
+  const prefix = getMemoryRepoSwarmReadPrefix();
+  const root = getMemoryRepoRoot();
+  if (!prefix || !root) return false;
+  const folder = nodePath.resolve(root, prefix);
+  const bases = new Set<string>([folder]);
+  try {
+    bases.add(canonicalizeAccessPath(folder));
+  } catch {
+    // The folder may not exist yet; the lexical path still applies.
+  }
+  const inside = (target: string) =>
+    [...bases].some((base) => {
+      const relative = nodePath.relative(base, target);
+      return relative === "" || (!relative.startsWith("..") && !nodePath.isAbsolute(relative));
+    });
+  return inside(nodePath.resolve(lexicalPath)) && inside(canonicalPath);
 }
 
 function resolveWorkspacePolicyPath(workspacePath: string, value: string): string {
@@ -612,7 +647,8 @@ export function evaluateWorkspaceFilesystemAccess(
     if (ruleDecision === "deny") {
       return { decision: "deny", path: operationPath, reason: "profile_filesystem_denied" };
     }
-    return isMemoryRepoReadAllowed()
+    // A swarm member without the memoryRepo layer reads its own swarm folder only.
+    return isMemoryRepoReadAllowed() || isWithinReadableSwarmFolder(requestedPath, resolvedPath)
       ? { decision: "allow", path: operationPath, reason: "memory_repo_read" }
       : { decision: "deny", path: operationPath, reason: "memory_repo_unavailable" };
   }
