@@ -61,10 +61,7 @@ import type {
   MemoryHubWhy,
 } from "../shared/memory-hub-types";
 import type { MemoryUsedForTask } from "../shared/memory-used";
-import type {
-  MemoryReviewMutationResult,
-  MemoryReviewState,
-} from "../shared/memory-review-types";
+import type { MemoryReviewMutationResult, MemoryReviewState } from "../shared/memory-review-types";
 import type { MemoryHealthReport, MemorySourcesReport } from "../shared/memory-health-types";
 import type {
   MemoryRepoCompactResult,
@@ -1258,6 +1255,10 @@ interface TextMemoryImportResult {
   duplicatesSkipped: number;
   truncated: number;
   errors: string[];
+  /** Memories created per export category (instructions, identity, career, ...). */
+  byCategory: Partial<Record<string, number>>;
+  /** The pasted answer said more entries remain. */
+  incomplete: boolean;
 }
 
 // Hooks types (inlined for sandboxed preload)
