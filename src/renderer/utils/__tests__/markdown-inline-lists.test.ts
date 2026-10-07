@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  cleanAssistantMessageForDisplay,
+  normalizeTimelineTitleMarkdownForDisplay,
+} from "../../components/MainContent/markdown-normalization";
+import {
+  fixUnclosedBold,
   normalizeInlineLists,
   normalizeInlineHeadings,
   normalizeMarkdownForCollab,
@@ -27,6 +32,7 @@ describe("normalizeInlineLists", () => {
     const output = normalizeInlineLists(input);
     expect(output).toContain("• Item A\n• Item B");
     expect(output).toContain("• Item B\n• Item C");
+    expect(normalizeInlineLists("Fast - and local: • A • B")).toBe("Fast - and local: • A\n• B");
   });
 
   it("leaves already-formatted lists unchanged", () => {
@@ -43,6 +49,90 @@ describe("normalizeInlineLists", () => {
     expect(output).toContain("\n2. any gaps or conflicts");
     expect(output).toContain("\n3. the key insights");
     expect(output).toContain("\n4. a clear plan");
+  });
+
+  it("does not split a list item whose line ends in a number", () => {
+    const input = "1. You pick a door, say Door 1.\n2. The host opens another door.";
+    expect(normalizeInlineLists(input)).toBe(input);
+    expect(cleanAssistantMessageForDisplay(input)).toBe(input);
+  });
+
+  it("does not split at a bullet marker at the end of a line", () => {
+    const input = "- Item A ends with a dash -\n- Item B";
+    expect(normalizeInlineLists(input)).toBe(input);
+  });
+
+  it("does not turn a trailing parenthetical number into an empty item", () => {
+    const input = "See note (1)\nNext line";
+    expect(normalizeInlineLists(input)).toBe(input);
+  });
+
+  it("still splits a real inline numbered list", () => {
+    expect(normalizeInlineLists("1. A 2. B 3. C")).toBe("1. A\n2. B\n3. C");
+    expect(normalizeInlineLists("Two options: 1. Keep it 2. Remove it")).toBe(
+      "Two options: 1. Keep it\n2. Remove it",
+    );
+  });
+
+  it("keeps the indentation of a nested inline list", () => {
+    expect(normalizeInlineLists("- Parent\n   1. A 2. B 3. C")).toBe(
+      "- Parent\n   1. A\n   2. B\n   3. C",
+    );
+  });
+
+  it("leaves 'Version 2. Next' sentences alone", () => {
+    const sentences = [
+      "We shipped Version 2. Next we add sync.",
+      "Requires Node 18. Then upgrade to Version 2. Next, restart.",
+      "Step 1. Install Node 18. Then run it.",
+      "1. Upgrade to Version 2. Next, run the migration.\n2. Restart the app.",
+      "1. You pick Door 1. The host opens Door 3. You may switch to Door 2. Done.",
+    ];
+    for (const input of sentences) {
+      expect(normalizeInlineLists(input)).toBe(input);
+    }
+  });
+
+  it("leaves arithmetic and dashes in prose alone", () => {
+    const lines = [
+      "Estimate: people * 0.4 * 250 * 12 = budget",
+      "* Cost: people * 0.4 * 250",
+      "- **Speed** - it's faster than the old path",
+      "Use X - it's faster - and Y",
+      "- 2023 - 2024 - 2025",
+      "* * *",
+    ];
+    for (const input of lines) {
+      expect(normalizeInlineLists(input)).toBe(input);
+    }
+  });
+
+  it("still splits an inline hyphen list on a bullet line", () => {
+    expect(normalizeInlineLists("- Fast - Cheap - Local")).toBe("- Fast\n- Cheap\n- Local");
+  });
+
+  it("leaves fenced code blocks untouched", () => {
+    const code = [
+      "```python",
+      "total = people * 0.4 * 250",
+      "steps = '1. a 2. b 3. c'",
+      "- x - y - z",
+      "print((1) + 2)",
+      "```",
+    ].join("\n");
+    const input = `Phases: 1. Plan 2. Build\n\n${code}\n\nAfter: 1. Test 2. Ship`;
+    expect(normalizeInlineLists(input)).toBe(
+      `Phases: 1. Plan\n2. Build\n\n${code}\n\nAfter: 1. Test\n2. Ship`,
+    );
+  });
+
+  it("leaves tilde, indented and unclosed fences untouched", () => {
+    const tilde = "~~~\n1. a 2. b 3. c\n~~~";
+    expect(normalizeInlineLists(tilde)).toBe(tilde);
+    const indented = "1. Run this:\n\n    ```bash\n    echo 1. a 2. b 3. c\n    ```";
+    expect(normalizeInlineLists(indented)).toBe(indented);
+    const unclosed = "```\n1. a 2. b 3. c";
+    expect(normalizeInlineLists(unclosed)).toBe(unclosed);
   });
 });
 
@@ -70,6 +160,37 @@ describe("normalizeInlineHeadings", () => {
     const output = normalizeInlineHeadings(input);
     expect(output).toContain("\n### Architecture");
     expect(output).toContain("\n## Feature Inventory");
+  });
+
+  it("leaves # comments in fenced code untouched", () => {
+    const python = "```python\nx = 1 # note\ny = 2  ## also a comment\n```";
+    const bash = "```bash\necho hi # comment\n```";
+    const tilde = "~~~sh\nls # list\n~~~";
+    const input = `From X: ### Overview\n\n${python}\n\n${bash}\n\n${tilde}\n\nThen ## Next`;
+    expect(normalizeInlineHeadings(input)).toBe(
+      `From X:\n### Overview\n\n${python}\n\n${bash}\n\n${tilde}\n\nThen\n## Next`,
+    );
+    const unclosed = "```bash\necho hi # comment";
+    expect(normalizeInlineHeadings(unclosed)).toBe(unclosed);
+  });
+
+  it("does not rewrite across line boundaries", () => {
+    const inputs = [
+      "Intro\n\n## Section",
+      "Notes:\n\n    # indented code",
+      "Total ##\nNext line",
+      "- Parent\n  ### Child heading",
+    ];
+    for (const input of inputs) {
+      expect(normalizeInlineHeadings(input)).toBe(input);
+    }
+  });
+});
+
+describe("normalizeTimelineTitleMarkdownForDisplay", () => {
+  it("keeps inline # comments in fenced code on their line", () => {
+    const code = "```python\nx = 1 # note\n```";
+    expect(normalizeTimelineTitleMarkdownForDisplay(`Ran:\n\n${code}`)).toBe(`Ran:\n\n${code}`);
   });
 });
 
@@ -177,5 +298,25 @@ describe("normalizeMarkdownForCollab", () => {
     const input = "**CoWork OS** most likely fits";
     const output = normalizeMarkdownForCollab(input);
     expect(output).toBe(input);
+  });
+
+  it("leaves ** and # comments in fenced code untouched", () => {
+    const python = "```python\nsquare = x ** 2  # power\n```";
+    const bash = "~~~bash\nshopt -s globstar # enable **\n~~~";
+    const input = `**Electron desktop app\n\nFrom X: ### Overview\n\n${python}\n\n${bash}`;
+    expect(normalizeMarkdownForCollab(input)).toBe(
+      `**Electron desktop app**\n\nFrom X:\n### Overview\n\n${python}\n\n${bash}`,
+    );
+  });
+});
+
+describe("fixUnclosedBold", () => {
+  it("leaves ** inside fenced code untouched", () => {
+    const code = "```python\ny = x ** 2\n```";
+    expect(fixUnclosedBold(`**Unclosed\n\n${code}\n\n**Also unclosed`)).toBe(
+      `**Unclosed**\n\n${code}\n\n**Also unclosed**`,
+    );
+    const unclosed = "```js\nconst glob = 'src/**';";
+    expect(fixUnclosedBold(unclosed)).toBe(unclosed);
   });
 });

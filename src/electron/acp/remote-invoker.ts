@@ -1,5 +1,11 @@
 import { randomUUID } from "crypto";
-import net from "net";
+import { isIP } from "net";
+import {
+  isLoopbackAddress,
+  isPrivateOrLoopbackAddress,
+  normalizeHostname,
+} from "../security/address-classes";
+import { pinnedFetch } from "../security/pinned-fetch";
 import type {
   ACPAgentCard,
   ACPTaskCreateParams,
@@ -8,6 +14,13 @@ import type {
   A2AJsonRpcSuccessResponse,
   A2ARemoteTaskResult,
 } from "./types";
+import {
+  createRemoteAgentSecretResolver,
+  getRemoteAgentSecretRef,
+  hasPlaintextRemoteAgentSecrets,
+  type RemoteAgentSecretResolver,
+  type RemoteAgentSecrets,
+} from "./remote-agent-secrets";
 
 export interface RemoteInvocationResult {
   status: "completed" | "failed" | "pending" | "running" | "cancelled";
@@ -35,33 +48,6 @@ const METHOD_UNSUPPORTED_HTTP_STATUSES = new Set([404, 405, 501]);
 // -32601 Method not found, -32600 Invalid Request: rejected before execution per JSON-RPC 2.0.
 const METHOD_UNSUPPORTED_JSON_RPC_CODES = new Set([-32601, -32600]);
 
-function isLoopbackHostname(hostname: string): boolean {
-  const normalized = hostname.trim().toLowerCase();
-  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
-}
-
-function isPrivateIpAddress(hostname: string): boolean {
-  if (net.isIP(hostname) === 4) {
-    return (
-      hostname.startsWith("10.") ||
-      hostname.startsWith("127.") ||
-      hostname.startsWith("169.254.") ||
-      hostname.startsWith("192.168.") ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
-    );
-  }
-  if (net.isIP(hostname) === 6) {
-    const normalized = hostname.toLowerCase();
-    return (
-      normalized === "::1" ||
-      normalized.startsWith("fc") ||
-      normalized.startsWith("fd") ||
-      normalized.startsWith("fe80:")
-    );
-  }
-  return false;
-}
-
 export function validateRemoteAgentEndpoint(endpoint: string): URL {
   let parsed: URL;
   try {
@@ -75,30 +61,48 @@ export function validateRemoteAgentEndpoint(endpoint: string): URL {
     throw new Error("Remote agent endpoint must use https, or http for loopback development only");
   }
 
-  if (protocol === "http:" && !isLoopbackHostname(parsed.hostname)) {
+  // URL keeps IPv6 literals bracketed ("[fd00::1]"), which a raw net.isIP check
+  // reads as "not an IP" and waves through. Normalize first, and use the shared
+  // address classes so IPv4-mapped and encoded literals are classified too.
+  const hostname = normalizeHostname(parsed.hostname);
+  // `*.localhost` names are not guaranteed to resolve locally, so plaintext http
+  // stays limited to `localhost` itself and loopback literals.
+  const loopback =
+    hostname === "localhost" || (isIP(hostname) !== 0 && isLoopbackAddress(hostname));
+  if (protocol === "http:" && !loopback) {
     throw new Error("Remote agent endpoint must use https unless it targets localhost");
   }
 
-  if (isPrivateIpAddress(parsed.hostname) && !isLoopbackHostname(parsed.hostname)) {
+  // Literal addresses only. Names are checked by the network policy at dispatch
+  // admission and resolved and pinned per request by pinnedFetch, both of which
+  // honor the admin `allowedInternalHosts` exception for self-hosted agents.
+  if (isIP(hostname) && !loopback && isPrivateOrLoopbackAddress(hostname)) {
     throw new Error("Remote agent endpoint cannot target private or link-local IP ranges");
   }
 
   return parsed;
 }
 
-function buildHeaders(agent: ACPAgentCard): Record<string, string> {
+function buildHeaders(secrets: RemoteAgentSecrets | undefined): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
-  const metadata = (agent.metadata || {}) as Record<string, unknown>;
-  const explicitHeader = metadata.authorizationHeader;
-  const bearerToken = metadata.bearerToken;
+  const explicitHeader = secrets?.authorizationHeader;
+  const bearerToken = secrets?.bearerToken;
   if (typeof explicitHeader === "string" && explicitHeader.trim()) {
     headers.Authorization = explicitHeader.trim();
   } else if (typeof bearerToken === "string" && bearerToken.trim()) {
     headers.Authorization = `Bearer ${bearerToken.trim()}`;
   }
   return headers;
+}
+
+export interface RemoteAgentInvokerOptions {
+  /**
+   * Resolves an agent's credentials when a request is sent. Defaults to the
+   * secure-settings store; credentials are never read from the agent card.
+   */
+  resolveSecrets?: RemoteAgentSecretResolver;
 }
 
 function normalizeRemoteResult(
@@ -137,6 +141,29 @@ function normalizeRemoteResult(
 }
 
 export class RemoteAgentInvoker {
+  private readonly resolveSecrets: RemoteAgentSecretResolver;
+
+  constructor(options: RemoteAgentInvokerOptions = {}) {
+    this.resolveSecrets = options.resolveSecrets ?? createRemoteAgentSecretResolver();
+  }
+
+  private async resolveHeaders(agent: ACPAgentCard): Promise<Record<string, string>> {
+    const secrets = await this.resolveSecrets(agent);
+    const headers = buildHeaders(secrets);
+    if (!headers.Authorization && getRemoteAgentSecretRef(agent)) {
+      // Fail closed: the agent was registered with credentials that cannot be read now.
+      throw new Error(`Credentials for remote agent ${agent.id} are unavailable`);
+    }
+    if (!headers.Authorization && hasPlaintextRemoteAgentSecrets(agent)) {
+      // Fail closed: the card still holds credentials that could not be moved to secure
+      // storage yet. Sending without them would call the agent unauthenticated.
+      throw new Error(
+        `Credentials for remote agent ${agent.id} are waiting to move to secure storage; check that secure storage is available and restart CoWork`,
+      );
+    }
+    return headers;
+  }
+
   private async sendRequest<T>(
     agent: ACPAgentCard,
     method: A2AJsonRpcRequest["method"],
@@ -146,6 +173,7 @@ export class RemoteAgentInvoker {
       throw new Error(`Remote agent ${agent.id} is missing an endpoint`);
     }
     const endpoint = validateRemoteAgentEndpoint(agent.endpoint).toString();
+    const headers = await this.resolveHeaders(agent);
     const request: A2AJsonRpcRequest = {
       jsonrpc: "2.0",
       id: randomUUID(),
@@ -155,9 +183,13 @@ export class RemoteAgentInvoker {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REMOTE_REQUEST_TIMEOUT_MS);
     try {
-      const response = await fetch(endpoint, {
+      // pinnedFetch resolves the host, refuses internal answers, and binds the
+      // socket to the validated addresses, so a public name that resolves (or
+      // rebinds) to a private range is refused. It also does not follow redirects;
+      // a 3xx is a non-OK response below rather than a hop to an unchecked host.
+      const response = await pinnedFetch(endpoint, {
         method: "POST",
-        headers: buildHeaders(agent),
+        headers,
         body: JSON.stringify(request),
         signal: controller.signal,
       });

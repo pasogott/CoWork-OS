@@ -7,8 +7,14 @@ import { sanitizeToolCallTextFromAssistant } from "../../../shared/tool-call-tex
 import {
   normalizeInlineLists,
   normalizeInlineHeadings,
+  transformOutsideFencedCode,
   unwrapMarkdownCodeBlocks,
 } from "../../utils/markdown-inline-lists";
+import {
+  ANSWER_SURFACE_FENCE_LANGUAGE,
+  hasAnswerSurfaceBlock,
+  splitAnswerSurfaceBlocks,
+} from "../../../shared/answer-surfaces/blocks";
 
 const FILE_EXTENSIONS = new Set([
   "txt",
@@ -269,10 +275,13 @@ export function normalizeTimelineTitleMarkdownForDisplay(text: string): string {
     normalizeInlineHeadings(normalizeMarkdownForDisplay(text)),
   );
   // Escape only single # so shell comments like "# route check" are not rendered
-  // as <h1>. Allow ##, ###, etc. to render as headings.
-  return normalized.replace(
-    /^( {0,3})(#)(?=\s)/gm,
-    (_match: string, indent: string, hash: string) => `${indent}${hash.replace(/#/g, "\\#")}`,
+  // as <h1>. Allow ##, ###, etc. to render as headings. Fenced code is skipped, since
+  // backslash escapes are literal there and "\#" would show in the code.
+  return transformOutsideFencedCode(normalized, (segment) =>
+    segment.replace(
+      /^( {0,3})(#)(?=\s)/gm,
+      (_match: string, indent: string, hash: string) => `${indent}${hash.replace(/#/g, "\\#")}`,
+    ),
   );
 }
 
@@ -285,11 +294,28 @@ export function hasDisplayableAssistantText(message: string): boolean {
   return cleanAssistantMessageForDisplay(message).trim().length > 0;
 }
 
-export function cleanAssistantMessageForDisplay(message: string): string {
+function cleanAssistantTextForDisplay(message: string): string {
   const sanitized = String(message || "")
     .replace(/\[\[speak\]\]([\s\S]*?)\[\[\/speak\]\]/gi, "$1")
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
     .replace(/<tool_result>[\s\S]*?<\/tool_result>/gi, "")
     .trim();
   return normalizeMarkdownForDisplay(normalizeInlineLists(unwrapMarkdownCodeBlocks(sanitized)));
+}
+
+export function cleanAssistantMessageForDisplay(message: string): string {
+  if (!hasAnswerSurfaceBlock(message)) return cleanAssistantTextForDisplay(message);
+  // Answer surface blocks are JSON: the list and link rewriting below would corrupt them.
+  return splitAnswerSurfaceBlocks(message)
+    .map((part) =>
+      part.kind === "text"
+        ? cleanAssistantTextForDisplay(part.text)
+        : [
+            "```" + ANSWER_SURFACE_FENCE_LANGUAGE,
+            part.source,
+            ...(part.closed ? ["```"] : []),
+          ].join("\n"),
+    )
+    .filter((part) => part.trim().length > 0)
+    .join("\n\n");
 }

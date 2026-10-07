@@ -15,6 +15,11 @@ import { createLogger } from "../utils/logger";
 import { ACPAgentRegistry } from "./agent-registry";
 import { RemoteAgentInvoker } from "./remote-invoker";
 import {
+  createRemoteAgentSecretResolver,
+  toPublicAgentCard,
+  type RemoteAgentSecretStore,
+} from "./remote-agent-secrets";
+import {
   ACPMethods,
   ACPEvents,
   type ACPMessage,
@@ -98,11 +103,16 @@ export interface ACPHandlerDeps {
     | Promise<{ id: string; status: string; error?: string } | undefined>;
   /** Function to cancel a task by ID */
   cancelTask?: (taskId: string) => Promise<void>;
+  /**
+   * Store for remote agent credentials. Defaults to SecureSettingsRepository
+   * (safeStorage); tests inject an in-memory store.
+   */
+  remoteAgentSecretStore?: RemoteAgentSecretStore;
 }
 
 /** In-memory ACP task tracker */
 const acpTasks = new Map<string, ACPTask>();
-const remoteInvoker = new RemoteAgentInvoker();
+let remoteInvoker = new RemoteAgentInvoker();
 const logger = createLogger("ACPHandler");
 
 /** The shared ACP agent registry instance */
@@ -111,9 +121,12 @@ let registry: ACPAgentRegistry | null = null;
 /**
  * Get or create the ACP agent registry singleton
  */
-export function getACPRegistry(db?: Database.Database): ACPAgentRegistry {
+export function getACPRegistry(
+  db?: Database.Database,
+  options?: ConstructorParameters<typeof ACPAgentRegistry>[1],
+): ACPAgentRegistry {
   if (!registry) {
-    registry = new ACPAgentRegistry(db);
+    registry = new ACPAgentRegistry(db, options);
   }
   return registry;
 }
@@ -285,7 +298,10 @@ function requireString(value: unknown, field: string): string {
  * Call this during server startup alongside registerTaskAndWorkspaceMethods.
  */
 export function registerACPMethods(server: ControlPlaneServer, deps: ACPHandlerDeps): void {
-  const reg = getACPRegistry(deps.db);
+  const reg = getACPRegistry(deps.db, { secretStore: deps.remoteAgentSecretStore });
+  remoteInvoker = new RemoteAgentInvoker({
+    resolveSecrets: createRemoteAgentSecretResolver(deps.remoteAgentSecretStore),
+  });
   // Handlers run once the persisted tasks and remote agents are loaded.
   const loaded = Promise.all([loadPersistedTasks(deps.db), reg.ready]).catch((error: unknown) => {
     logger.warn("Failed to load persisted ACP state:", error);
@@ -302,7 +318,8 @@ export function registerACPMethods(server: ControlPlaneServer, deps: ACPHandlerD
     const p = (params || {}) as ACPDiscoverParams;
     const roles = await deps.getActiveRoles();
     const agents = reg.discover(p, roles);
-    return { agents };
+    // Read-scoped clients get the public projection: no credential metadata.
+    return { agents: agents.map(toPublicAgentCard) };
   });
 
   // ----- acp.agent.get -----
@@ -315,7 +332,7 @@ export function registerACPMethods(server: ControlPlaneServer, deps: ACPHandlerD
     if (!agent) {
       throw { code: ErrorCodes.INVALID_PARAMS, message: `Agent not found: ${agentId}` };
     }
-    return { agent };
+    return { agent: toPublicAgentCard(agent) };
   });
 
   // ----- acp.agent.register -----
@@ -325,9 +342,9 @@ export function registerACPMethods(server: ControlPlaneServer, deps: ACPHandlerD
     requireString(p.name, "name");
     requireString(p.description, "description");
 
-    const card = reg.registerRemoteAgent(p);
+    const card = toPublicAgentCard(reg.registerRemoteAgent(p));
 
-    // Broadcast registration event
+    // Broadcast registration event (every authenticated client receives it)
     server.broadcast(ACPEvents.AGENT_REGISTERED, { agent: card });
 
     return { agent: card };
@@ -514,29 +531,14 @@ export function registerACPMethods(server: ControlPlaneServer, deps: ACPHandlerD
         acpTask.status = "failed";
         acpTask.error = err?.message || "Failed to create task";
       }
-    } else if (assignee.origin === "remote" && assignee.endpoint) {
-      try {
-        const result = await remoteInvoker.invoke(assignee, {
-          assigneeId,
-          title,
-          prompt,
-          workspaceId: p.workspaceId,
-        });
-        acpTask.remoteTaskId = result.remoteTaskId;
-        acpTask.status = result.status;
-        acpTask.result = result.result;
-        acpTask.error = result.error;
-        if (
-          result.status === "completed" ||
-          result.status === "failed" ||
-          result.status === "cancelled"
-        ) {
-          acpTask.completedAt = Date.now();
-        }
-      } catch (err: Any) {
-        acpTask.status = "failed";
-        acpTask.error = err?.message || "Failed to invoke remote agent";
-      }
+    } else if (assignee.origin === "remote") {
+      // New remote sends go only through the orchestration graph, which runs
+      // remote dispatch admission (policy, network policy, approval). Without it
+      // this server must not invoke the agent directly. Polling and cancelling an
+      // already-admitted remote task below stay on the invoker.
+      acpTask.status = "failed";
+      acpTask.error = "Remote ACP task delegation is not configured on this server";
+      acpTask.completedAt = Date.now();
     }
 
     acpTasks.set(acpTask.id, acpTask);

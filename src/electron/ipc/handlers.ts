@@ -503,6 +503,7 @@ import { parseSpawnAgentCount } from "../../shared/spawn-intent-detection";
 import { MCPSettingsManager } from "../mcp/settings";
 import { MCPClientManager } from "../mcp/client/MCPClientManager";
 import { MCPRegistryManager } from "../mcp/registry/MCPRegistryManager";
+import { assertMcpServerEnableAllowed, assertMcpServerNotBlocked } from "../mcp/connector-policy";
 import { getBoxMcpServer, syncBoxMcpConnection } from "../mcp/box-integration";
 import { getChannelRegistry as _getChannelRegistry } from "../gateway/channel-registry";
 import type { MCPSettings, MCPServerConfig } from "../mcp/types";
@@ -571,6 +572,11 @@ import {
 } from "../memory/memory-review-wiring";
 import { setupMemoryReviewHandlers } from "./memory-review-handlers";
 import { setupMemoryHealthHandlers } from "./memory-health-handlers";
+import { setupAnswerSurfaceHandlers } from "./answer-surface-handlers";
+import { answerImageNetworkContext } from "../answer-surfaces/network-context";
+import { configuredImageSearch } from "../answer-surfaces/web-image-search";
+import { AnswerImageService } from "../answer-surfaces/AnswerImageService";
+import { AnswerSurfaceStateStore } from "../answer-surfaces/AnswerSurfaceStateStore";
 import { setupMemoryRepoHandlers } from "./memory-repo-handlers";
 import { MemoryObservationService } from "../memory/MemoryObservationService";
 import { MemorySynthesizer } from "../memory/MemorySynthesizer";
@@ -11779,6 +11785,21 @@ export async function setupIpcHandlers(
     workspaceExists: async (workspaceId) => Boolean(await workspaceRepo.findById(workspaceId)),
   });
 
+  // Interactive answer surfaces: saved control values and photos found by description.
+  setupAnswerSurfaceHandlers({
+    taskExists: async (taskId) => Boolean(await taskRepo.findById(taskId)),
+    resolveNetworkContext: async (taskId) => {
+      const task = taskId ? await taskRepo.findById(taskId) : undefined;
+      const workspace = task ? await workspaceRepo.findById(task.workspaceId) : undefined;
+      return task && workspace ? answerImageNetworkContext(task, workspace) : {};
+    },
+    images: new AnswerImageService({
+      cacheDir: path.join(getUserDataDir(), "cache", "answer-images"),
+      imageSearch: configuredImageSearch,
+    }),
+    store: AnswerSurfaceStateStore,
+  });
+
   // Memory folder: status, open, compact history and entry lines by ref. The
   // folder is the running service's root, never a path from the renderer.
   setupMemoryRepoHandlers({
@@ -11983,6 +12004,13 @@ function setupMCPHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.MCP_SAVE_SETTINGS, async (_, settings) => {
     checkRateLimit(IPC_CHANNELS.MCP_SAVE_SETTINGS);
     const validated = validateInput(MCPSettingsSchema, settings, "MCP settings") as MCPSettings;
+    // Admin policy: a connector in connectors.blocked cannot be switched on.
+    const previousServers = new Map(
+      MCPSettingsManager.loadSettings().servers.map((server) => [server.id, server]),
+    );
+    for (const server of validated.servers || []) {
+      assertMcpServerEnableAllowed(previousServers.get(server.id), server);
+    }
     MCPSettingsManager.saveSettings(validated);
     MCPSettingsManager.clearCache();
     return { success: true };
@@ -11999,6 +12027,7 @@ function setupMCPHandlers(): void {
     checkRateLimit(IPC_CHANNELS.MCP_ADD_SERVER);
     const validated = validateInput(MCPServerConfigSchema, serverConfig, "MCP server config");
     const { id: _id, ...configWithoutId } = validated;
+    assertMcpServerEnableAllowed(undefined, { ...configWithoutId, id: "" } as MCPServerConfig);
     return MCPSettingsManager.addServer(configWithoutId as Omit<MCPServerConfig, "id">);
   });
 
@@ -12010,6 +12039,17 @@ function setupMCPHandlers(): void {
       updates,
       "server updates",
     ) as Partial<MCPServerConfig>;
+    const current = MCPSettingsManager.getServer(validatedId);
+    if (current) {
+      // registryId is the connector identity admin policy matches on; it is set at install.
+      if (
+        validatedUpdates.registryId !== undefined &&
+        validatedUpdates.registryId !== current.registryId
+      ) {
+        throw new Error("A server's registry ID cannot be changed. Reinstall it instead.");
+      }
+      assertMcpServerEnableAllowed(current, { ...current, ...validatedUpdates });
+    }
     return MCPSettingsManager.updateServer(validatedId, validatedUpdates);
   });
 
@@ -12120,6 +12160,8 @@ function setupMCPHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.MCP_CONNECTOR_OAUTH_START, async (_, payload) => {
     checkRateLimit(IPC_CHANNELS.MCP_CONNECTOR_OAUTH_START);
     const validated = validateInput(MCPConnectorOAuthSchema, payload, "connector oauth");
+    // Admin policy connectors.blocked: do not collect tokens for a blocked provider.
+    assertMcpServerNotBlocked({ id: "", name: validated.provider, registryId: validated.provider });
     return startConnectorOAuth(validated);
   });
 
