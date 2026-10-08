@@ -2258,7 +2258,7 @@ export function App() {
   const botConversationTasksRef = useRef<Task[]>([]);
   botConversationTasksRef.current = botConversationTasks;
 
-  // Child tasks dispatched from the selected parent task (for DispatchedAgentsPanel)
+  // Child tasks dispatched from the selected parent task (for sub-agent lifecycle rows and the agent sidebar)
   const childTasks = useMemo(() => {
     if (!selectedTaskId) return [];
     return tasks.filter((t) => t.parentTaskId === selectedTaskId && t.agentType === "sub");
@@ -4881,7 +4881,7 @@ export function App() {
         }
       }
 
-      // Capture events from dispatched child tasks for DispatchedAgentsPanel / CliAgentFrame
+      // Capture events from dispatched child tasks for sub-agent lifecycle rows / CliAgentFrame
       if (!isSelectedTask && event.type !== "llm_streaming" && event.type !== "llm_usage") {
         if (childTaskIdsRef.current.has(event.taskId)) {
           setChildEvents((prev) =>
@@ -6828,6 +6828,7 @@ export function App() {
   const handleCreateTaskFromPrompt = async (
     prompt: string,
     attachments: PendingAttachment[] = [],
+    taskOptions?: { accessProfileId?: AccessProfileId },
   ): Promise<boolean> => {
     let workspace = currentWorkspace;
     if (!workspace) {
@@ -6866,6 +6867,7 @@ export function App() {
       message,
       {
         generateTitle: true,
+        ...(taskOptions?.accessProfileId ? { accessProfileId: taskOptions.accessProfileId } : {}),
         ...(isBuildPrompt(prompt) ? { agentConfig: { taskOrigin: "build" as const } } : {}),
       },
       images,
@@ -8545,6 +8547,10 @@ export function App() {
                   onSelectWorkspace={(workspace) => void selectBuildWorkspace(workspace)}
                   recentBuilds={recentBuilds}
                   onOpenBuild={(taskId) => void openTaskById(taskId)}
+                  onOpenSettings={(tab) => {
+                    if (tab) setSettingsTab(tab);
+                    setCurrentView("settings");
+                  }}
                   onPickFolder={handlePickBuildFolder}
                   folderPickerUnavailableReason={
                     isBrowserHost

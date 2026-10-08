@@ -54,6 +54,7 @@ import { fileURLToPath, pathToFileURL } from "url";
 import {
   app,
   BrowserWindow,
+  clipboard,
   ipcMain,
   dialog,
   session,
@@ -66,6 +67,7 @@ import {
   type BrowserWindowConstructorOptions,
 } from "electron";
 import mime from "mime-types";
+import { attachImageContextMenu } from "./utils/image-context-menu";
 import { closeWindowsForShutdown, installGracefulShutdown } from "./utils/graceful-shutdown";
 import { DatabaseManager } from "./database/schema";
 import {
@@ -158,6 +160,7 @@ import { AppearanceManager } from "./settings/appearance-manager";
 import { MemoryFeaturesManager } from "./settings/memory-features-manager";
 import { PersonalityManager } from "./settings/personality-manager";
 import { MCPClientManager } from "./mcp/client/MCPClientManager";
+import { MCPEventService } from "./mcp/events/MCPEventService";
 import { InfraManager } from "./infra/infra-manager";
 import { trayManager } from "./tray";
 import {
@@ -406,6 +409,7 @@ let strategicPlannerService: StrategicPlannerService | null = null;
 let automationOutcomeService: AutomationOutcomeService | null = null;
 let recurringApprovalService: RecurringApprovalService | null = null;
 let eventTriggerService: EventTriggerService | null = null;
+let mcpEventService: MCPEventService | null = null;
 let routineService: RoutineService | null = null;
 let workflowStarterWatcher: GoogleWorkspaceWorkflowStarterWatcher | null = null;
 let coreTraceService: CoreTraceService | null = null;
@@ -630,6 +634,7 @@ async function ensureCoreAutomationProfiles(): Promise<void> {
 }
 
 app.on("web-contents-created", (_event, contents) => {
+  attachImageContextMenu(contents, clipboard);
   contents.on("did-attach-webview", (_event, guest) => {
     CanvasManager.getInstance().attachWebviewNetworkGuards(guest);
   });
@@ -3804,6 +3809,7 @@ if (isMacSafeStorageMigrationWorker) {
             .map(connectorTriggerSubscription)
             .filter((value): value is NonNullable<typeof value> => Boolean(value));
           await mcpClientManager.syncTriggerResourceSubscriptions(subscriptions);
+          await mcpEventService?.sync();
         };
         mailboxForwardingService = new MailboxForwardingService({
           db,
@@ -3822,6 +3828,13 @@ if (isMacSafeStorageMigrationWorker) {
         mailboxForwardingService.start();
         automationRuntime.register("event_triggers", currentTriggerService);
         await automationRuntime.start("event_triggers");
+        mcpEventService = new MCPEventService(db, mcpClientManager, currentTriggerService);
+        await mcpEventService.start().catch((error) => {
+          logger.warn("MCP Events service could not start:", error);
+        });
+        mcpClientManager.on("event", (event: { type: string }) => {
+          if (event.type === "server_connected") void mcpEventService?.sync();
+        });
         setHookTriggerEmitter((event) => {
           void currentTriggerService
             .evaluateEvent(event)
@@ -3835,7 +3848,7 @@ if (isMacSafeStorageMigrationWorker) {
           }
         });
         void syncMcpTriggerSubscriptions();
-        setupTriggerHandlers(currentTriggerService, syncMcpTriggerSubscriptions);
+        setupTriggerHandlers(currentTriggerService, syncMcpTriggerSubscriptions, mcpEventService);
         const managedSessionService = new ManagedSessionService(db, agentDaemon, {
           workContextService: new WorkContextService(db),
         });
@@ -4678,6 +4691,13 @@ if (isMacSafeStorageMigrationWorker) {
           },
         },
         { name: "control plane", run: () => shutdownControlPlane() },
+        {
+          name: "MCP Events",
+          run: async () => {
+            await mcpEventService?.stop();
+            mcpEventService = null;
+          },
+        },
         {
           name: "event triggers",
           run: async () => {
