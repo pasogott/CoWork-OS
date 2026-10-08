@@ -34,7 +34,13 @@ This is a best-effort WSL/WSLg compatibility path, not a claim of general Linux 
 
 On a supported macOS version, an unsigned CoWork OS DMG may show **"Apple could not verify CoWork OS is free of malware"** or **`"CoWork OS" was blocked to protect your Mac`** on first launch.
 
-Use the macOS Gatekeeper override:
+To avoid the dialog entirely, install from the terminal instead of the DMG. Browsers add the quarantine attribute that triggers Gatekeeper; `curl` does not, and the installer verifies the release checksum and the app signature before copying it into Applications (details in [macOS Installation](macos-installation.md)):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CoWork-OS/CoWork-OS/main/scripts/install-macos.sh | bash
+```
+
+If you already copied the app from the DMG, use the macOS Gatekeeper override:
 
 1. Drag **CoWork OS** from the DMG into **Applications**.
 2. Open **CoWork OS** once. If macOS blocks it, click **Done**.
@@ -465,8 +471,8 @@ If a task like "go to example.com and test the application as a normal user" doe
 
 1. Confirm the task used a `browser_*` tool such as `browser_navigate`, not only `web_fetch`. `web_fetch` is still correct for static page reading.
 2. Confirm the task is selected in the main task view. The visible workbench is tied to the selected task and opens on demand through the renderer.
-3. If the task explicitly requested `force_headless`, `profile`, `browser_channel`, or `debugger_url`, the tool will use the Playwright/external-CDP fallback path instead of the embedded workbench. The legacy `headless` flag alone should not bypass the visible workbench for normal site testing.
-4. If the site requires an existing signed-in Chrome or Edge session, use `browser_attach` explicitly and confirm real-browser control. The embedded browser uses a persistent workspace profile and does not silently reuse system Chrome cookies.
+3. If the task explicitly requested `force_headless`, `profile`, or `browser_channel`, the tool will use the Playwright fallback path instead of the embedded workbench. The legacy `headless` flag alone should not bypass the visible workbench for normal site testing.
+4. If the site requires a signed-in session, sign in inside the Browser Workbench, or launch Chrome with `profile: "user"` after confirming real-browser control. Attaching to an already-running Chrome or Edge (`browser_attach`, `debugger_url`) is refused under the enforced network policy. The embedded browser uses a persistent workspace profile and does not silently reuse system Chrome cookies.
 5. Capture a fresh dev log and check for `browserWorkbench:openRequest`, `browserWorkbench:register`, `BrowserSessionManager`, or browser tool errors if the sidebar never appears.
 
 If the sidebar opens but browser actions are hard to follow:
