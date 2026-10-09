@@ -1376,75 +1376,6 @@ export const GuardrailSettingsSchema = z.object({
 
 export const SecurityModeSchema = z.enum(["pairing", "allowlist", "open"]);
 
-const DISCORD_SUPERVISOR_CONFIG_SHAPE = {
-  enabled: z.boolean(),
-  coordinationChannelId: z.string().trim().min(1).max(100).optional(),
-  watchedChannelIds: z.array(z.string().trim().min(1).max(100)).max(100).optional(),
-  workerAgentRoleId: z.string().uuid().optional(),
-  supervisorAgentRoleId: z.string().uuid().optional(),
-  humanEscalationChannelId: z.string().trim().min(1).max(100).optional(),
-  humanEscalationUserId: z.string().trim().min(1).max(100).optional(),
-  peerBotUserIds: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
-  strictMode: z.boolean().optional(),
-} satisfies z.ZodRawShape;
-
-type DiscordSupervisorConfigRefinementValue = {
-  enabled?: boolean;
-  coordinationChannelId?: string;
-  workerAgentRoleId?: string;
-  supervisorAgentRoleId?: string;
-  peerBotUserIds?: string[];
-};
-
-function addDiscordSupervisorConfigRefinement(
-  schema: z.ZodObject<z.ZodRawShape>,
-): z.ZodObject<z.ZodRawShape> {
-  return schema.superRefine((value, ctx) => {
-    const config = value as DiscordSupervisorConfigRefinementValue;
-    if (!config.enabled) return;
-
-    if (!config.coordinationChannelId) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["coordinationChannelId"],
-        message: "Coordination channel ID is required when supervisor mode is enabled",
-      });
-    }
-    if (!config.workerAgentRoleId) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["workerAgentRoleId"],
-        message: "Worker agent role is required when supervisor mode is enabled",
-      });
-    }
-    if (!config.supervisorAgentRoleId) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["supervisorAgentRoleId"],
-        message: "Supervisor agent role is required when supervisor mode is enabled",
-      });
-    }
-    if (!config.peerBotUserIds || config.peerBotUserIds.length === 0) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["peerBotUserIds"],
-        message: "At least one peer bot user ID is required when supervisor mode is enabled",
-      });
-    }
-  });
-}
-
-const AddDiscordSupervisorConfigSchema = addDiscordSupervisorConfigRefinement(
-  z.object({
-    ...DISCORD_SUPERVISOR_CONFIG_SHAPE,
-    enabled: z.boolean().optional(),
-  }),
-);
-
-const DiscordSupervisorConfigSchema = addDiscordSupervisorConfigRefinement(
-  z.object(DISCORD_SUPERVISOR_CONFIG_SHAPE),
-);
-
 export const AddTelegramChannelSchema = z.object({
   type: z.literal("telegram"),
   name: z.string().min(1).max(MAX_TITLE_LENGTH),
@@ -1462,7 +1393,6 @@ export const AddDiscordChannelSchema = z.object({
   botToken: z.string().min(1).max(500),
   applicationId: z.string().min(1).max(100),
   guildIds: z.array(z.string().max(100)).max(100).optional(),
-  discordSupervisor: AddDiscordSupervisorConfigSchema.optional(),
   securityMode: SecurityModeSchema.optional(),
 });
 
@@ -2038,7 +1968,6 @@ export const ChannelConfigSchema = z
   .object({
     ownerUserIds: GatewayOwnerUserIdsSchema.optional(),
     selfChatMode: z.boolean().optional(),
-    supervisor: DiscordSupervisorConfigSchema.optional(),
     progressRelayMode: z.enum(["minimal", "curated"]).optional(),
     responsePrefix: z.string().max(20).optional(),
     trustedGroupMemoryOptIn: z.boolean().optional(),
@@ -2264,13 +2193,6 @@ export const AutomationProfileAttachRequestSchema = z
     maxDispatchesPerDay: z.number().int().min(1).max(96).optional(),
     profile: HeartbeatProfileSchema.optional(),
     activeHours: HeartbeatActiveHoursSchema.nullable().optional(),
-  })
-  .strict();
-export const StandupDeliveryRequestSchema = z
-  .object({
-    reportId: UUIDSchema,
-    channelType: ChannelTypeSchema,
-    channelId: z.string().trim().min(1).max(200),
   })
   .strict();
 export const CoreTraceKindSchema = z.enum([
@@ -2892,37 +2814,6 @@ export const AwarenessConfigSchema = z.object({
   sources: z.record(AwarenessSourceSchema, AwarenessSourcePolicySchema).optional(),
 });
 
-const ChiefOfStaffActionTypeSchema = z.enum([
-  "prepare_briefing",
-  "create_task",
-  "schedule_follow_up",
-  "draft_message",
-  "draft_agenda",
-  "organize_work_session",
-  "nudge_user",
-  "execute_local_action",
-]);
-const AutonomyPolicyLevelSchema = z.enum([
-  "observe_only",
-  "suggest_only",
-  "execute_local",
-  "execute_with_approval",
-  "never",
-]);
-const ActionPolicySchema = z.object({
-  actionType: ChiefOfStaffActionTypeSchema.optional(),
-  level: AutonomyPolicyLevelSchema.optional(),
-  allowExternalSideEffects: z.boolean().optional(),
-  cooldownMinutes: z.number().int().min(0).max(10080).optional(),
-});
-
-export const AutonomyConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  autoEvaluate: z.boolean().optional(),
-  maxPendingDecisions: z.number().int().min(1).max(100).optional(),
-  actionPolicies: z.record(ChiefOfStaffActionTypeSchema, ActionPolicySchema).optional(),
-});
-
 export const QAStartRunSchema = z.object({
   taskId: z.string().min(1).max(200),
   workspaceId: WorkspaceIdSchema,
@@ -3117,16 +3008,6 @@ export function parsePersonalitySaveOptions(
 }
 
 export const AwarenessUpdateBeliefSchema = z.object({
-  id: z.string().min(1).max(200),
-  patch: z
-    .record(z.string(), z.unknown())
-    .optional()
-    .refine((p) => p == null || (typeof p === "object" && JSON.stringify(p).length <= 50000), {
-      message: "Patch must be under 50KB",
-    }),
-});
-
-export const AutonomyUpdateDecisionSchema = z.object({
   id: z.string().min(1).max(200),
   patch: z
     .record(z.string(), z.unknown())

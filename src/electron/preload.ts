@@ -132,8 +132,6 @@ import type {
   AgentBuilderPlanRequest,
   AgentWorkspaceMembership,
   AgentWorkspacePermissionSnapshot,
-  AgentPerformanceReview,
-  AgentReviewGenerateRequest,
   AgentTemplate,
   AppProfileSummary,
   AudioSummaryConfig,
@@ -219,9 +217,6 @@ import type {
   UpdateManagedAgentRoutineRequest,
   ConvertAgentRoleToManagedAgentRequest,
   ConvertAutomationProfileToManagedAgentRequest,
-  SupermemoryConfigStatus,
-  SupermemoryDisconnectPurgeResult,
-  SupermemorySettings,
   WorkspaceKitInitRequest,
   WorkspaceKitProjectCreateRequest,
   WorkspaceKitStatus,
@@ -255,9 +250,6 @@ import type {
   TerminalTabRunResult,
   TerminalTabOutputEvent,
   LLMRoutingRuntimeState,
-  SupervisorExchange,
-  SupervisorExchangeEvent,
-  SupervisorExchangeStatus,
   AgentMailApiKeySummary,
   AgentMailConnectionTestResult,
   AgentMailDomain,
@@ -1785,7 +1777,6 @@ type ActivityType =
   | "command_executed"
   | "tool_used"
   | "mention"
-  | "supervisor_exchange"
   | "agent_assigned"
   | "error"
   | "info";
@@ -1872,10 +1863,6 @@ interface MentionListQuery {
   offset?: number;
 }
 
-// SupervisorProtocolIntent, SupervisorExchangeStatus, SupervisorEvidenceRef,
-// SupervisorExchange, and SupervisorExchangeEvent are imported from shared/types above.
-// Use SupervisorExchange (not SupervisorExchange) as the canonical type.
-
 interface MentionEvent {
   type: "created" | "acknowledged" | "completed" | "dismissed";
   mention?: MentionData;
@@ -1946,18 +1933,6 @@ interface SubscriptionEvent {
   taskId: string;
   agentRoleId: string;
   subscription?: TaskSubscription;
-}
-
-interface StandupReport {
-  id: string;
-  workspaceId: string;
-  reportDate: string;
-  completedTaskIds: string[];
-  inProgressTaskIds: string[];
-  blockedTaskIds: string[];
-  summary: string;
-  deliveredToChannel?: string;
-  createdAt: number;
 }
 
 // Task Board types (inlined for sandboxed preload)
@@ -3049,28 +3024,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   selectWorkspace: (id: string) => ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_SELECT, id),
   getTempWorkspace: (options?: { createNew?: boolean }) =>
     ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GET_TEMP, options),
-  preflightFirstTask: () => ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_PREFLIGHT),
-  getFirstTaskSetup: () => ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_SETUP_GET),
-  setFirstTaskSetup: (choice: "ready" | "skipped" | "browsing_without_ai" | "connecting") =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_SETUP_SET, choice),
-  startFirstTask: (attemptId: string, preflightToken: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_START, attemptId, preflightToken),
-  getFirstTask: (attemptId?: string, taskId?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_GET, attemptId, taskId),
-  verifyFirstTask: (attemptId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_VERIFY, attemptId),
-  inspectFirstTask: (attemptId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_INSPECT, attemptId),
-  requestFirstTaskRevision: (attemptId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_REQUEST_REVISION, attemptId),
-  cancelFirstTaskRevision: (attemptId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_CANCEL_REVISION, attemptId),
-  getFirstTaskRealWork: (taskId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_REAL_WORK_GET, taskId),
-  inspectFirstTaskRealWork: (taskId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_REAL_WORK_INSPECT, taskId),
-  markFirstTaskRealWorkUseful: (taskId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FIRST_TASK_REAL_WORK_USEFUL, taskId),
   pruneTempWorkspaces: (options?: { dryRun?: boolean }) =>
     ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_PRUNE_TEMP, options),
   touchWorkspace: (id: string) => ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_TOUCH, id),
@@ -4495,20 +4448,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.AWARENESS_GET_SNAPSHOT, workspaceId),
   listAwarenessEvents: (params?: { workspaceId?: string; limit?: number }) =>
     ipcRenderer.invoke(IPC_CHANNELS.AWARENESS_LIST_EVENTS, params),
-  getAutonomyConfig: () => ipcRenderer.invoke(IPC_CHANNELS.AUTONOMY_GET_CONFIG),
-  saveAutonomyConfig: (config: Any) =>
-    ipcRenderer.invoke(IPC_CHANNELS.AUTONOMY_SAVE_CONFIG, config),
-  getAutonomyState: (workspaceId?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.AUTONOMY_GET_STATE, workspaceId),
-  listAutonomyDecisions: (workspaceId?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.AUTONOMY_LIST_DECISIONS, workspaceId),
-  listAutonomyActions: (workspaceId?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.AUTONOMY_LIST_ACTIONS, workspaceId),
-  updateAutonomyDecision: (id: string, patch: Any) =>
-    ipcRenderer.invoke(IPC_CHANNELS.AUTONOMY_UPDATE_DECISION, { id, patch }),
-  triggerAutonomyEvaluation: (workspaceId?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.AUTONOMY_TRIGGER_EVALUATION, workspaceId),
-
   // Memory Features APIs
   getMemoryFeaturesSettings: () => ipcRenderer.invoke(IPC_CHANNELS.MEMORY_FEATURES_GET_SETTINGS),
   saveMemoryFeaturesSettings: (settings: MemoryFeaturesSettings) =>
@@ -4525,13 +4464,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_WRITE_APPROVALS_REJECT, data),
   countMemoryWriteApprovals: (workspaceId?: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_WRITE_APPROVALS_COUNT, workspaceId),
-  getSupermemorySettings: () => ipcRenderer.invoke(IPC_CHANNELS.SUPERMEMORY_GET_SETTINGS),
-  saveSupermemorySettings: (settings: SupermemorySettings) =>
-    ipcRenderer.invoke(IPC_CHANNELS.SUPERMEMORY_SAVE_SETTINGS, settings),
-  testSupermemoryConnection: () => ipcRenderer.invoke(IPC_CHANNELS.SUPERMEMORY_TEST_CONNECTION),
-  getSupermemoryStatus: () => ipcRenderer.invoke(IPC_CHANNELS.SUPERMEMORY_GET_STATUS),
-  disconnectAndPurgeSupermemory: () =>
-    ipcRenderer.invoke(IPC_CHANNELS.SUPERMEMORY_DISCONNECT_PURGE),
 
   // Self-improvement loop APIs
   getImprovementSettings: () =>
@@ -5019,22 +4951,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on(IPC_CHANNELS.MENTION_EVENT, subscription);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.MENTION_EVENT, subscription);
   },
-  listSupervisorExchanges: (query: {
-    workspaceId: string;
-    status?: SupervisorExchangeStatus | SupervisorExchangeStatus[];
-    limit?: number;
-  }) => ipcRenderer.invoke(IPC_CHANNELS.SUPERVISOR_EXCHANGE_LIST, query),
-  resolveSupervisorExchange: (request: {
-    id: string;
-    resolution: string;
-    mirrorToDiscord?: boolean;
-  }) => ipcRenderer.invoke(IPC_CHANNELS.SUPERVISOR_EXCHANGE_RESOLVE, request),
-  onSupervisorExchangeEvent: (callback: (event: SupervisorExchangeEvent) => void) => {
-    const subscription = (_: Any, data: SupervisorExchangeEvent) => callback(data);
-    ipcRenderer.on(IPC_CHANNELS.SUPERVISOR_EXCHANGE_EVENT, subscription);
-    return () => ipcRenderer.removeListener(IPC_CHANNELS.SUPERVISOR_EXCHANGE_EVENT, subscription);
-  },
-
   // ============ Mission Control APIs ============
 
   // Heartbeat System
@@ -5163,24 +5079,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener(IPC_CHANNELS.SUBSCRIPTION_EVENT, subscription);
   },
 
-  // Standup Reports
-  generateStandupReport: (workspaceId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.STANDUP_GENERATE, workspaceId),
-  getLatestStandupReport: (workspaceId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.STANDUP_GET_LATEST, workspaceId),
-  listStandupReports: (workspaceId: string, limit?: number) =>
-    ipcRenderer.invoke(IPC_CHANNELS.STANDUP_LIST, workspaceId, limit),
-  deliverStandupReport: (reportId: string, channelType: string, channelId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.STANDUP_DELIVER, reportId, channelType, channelId),
-
-  // Agent Performance Reviews
-  generateAgentReview: (request: AgentReviewGenerateRequest) =>
-    ipcRenderer.invoke(IPC_CHANNELS.REVIEW_GENERATE, request),
-  getLatestAgentReview: (workspaceId: string, agentRoleId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.REVIEW_GET_LATEST, workspaceId, agentRoleId),
-  listAgentReviews: (query: { workspaceId: string; agentRoleId?: string; limit?: number }) =>
-    ipcRenderer.invoke(IPC_CHANNELS.REVIEW_LIST, query),
-  deleteAgentReview: (id: string) => ipcRenderer.invoke(IPC_CHANNELS.REVIEW_DELETE, id),
   listEvalSuites: (options?: { windowDays?: number }) =>
     ipcRenderer.invoke(IPC_CHANNELS.EVAL_LIST_SUITES, options),
   runEvalSuite: (suiteId: string) => ipcRenderer.invoke(IPC_CHANNELS.EVAL_RUN_SUITE, suiteId),
@@ -5598,15 +5496,7 @@ export type {
 };
 
 // Export Activity Feed types
-export type {
-  ActivityActorType,
-  ActivityType,
-  ActivityData,
-  ActivityListQuery,
-  ActivityEvent,
-  SupervisorExchange,
-  SupervisorExchangeEvent,
-};
+export type { ActivityActorType, ActivityType, ActivityData, ActivityListQuery, ActivityEvent };
 
 // Export @Mention System types
 export type {
@@ -5715,7 +5605,6 @@ export type {
   SubscriptionReason,
   TaskSubscription,
   SubscriptionEvent,
-  StandupReport,
   AgentAutonomyLevel,
 };
 
@@ -6305,55 +6194,6 @@ export interface ElectronAPI {
   listWorkspaces: () => Promise<Workspace[]>;
   selectWorkspace: (id: string) => Promise<Workspace>;
   getTempWorkspace: (options?: { createNew?: boolean }) => Promise<Workspace | null>;
-  preflightFirstTask: () => Promise<
-    import("../electron/first-task/model-preflight").FirstTaskModelPreflight & {
-      workspace: "pass" | "fail";
-      workspaceDetail?: string;
-      token: string | null;
-      providerType: LLMProviderType;
-      modelId: string;
-    }
-  >;
-  getFirstTaskSetup: () => Promise<{
-    schemaVersion: number;
-    choice: "ready" | "skipped" | "browsing_without_ai" | "connecting";
-    updatedAt: number;
-    modelReadyAt: number | null;
-  } | null>;
-  setFirstTaskSetup: (
-    choice: "ready" | "skipped" | "browsing_without_ai" | "connecting",
-  ) => Promise<void>;
-  startFirstTask: (
-    attemptId: string,
-    preflightToken: string,
-  ) => Promise<{ attemptId: string; task: Task; workspace: Workspace } | null>;
-  getFirstTask: (
-    attemptId?: string,
-    taskId?: string,
-  ) => Promise<{
-    attemptId: string;
-    task: Task;
-    workspace: Workspace;
-    check: import("../electron/first-task/verify-release-brief").ReleaseBriefCheck | null;
-    inspectedAt: number | null;
-    revisionRequestedAt: number | null;
-    revisionInspectedAt: number | null;
-  } | null>;
-  verifyFirstTask: (
-    attemptId: string,
-  ) => Promise<import("../electron/first-task/verify-release-brief").ReleaseBriefCheck>;
-  inspectFirstTask: (attemptId: string) => Promise<boolean>;
-  requestFirstTaskRevision: (attemptId: string) => Promise<boolean>;
-  cancelFirstTaskRevision: (attemptId: string) => Promise<boolean>;
-  getFirstTaskRealWork: (
-    taskId: string,
-  ) => Promise<{ inspectedAt: number | null; usefulAt: number | null; returnUse: boolean }>;
-  inspectFirstTaskRealWork: (
-    taskId: string,
-  ) => Promise<{ inspectedAt: number | null; usefulAt: number | null; returnUse: boolean }>;
-  markFirstTaskRealWorkUseful: (
-    taskId: string,
-  ) => Promise<{ inspectedAt: number | null; usefulAt: number | null; returnUse: boolean }>;
   pruneTempWorkspaces: (options?: { dryRun?: boolean }) => Promise<{
     removedDirs: number;
     removedRows: number;
@@ -8163,14 +8003,6 @@ export interface ElectronAPI {
   getAwarenessSummary: (workspaceId?: string) => Promise<Any>;
   getAwarenessSnapshot: (workspaceId?: string) => Promise<Any>;
   listAwarenessEvents: (params?: { workspaceId?: string; limit?: number }) => Promise<Any[]>;
-  getAutonomyConfig: () => Promise<Any>;
-  saveAutonomyConfig: (config: Any) => Promise<Any>;
-  getAutonomyState: (workspaceId?: string) => Promise<Any>;
-  listAutonomyDecisions: (workspaceId?: string) => Promise<Any[]>;
-  listAutonomyActions: (workspaceId?: string) => Promise<Any[]>;
-  updateAutonomyDecision: (id: string, patch: Any) => Promise<Any | null>;
-  triggerAutonomyEvaluation: (workspaceId?: string) => Promise<Any>;
-
   // Memory Features (global toggles)
   getMemoryFeaturesSettings: () => Promise<MemoryFeaturesSettings>;
   saveMemoryFeaturesSettings: (settings: MemoryFeaturesSettings) => Promise<{ success: boolean }>;
@@ -8190,12 +8022,6 @@ export interface ElectronAPI {
     reason?: string;
   }) => Promise<MemoryWriteApprovalItem>;
   countMemoryWriteApprovals: (workspaceId?: string) => Promise<{ pending: number }>;
-  getSupermemorySettings: () => Promise<SupermemoryConfigStatus>;
-  saveSupermemorySettings: (settings: SupermemorySettings) => Promise<{ success: boolean }>;
-  testSupermemoryConnection: () => Promise<{ success: boolean; error?: string }>;
-  getSupermemoryStatus: () => Promise<SupermemoryConfigStatus>;
-  /** Delete the remote copies CoWork recorded, then disable Supermemory (SEC-17). */
-  disconnectAndPurgeSupermemory: () => Promise<SupermemoryDisconnectPurgeResult>;
 
   // Self-improvement loop
   getImprovementSettings: () => Promise<ImprovementLoopSettings>;
@@ -8659,17 +8485,6 @@ export interface ElectronAPI {
   completeMention: (id: string) => Promise<MentionData | undefined>;
   dismissMention: (id: string) => Promise<MentionData | undefined>;
   onMentionEvent: (callback: (event: MentionEvent) => void) => () => void;
-  listSupervisorExchanges: (query: {
-    workspaceId: string;
-    status?: SupervisorExchangeStatus | SupervisorExchangeStatus[];
-    limit?: number;
-  }) => Promise<SupervisorExchange[]>;
-  resolveSupervisorExchange: (request: {
-    id: string;
-    resolution: string;
-    mirrorToDiscord?: boolean;
-  }) => Promise<SupervisorExchange>;
-  onSupervisorExchangeEvent: (callback: (event: SupervisorExchangeEvent) => void) => () => void;
   // Mission Control - Heartbeat APIs
   getHeartbeatConfig: (agentRoleId: string) => Promise<
     | {
@@ -8818,23 +8633,6 @@ export interface ElectronAPI {
   getTaskSubscribers: (taskId: string) => Promise<TaskSubscription[]>;
   getAgentSubscriptions: (agentRoleId: string) => Promise<TaskSubscription[]>;
   onSubscriptionEvent: (callback: (event: SubscriptionEvent) => void) => () => void;
-  // Mission Control - Standup Report APIs
-  generateStandupReport: (workspaceId: string) => Promise<StandupReport>;
-  getLatestStandupReport: (workspaceId: string) => Promise<StandupReport | undefined>;
-  listStandupReports: (workspaceId: string, limit?: number) => Promise<StandupReport[]>;
-  deliverStandupReport: (reportId: string, channelType: string, channelId: string) => Promise<void>;
-  // Mission Control - Agent Performance Reviews
-  generateAgentReview: (request: AgentReviewGenerateRequest) => Promise<AgentPerformanceReview>;
-  getLatestAgentReview: (
-    workspaceId: string,
-    agentRoleId: string,
-  ) => Promise<AgentPerformanceReview | undefined>;
-  listAgentReviews: (query: {
-    workspaceId: string;
-    agentRoleId?: string;
-    limit?: number;
-  }) => Promise<AgentPerformanceReview[]>;
-  deleteAgentReview: (id: string) => Promise<{ success: boolean }>;
   listEvalSuites: (options?: { windowDays?: number }) => Promise<{
     suites: Array<EvalSuite & { caseCount: number; latestRun?: Partial<EvalRun> }>;
     metrics: EvalBaselineMetrics;

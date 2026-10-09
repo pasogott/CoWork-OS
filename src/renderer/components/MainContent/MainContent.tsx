@@ -115,10 +115,8 @@ import {
   type ModeSuggestion,
 } from "../../../shared/mode-suggestion-detection";
 import { CollaborativeAgentLines } from "../CollaborativeAgentLines";
-import { FirstTaskCard } from "../FirstTaskCard";
 import { UseCasesGallery } from "../UseCasesGallery";
 import { OPEN_USE_CASES_EVENT } from "../use-cases-events";
-import { RealWorkFeedback } from "../RealWorkFeedback";
 import { CollaborativeSummaryPanel } from "../CollaborativeSummaryPanel";
 import { AgentLifecycleRow } from "../timeline/AgentLifecycleRow";
 import { assignAgentGlyphs } from "../../utils/agent-glyphs";
@@ -636,7 +634,6 @@ interface MainContentProps {
     options?: CreateTaskOptions,
     images?: ImageAttachment[],
   ) => void | boolean | Promise<void | boolean>;
-  onFirstTaskReady?: (task: Task, workspace: Workspace) => void;
   onAskInbox?: (query: string) => void;
   onChangeWorkspace?: () => void;
   onSelectWorkspace?: (workspace: Workspace) => void;
@@ -1798,8 +1795,8 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
               : item.kind === "agent-lifecycle"
                 ? `agent-lifecycle:${item.row.id}`
                 : item.kind === "action_block"
-                ? `action-block:${item.blockId}`
-                : `event:${item.event.id}`;
+                  ? `action-block:${item.blockId}`
+                  : `event:${item.event.id}`;
       if (item.kind === "event") {
         visiblePerfEventId = item.event.id;
       } else if (item.kind === "action_block") {
@@ -1830,20 +1827,20 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
                     .map((taskId) => `${taskId}:${childTasksById.get(taskId)?.status ?? "none"}`)
                     .join(",")}`
                 : item.kind === "action_block"
-                ? `${item.blockId}:${item.events.length}:${
-                    item.events[item.events.length - 1]?.id ?? "none"
-                  }:${item.eventIndices
-                    .map((eventIndex: number) =>
-                      getCommandOutputSessionsRevision(
-                        commandOutputSessionsByInsertIndex.get(eventIndex),
-                      ),
-                    )
-                    .join("||")}`
-                : `${item.event.id}:${getEffectiveTaskEventType(item.event)}:${
-                    toolCallPairing.completions.get(item.event.id)?.id ?? "none"
-                  }:${getCommandOutputSessionsRevision(
-                    commandOutputSessionsByInsertIndex.get(item.eventIndex),
-                  )}`;
+                  ? `${item.blockId}:${item.events.length}:${
+                      item.events[item.events.length - 1]?.id ?? "none"
+                    }:${item.eventIndices
+                      .map((eventIndex: number) =>
+                        getCommandOutputSessionsRevision(
+                          commandOutputSessionsByInsertIndex.get(eventIndex),
+                        ),
+                      )
+                      .join("||")}`
+                  : `${item.event.id}:${getEffectiveTaskEventType(item.event)}:${
+                      toolCallPairing.completions.get(item.event.id)?.id ?? "none"
+                    }:${getCommandOutputSessionsRevision(
+                      commandOutputSessionsByInsertIndex.get(item.eventIndex),
+                    )}`;
 
       rows.push({
         kind: "timeline",
@@ -3858,7 +3855,6 @@ function MainContentComponent({
   onStartOnboarding,
   onStartFreshSession,
   onCreateTask,
-  onFirstTaskReady,
   onAskInbox,
   onChangeWorkspace,
   onSelectWorkspace,
@@ -5694,7 +5690,11 @@ function MainContentComponent({
             // parent's own narration interleaves between them. Those rows replace the
             // parent's per-agent "Created an agent" / "Agent finished" events.
             for (const row of buildAgentLifecycleRows(nonCliChildTasks)) {
-              specialItems.push({ kind: "agent-lifecycle" as const, timestamp: row.timestamp, row });
+              specialItems.push({
+                kind: "agent-lifecycle" as const,
+                timestamp: row.timestamp,
+                row,
+              });
             }
             eventItems = withoutCoveredAgentLifecycleEvents(
               eventItems,
@@ -9985,17 +9985,6 @@ function MainContentComponent({
               </p>
             )}
 
-            {import.meta.env.VITE_FIRST_TASK_BETA === "1" &&
-              onFirstTaskReady &&
-              onOpenWebArtifact &&
-              onOpenSettings && (
-                <FirstTaskCard
-                  onTaskReady={onFirstTaskReady}
-                  onOpenBrief={onOpenWebArtifact}
-                  onOpenSettings={() => onOpenSettings("llm")}
-                />
-              )}
-
             <div className="terminal-only">
               <div className="welcome-logo">
                 <img
@@ -11462,33 +11451,6 @@ function MainContentComponent({
       }`}
     >
       {fullAccessConfirmation.dialog}
-      {import.meta.env.VITE_FIRST_TASK_BETA === "1" &&
-        task?.source === "sample" &&
-        onFirstTaskReady &&
-        onOpenWebArtifact &&
-        onOpenSettings && (
-          <FirstTaskCard
-            taskId={task.id}
-            onTaskReady={onFirstTaskReady}
-            onOpenBrief={onOpenWebArtifact}
-            onOpenSettings={() => onOpenSettings("llm")}
-            onRevise={(prompt) => onSendMessage(prompt)}
-            onUseOwnFiles={onChangeWorkspace}
-          />
-        )}
-      {import.meta.env.VITE_FIRST_TASK_BETA === "1" &&
-        task?.status === "completed" &&
-        task.source !== "sample" &&
-        !task.parentTaskId &&
-        !task.evalCaseId &&
-        hasTaskOutputs(taskOutputSummary) &&
-        onViewTaskOutputs && (
-          <RealWorkFeedback
-            taskId={task.id}
-            primaryOutputPath={taskOutputSummary.primaryOutputPath}
-            onViewOutputs={onViewTaskOutputs}
-          />
-        )}
       {/* Header: in the app title bar when the shell provides a slot for it */}
       {renderMainHeader(
         <div className="main-header">

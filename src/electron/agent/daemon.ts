@@ -10624,13 +10624,6 @@ export class AgentDaemon extends EventEmitter {
     } catch {
       effectiveMemoryWorkspace = undefined;
     }
-    const memoryPermissions = effectiveMemoryWorkspace?.permissions;
-    const allowExternalMirror = Boolean(
-      memoryPermissions?.network === true &&
-      memoryPermissions.accessProfileUnavailable !== true &&
-      memoryPermissions.accessNetworkMode !== "disabled" &&
-      memoryPermissions.accessNetworkMode !== "on-request",
-    );
     const workspace = this.workspaceRepo.findById(task.workspaceId);
     if (!workspace?.path) return;
     const effectiveWorkspace = this.applyTaskWorkspaceOverrides(task, workspace);
@@ -11942,13 +11935,6 @@ export class AgentDaemon extends EventEmitter {
     } catch {
       effectiveMemoryWorkspace = undefined;
     }
-    const memoryPermissions = effectiveMemoryWorkspace?.permissions;
-    const allowExternalMirror = Boolean(
-      memoryPermissions?.network === true &&
-      memoryPermissions.accessProfileUnavailable !== true &&
-      memoryPermissions.accessNetworkMode !== "disabled" &&
-      memoryPermissions.accessNetworkMode !== "on-request",
-    );
 
     // Memory retention:
     // - Sub-agents (child tasks) default to retainMemory=false to avoid leaking sensitive
@@ -11985,9 +11971,13 @@ export class AgentDaemon extends EventEmitter {
                 `User said: ${text.slice(0, 300)}`,
                 `Task context: ${(task.prompt || "").slice(0, 200)}`,
               ].join("\n");
-              MemoryService.capture(task.workspaceId, taskId, "insight", correctionContent, false, {
-                allowExternalMirror,
-              }).catch(() => {});
+              MemoryService.capture(
+                task.workspaceId,
+                taskId,
+                "insight",
+                correctionContent,
+                false,
+              ).catch(() => {});
 
               // Playbook ledger only (no second archive row): the task's success evidence
               // is invalidated as corrected by the user.
@@ -12028,7 +12018,6 @@ export class AgentDaemon extends EventEmitter {
       capture.memoryType,
       capture.content,
       forcePrivate,
-      { allowExternalMirror },
     );
   }
 
@@ -15926,12 +15915,7 @@ export class AgentDaemon extends EventEmitter {
     try {
       const isTopLevelTask =
         existingTask && !existingTask.parentTaskId && (existingTask.agentType ?? "main") === "main";
-      if (
-        isCompletedOutcome &&
-        isTopLevelTask &&
-        existingTask.source !== "sample" &&
-        !taskDisablesMemoryCapture(existingTask)
-      ) {
+      if (isCompletedOutcome && isTopLevelTask && !taskDisablesMemoryCapture(existingTask)) {
         const workspaceName = this.workspaceRepo.findById(existingTask.workspaceId)?.name;
         PersonalityManager.recordTaskCompleted(workspaceName);
         const gatewayContext = existingTask.agentConfig?.gatewayContext ?? "private";

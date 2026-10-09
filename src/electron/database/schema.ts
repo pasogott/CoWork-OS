@@ -17,7 +17,6 @@ import { removeLegacyHealthBridgeTempDirs } from "../utils/retired-feature-clean
 import { createLogger } from "../utils/logger";
 import { runMemoryPayloadMigration } from "../memory/memory-payload-migration-sql";
 import { ensureMemoryItemsSchema } from "../memory/memory-items-sql";
-import { ensureSupermemoryRemoteRefsSchema } from "../memory/supermemory-remote-refs-sql";
 import { ensureMemoryCurationSchema } from "../memory/memory-curation-log-sql";
 import { ensureKnowledgeGraphQualitySchema } from "../knowledge-graph/knowledge-graph-maintenance-sql";
 import type { DatabaseClient } from "./async/DatabaseClient";
@@ -332,7 +331,8 @@ export class DatabaseManager {
   }
 
   /**
-   * Settings of retired features (the X integration and the Infrastructure tools) are removed on
+   * Settings of retired features (the X integration, the Infrastructure tools and Supermemory,
+   * including its API key) are removed on
    * every startup, including after an older database is restored. The encrypted wallet keys of
    * the Infrastructure tools (`infra-wallet`, `conway-wallet`) are kept so they can still be
    * exported.
@@ -342,7 +342,9 @@ export class DatabaseManager {
     this.db.pragma("secure_delete = ON");
     try {
       const result = this.db
-        .prepare("DELETE FROM secure_settings WHERE category IN ('x', 'infra')")
+        .prepare(
+          "DELETE FROM secure_settings WHERE category IN ('x', 'infra', 'supermemory', 'autonomy-chief-of-staff')",
+        )
         .run();
       if (result.changes > 0) {
         schemaLogger.info(`Retired ${result.changes} settings row(s) of removed features`);
@@ -2772,7 +2774,7 @@ export class DatabaseManager {
     this.upgradeTaskReferenceForeignKeysToSetNull();
     this.initializeKnowledgeGraphFTS();
     this.upgradeKnowledgeGraphQuality();
-    this.dropRetiredEverydayAgentTables();
+    this.dropRetiredFeatureTables();
     this.migrateMemoryPayloadTables();
     this.initializeMemoryItems();
     this.ensureForeignKeyChildIndexes();
@@ -4106,69 +4108,6 @@ export class DatabaseManager {
       // Table already exists, ignore
     }
 
-    // Migration: Create supervisor exchange tables for Discord supervisor protocol
-    try {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS supervisor_exchanges (
-          id TEXT PRIMARY KEY,
-          workspace_id TEXT NOT NULL,
-          coordination_channel_id TEXT NOT NULL,
-          source_channel_id TEXT,
-          source_message_id TEXT,
-          source_peer_user_id TEXT,
-          worker_agent_role_id TEXT,
-          supervisor_agent_role_id TEXT,
-          linked_task_id TEXT,
-          escalation_target TEXT,
-          status TEXT NOT NULL,
-          last_intent TEXT,
-          turn_count INTEGER NOT NULL DEFAULT 0,
-          terminal_reason TEXT,
-          evidence_refs_json TEXT,
-          human_resolution TEXT,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          closed_at INTEGER,
-          FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
-          FOREIGN KEY (worker_agent_role_id) REFERENCES agent_roles(id),
-          FOREIGN KEY (supervisor_agent_role_id) REFERENCES agent_roles(id),
-          FOREIGN KEY (linked_task_id) REFERENCES tasks(id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_supervisor_exchanges_workspace
-          ON supervisor_exchanges(workspace_id, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_supervisor_exchanges_status
-          ON supervisor_exchanges(status, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_supervisor_exchanges_source
-          ON supervisor_exchanges(source_message_id);
-      `);
-    } catch {
-      // Table already exists, ignore
-    }
-
-    try {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS supervisor_exchange_messages (
-          id TEXT PRIMARY KEY,
-          exchange_id TEXT NOT NULL REFERENCES supervisor_exchanges(id) ON DELETE CASCADE,
-          discord_message_id TEXT NOT NULL UNIQUE,
-          channel_id TEXT NOT NULL,
-          author_user_id TEXT,
-          actor_kind TEXT NOT NULL,
-          intent TEXT NOT NULL,
-          raw_content TEXT NOT NULL,
-          created_at INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_supervisor_exchange_messages_exchange
-          ON supervisor_exchange_messages(exchange_id, created_at ASC);
-        CREATE INDEX IF NOT EXISTS idx_supervisor_exchange_messages_channel
-          ON supervisor_exchange_messages(channel_id, created_at DESC);
-      `);
-    } catch {
-      // Table already exists, ignore
-    }
-
     // Migration: Add mentioned_agent_role_ids to tasks table
     try {
       this.db.exec("ALTER TABLE tasks ADD COLUMN mentioned_agent_role_ids TEXT");
@@ -4897,30 +4836,6 @@ export class DatabaseManager {
       // Table already exists, ignore
     }
 
-    // Migration: Create standup_reports table for daily standups
-    try {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS standup_reports (
-          id TEXT PRIMARY KEY,
-          workspace_id TEXT NOT NULL,
-          report_date TEXT NOT NULL,
-          completed_task_ids TEXT,
-          in_progress_task_ids TEXT,
-          blocked_task_ids TEXT,
-          summary TEXT NOT NULL,
-          delivered_to_channel TEXT,
-          created_at INTEGER NOT NULL,
-          FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
-          UNIQUE(workspace_id, report_date)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_standup_reports_workspace ON standup_reports(workspace_id);
-        CREATE INDEX IF NOT EXISTS idx_standup_reports_date ON standup_reports(report_date);
-      `);
-    } catch {
-      // Table already exists, ignore
-    }
-
     // The R&D Council feature was retired; its tables are dropped once on upgrade.
     this.db.exec(`
       DROP TABLE IF EXISTS council_memos;
@@ -5063,31 +4978,6 @@ export class DatabaseManager {
       this.db.exec("ALTER TABLE agent_team_runs ADD COLUMN multi_llm_mode INTEGER DEFAULT 0");
     } catch {
       // Column already exists, ignore
-    }
-
-    // ============ Agent Performance Reviews (Mission Control) ============
-
-    try {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS agent_performance_reviews (
-          id TEXT PRIMARY KEY,
-          workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-          agent_role_id TEXT NOT NULL REFERENCES agent_roles(id),
-          period_start INTEGER NOT NULL,
-          period_end INTEGER NOT NULL,
-          rating INTEGER NOT NULL,
-          summary TEXT NOT NULL,
-          metrics TEXT,
-          recommended_autonomy_level TEXT,
-          recommendation_rationale TEXT,
-          created_at INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_agent_reviews_workspace ON agent_performance_reviews(workspace_id, created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_agent_reviews_role ON agent_performance_reviews(agent_role_id, created_at DESC);
-      `);
-    } catch {
-      // Table already exists, ignore
     }
 
     // ============ Git Worktree Support ============
@@ -8104,10 +7994,11 @@ export class DatabaseManager {
    * table-rebuild procedure: copy, drop, rename) when an older definition is found.
    */
   /**
-   * The Everyday Agent feature was retired; its tables are dropped once on upgrade (children
-   * first so the drop never violates a foreign key).
+   * Retired features (Everyday Agent, the first-task beta, Discord supervisor mode and the
+   * Supermemory provider) have
+   * their tables dropped once on upgrade, children first so the drop never violates a foreign key.
    */
-  private dropRetiredEverydayAgentTables(): void {
+  private dropRetiredFeatureTables(): void {
     this.db.exec(`
       DROP TABLE IF EXISTS everyday_agent_task_links;
       DROP TABLE IF EXISTS everyday_agent_routine_provenance;
@@ -8119,6 +8010,14 @@ export class DatabaseManager {
       DROP TABLE IF EXISTS everyday_agent_pause_scopes;
       DROP TABLE IF EXISTS everyday_agent_consent_history;
       DROP TABLE IF EXISTS everyday_agent_profiles;
+      DROP TABLE IF EXISTS first_task_real_work;
+      DROP TABLE IF EXISTS first_task_attempts;
+      DROP TABLE IF EXISTS first_task_setup;
+      DROP TABLE IF EXISTS supervisor_exchange_messages;
+      DROP TABLE IF EXISTS supervisor_exchanges;
+      DROP TABLE IF EXISTS supermemory_remote_refs;
+      DROP TABLE IF EXISTS standup_reports;
+      DROP TABLE IF EXISTS agent_performance_reviews;
     `);
   }
 
@@ -8357,12 +8256,6 @@ export class DatabaseManager {
       ensureMemoryItemsSchema(this.db);
     } catch (error) {
       schemaLogger.warn("[DatabaseManager] memory_items schema initialization failed:", error);
-    }
-    // SEC-17: remote ids of Supermemory copies, so local deletes can forget them remotely.
-    try {
-      ensureSupermemoryRemoteRefsSchema(this.db);
-    } catch (error) {
-      schemaLogger.warn("[DatabaseManager] Supermemory remote refs schema failed:", error);
     }
     // Phase 3: the memory curator's audit log and Dreaming columns (memory-curation-log-sql).
     try {
