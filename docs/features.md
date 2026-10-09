@@ -89,9 +89,6 @@ Messaging channels share unified operations, plus per-channel, per-chat, and per
 - **Agent Teams**: Multi-agent collaboration with shared checklists, graph-backed coordinated runs, and team management UI
 - **Collaborative Mode**: Auto-create ephemeral teams where multiple agents work on the same task, sharing thoughts in real-time through the delegated orchestration graph
 - **Multitask Command**: `/multitask [N] <task>` starts a collaborative run from one prompt, auto-splits it into bounded lane-specific child tasks, respects the global queue limit, and synthesizes the lane outputs. See [Multitask Command](multitask.md).
-- **Multi-LLM Mode**: Send the same task to multiple LLM providers/models simultaneously, with a judge agent synthesizing the best result
-- **Workflow Pipeline**: Optional phase-based execution path where decomposed steps run as child tasks with per-phase LLM overrides or capability-based auto-selection
-- **Agent Comparison Mode**: Compare agent or model outputs side by side
 - **External Agent Orchestration**: Discover ACP agents, target local or remote assignees from orchestration tools, and invoke A2A-compatible remote endpoints behind the normal approval/policy layer; orchestration now flows through the shared graph engine and graph-backed task state
 - **ACP Lifecycle Hardening**: ACP task state is persisted locally, survives restarts, supports remote cancel, and enforces scoped task/inbox access for non-operator clients
 - **Sub-Task Navigation**: Open a delegated sub-task, inspect its timeline, then jump back to the parent task from the main content view
@@ -219,7 +216,7 @@ CoWork OS now includes a dedicated Devices tab for running and observing work ac
 
 - **Local + remote device inventory**: track the current machine alongside saved remote devices in one view
 - **Connection-aware remote cards**: direct, SSH-tunneled, and Tailscale-backed devices expose connection state, last-seen time, active runs, storage summary, app summary, and attention state
-- **Remote task dispatch**: start a task on a selected remote device with an access profile, execution mode, or multi-LLM options
+- **Remote task dispatch**: start a task on a selected remote device with an access profile or execution mode
 - **Remote file picker**: browse remote workspaces and attach files directly from the target machine before dispatching a task
 - **Remote task feed**: filter tasks for the selected device, all devices, or attention states, then open those tasks in a remote session view
 - **Device overlays**: inspect apps, storage, resource signals, alerts, and observer history without leaving the Devices surface
@@ -358,25 +355,16 @@ Reliability is built as a continuous loop: capture failures -> replay determinis
 
 See [Reliability Flywheel](reliability-flywheel.md) for architecture, schema, scripts, IPC endpoints, CI workflows, and operational commands.
 
-### Work Choice and Runtime Overrides
+### Work Choice
 
-The composer presents two work choices. **Ask** handles conversation and supplied content without external actions. **Do** lets CoWork select a task strategy. In the current runtime contract, Ask maps to the `chat` interaction value and Do maps to `smart`. **Advanced…** exposes the execution overrides below; these are runtime options beneath Do, not additional first-level work choices.
-
-| Advanced override | Runtime behavior                                                                                                                                             |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Execute**       | Full task execution path with tools, planning, and artifacts.                                                                                                |
-| **Plan**          | Structured planning path; can pause for `request_user_input` when structured human input is enabled and is intended for non-mutating planning/coordination. |
-| **Analyze**       | Read-only analysis path that stays evidence-focused and blocks mutating tools.                                                                               |
-| **Debug**         | Focused debugging path for diagnosis and repair.                                                                                                              |
-| **Verified**      | Execute-like path that adds external verification checks after steps before completion.                                                                      |
+The composer presents three work choices. **Ask** handles conversation and supplied content without external actions. **Do** lets CoWork select a task strategy: full execution, read-only analysis, a verification gate after risky steps, or an evidence-first debugging loop, depending on the request. **Plan** pins a structured planning path that uses no mutating tools and can pause for `request_user_input` when structured human input is enabled. In the runtime contract, Ask maps to the `chat` interaction value, Do to `smart`, and Plan to `smart` with the `plan` override.
 
 Runtime behavior is separate from [access profiles](access-profiles.md). The
-work choice selects conversation or task handling; an advanced override pins a
-runtime strategy; the profile selects the sandbox, approvals, reviewer,
-command-tool, filesystem, network, and domain boundary. A choice or orchestration
-control cannot widen the selected profile.
+work choice selects conversation, task handling or planning; the profile selects
+the sandbox, approvals, reviewer, command-tool, filesystem, network, and domain
+boundary. A choice or orchestration control cannot widen the selected profile.
 
-> **Note:** Verified is useful when execution should include an explicit verification gate. Plan can request structured user input; it does not bypass approvals.
+> **Note:** Plan can request structured user input; it does not bypass approvals.
 
 ### Task Toggles
 
@@ -388,7 +376,6 @@ The task creation UI also includes higher-level toggles that change how tasks ar
 | **Check-ins**         | Opts a fresh task into legacy clarification pauses. Keep this off for Codex/Claude Code-style execution that chooses safe defaults and stops only for hard blockers.                                                         |
 | **Collaborative**     | Auto-creates an ephemeral team of agents that analyze the task from multiple perspectives, then a leader synthesizes the results. Phases: dispatch → think → synthesize → complete.                                          |
 | **Multitask command** | Type `/multitask [N] <task>` to create a fresh collaborative run that splits the prompt into lane-specific child tasks before synthesis. Defaults to 4 lanes, bounded to 2-8.                                                |
-| **Multi-LLM**         | Sends the same task to multiple LLM providers/models in parallel. A designated judge model synthesizes the best result. Requires 2+ providers configured.                                                                    |
 | **Think With Me**     | Socratic brainstorming mode — agent asks follow-up questions and explores trade-offs without executing tools. Read-only tools only.                                                                                          |
 
 > **Note:** Autonomous mode shows a confirmation dialog before enabling. It is
@@ -786,7 +773,6 @@ Define per-role personality and operating guidelines in `.cowork/agents/<role-id
 | **Run Tracking**           | Track team runs with status, progress, and history                                            |
 | **Collaborative Mode**     | Ephemeral teams with real-time thought sharing                                                |
 | **Multitask Command**      | One-shot ephemeral team runs with auto-planned independent lanes from `/multitask [N] <task>` |
-| **Multi-LLM Mode**         | Dispatch same task to multiple providers with judge-based synthesis                           |
 | **Collaborative Thoughts** | Real-time thought panel shows agent reasoning as it happens                                   |
 
 Configure in **Mission Control** > **Teams**.
@@ -949,21 +935,7 @@ Notes persist to `.cowork/scratchpad-{taskId}.json` for crash recovery. The scra
 
 ---
 
-## Workflow Pipeline & Deep Work Mode
-
-### Workflow Pipeline
-
-Multi-phase task execution for complex workflows. The Workflow Decomposer detects multi-step prompts (using connectives like "then", "after that", "next", "finally") and splits them into sequential phases.
-
-| Feature                  | Description                                                                  |
-| ------------------------ | ---------------------------------------------------------------------------- |
-| **Auto-detection**       | Regex-based decomposition of multi-phase prompts                             |
-| **5 phase types**        | research, create, deliver, analyze, general                                  |
-| **Sequential execution** | Each phase creates a child task; output pipes into the next phase            |
-| **LLM fallback**         | Complex prompts that resist regex decomposition use LLM-powered splitting    |
-| **Pipeline events**      | `pipeline_started`, `phase_started`, `phase_completed`, `pipeline_completed` |
-
-### Deep Work Mode
+## Deep Work Mode
 
 Extended execution mode for complex tasks that need sustained focus:
 

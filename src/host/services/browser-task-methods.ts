@@ -49,8 +49,6 @@ type SafeAgentConfig = Pick<
   | "multitaskMode"
   | "multitaskLaneCount"
   | "multitaskAssignmentMode"
-  | "multiLlmMode"
-  | "multiLlmConfig"
   | "researchWorkflow"
   | "qualityPasses"
 >;
@@ -286,8 +284,6 @@ const BrowserTaskOptionsSchema = AgentConfigSchema.pick({
   multitaskMode: true,
   multitaskLaneCount: true,
   multitaskAssignmentMode: true,
-  multiLlmMode: true,
-  multiLlmConfig: true,
   researchWorkflow: true,
   qualityPasses: true,
 }).strict();
@@ -317,8 +313,6 @@ function parseSafeAgentConfig(value: unknown): SafeAgentConfig {
     "multitaskMode",
     "multitaskLaneCount",
     "multitaskAssignmentMode",
-    "multiLlmMode",
-    "multiLlmConfig",
     "researchWorkflow",
     "qualityPasses",
   ]);
@@ -423,16 +417,8 @@ function isExecutionMode(value: unknown): value is NonNullable<AgentConfig["exec
   );
 }
 
-function isExecutionModeOverride(
-  value: unknown,
-): value is "execute" | "plan" | "analyze" | "debug" | "verified" {
-  return (
-    value === "execute" ||
-    value === "plan" ||
-    value === "analyze" ||
-    value === "debug" ||
-    value === "verified"
-  );
+function isExecutionModeOverride(value: unknown): value is "plan" {
+  return value === "plan";
 }
 
 function isTaskDomain(value: unknown): value is NonNullable<AgentConfig["taskDomain"]> {
