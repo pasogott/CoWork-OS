@@ -4,15 +4,40 @@ interface DisclaimerModalProps {
   onAccept: (dontShowAgain: boolean) => void;
 }
 
-export function DisclaimerModal({ onAccept }: DisclaimerModalProps) {
-  const [selectedOption, setSelectedOption] = useState<"yes" | "no" | null>(null);
-  const [dontShowAgain, setDontShowAgain] = useState(true);
+const SECTIONS = [
+  {
+    title: "How CoWork stays safe",
+    items: [
+      "Works only inside workspaces you select, plus a private starter workspace.",
+      "Asks before destructive or sensitive external actions.",
+      "Command tools follow the access profile chosen for each task.",
+      "Connected apps need their own setup and approval.",
+    ],
+  },
+  {
+    title: "What it can do when allowed",
+    items: [
+      "Run commands the selected access profile permits.",
+      "Read, write, and delete files in allowed workspace paths.",
+      "Use the network, browser automation, skills, plugins, and services you enable.",
+      "Send and receive messages on channels like WhatsApp, Telegram, Slack, or email.",
+    ],
+  },
+  {
+    title: "Recommended",
+    items: [
+      "Start with restrictive workspace permissions.",
+      "Limit agent capabilities in Settings → Guardrails.",
+      "Use pairing codes and allowlists for messaging channels.",
+      "Read each approval request before allowing it.",
+      "Keep sensitive files outside your workspace.",
+    ],
+  },
+];
 
-  const handleContinue = () => {
-    if (selectedOption === "yes") {
-      onAccept(dontShowAgain);
-    }
-  };
+export function DisclaimerModal({ onAccept }: DisclaimerModalProps) {
+  const [dontShowAgain, setDontShowAgain] = useState(true);
+  const [declined, setDeclined] = useState(false);
 
   return (
     <div
@@ -20,160 +45,74 @@ export function DisclaimerModal({ onAccept }: DisclaimerModalProps) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="disclaimer-title"
+      aria-describedby="disclaimer-intro"
     >
-      <div className="disclaimer-container">
-        {/* Logo */}
-        <div className="disclaimer-logo">
-          <span className="disclaimer-logo-text">CoWork </span>
-          <span className="disclaimer-logo-os">OS</span>
-        </div>
-        <div className="disclaimer-subtitle">Agentic Task Automation</div>
-
-        {/* Main content card */}
-        <div className="disclaimer-card">
-          <div className="disclaimer-card-header">
-            <div className="disclaimer-card-icon-wrap" aria-hidden="true">
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                <path
-                  d="M10 2L18 17H2L10 2Z"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinejoin="round"
-                  fill="none"
-                />
-                <path d="M10 8V11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                <circle cx="10" cy="13.5" r="0.75" fill="currentColor" />
-              </svg>
-            </div>
-            <h2 id="disclaimer-title" className="disclaimer-card-title">
-              Security Notice
-            </h2>
-          </div>
-
-          <div className="disclaimer-card-body">
-            <p className="disclaimer-intro">
-              CoWork can help with real work, so it uses explicit workspace boundaries and
-              approvals.
-            </p>
-
-            <div className="disclaimer-section">
-              <h4>Default safety model</h4>
-              <ul>
-                <li>CoWork works inside selected workspaces and a private starter workspace.</li>
-                <li>Destructive actions and sensitive external actions ask first.</li>
-                <li>Command tools are governed by the access profile selected for each task.</li>
-                <li>Connected apps require separate setup and approval.</li>
-              </ul>
-            </div>
-
-            <div className="disclaimer-section">
-              <h4>Power-user capabilities</h4>
-              <ul>
-                <li>Run command tools when the selected access profile permits them.</li>
-                <li>Read, write, and delete files in allowed workspace paths.</li>
-                <li>
-                  Access the network, browser automation, skills, plugins, and connected services
-                  you enable.
-                </li>
-                <li>
-                  Send or receive messages through configured channels such as WhatsApp, Telegram,
-                  Slack, or email.
-                </li>
-              </ul>
-            </div>
-
-            <div className="disclaimer-section">
-              <h4>Recommendations</h4>
-              <ul>
-                <li>Start with restrictive workspace permissions</li>
-                <li>Use Settings → Guardrails to limit agent capabilities</li>
-                <li>Use pairing codes and allowlists for messaging channels</li>
-                <li>Review and understand each approval request</li>
-                <li>Keep sensitive files outside your workspace</li>
-              </ul>
-            </div>
-          </div>
+      <div className="disclaimer-card">
+        <div className="disclaimer-header">
+          <span className="disclaimer-glyph" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="none">
+              <path
+                d="M10 2.5L18 17H2L10 2.5Z"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinejoin="round"
+              />
+              <path d="M10 8V11.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+              <circle cx="10" cy="14" r="0.9" fill="currentColor" />
+            </svg>
+          </span>
+          <span className="disclaimer-name">CoWork OS · Security notice</span>
         </div>
 
-        {/* Selection */}
-        <div className="disclaimer-question-section">
-          <div className="disclaimer-question">
-            I understand this is powerful and inherently risky. Continue?
-          </div>
+        <h2 id="disclaimer-title" className="disclaimer-title">
+          Before you start
+        </h2>
+        <p id="disclaimer-intro" className="disclaimer-intro">
+          CoWork can take real actions on your computer and accounts, so it works within explicit
+          workspace boundaries and asks for approval.
+        </p>
 
-          <div className="disclaimer-options" role="radiogroup" aria-label="Accept security notice">
-            <button
-              type="button"
-              role="radio"
-              aria-checked={selectedOption === "yes"}
-              className={`disclaimer-option ${selectedOption === "yes" ? "selected" : ""}`}
-              onClick={() => setSelectedOption("yes")}
-            >
-              <span className="disclaimer-radio-modern">
-                {selectedOption === "yes" && <span className="disclaimer-radio-dot" />}
-              </span>
-              <span>Yes, I understand</span>
-            </button>
-            <button
-              type="button"
-              role="radio"
-              aria-checked={selectedOption === "no"}
-              className={`disclaimer-option ${selectedOption === "no" ? "selected" : ""}`}
-              onClick={() => setSelectedOption("no")}
-            >
-              <span className="disclaimer-radio-modern">
-                {selectedOption === "no" && <span className="disclaimer-radio-dot" />}
-              </span>
-              <span>No</span>
-            </button>
-          </div>
+        <div className="disclaimer-body">
+          {SECTIONS.map((section) => (
+            <section key={section.title} className="disclaimer-section">
+              <h3>{section.title}</h3>
+              <ul>
+                {section.items.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </section>
+          ))}
         </div>
 
-        {/* Continue button */}
-        {selectedOption === "yes" && (
-          <div className="disclaimer-continue">
-            <button
-              type="button"
-              role="checkbox"
-              aria-checked={dontShowAgain}
-              className="disclaimer-checkbox-label"
-              onClick={() => setDontShowAgain(!dontShowAgain)}
-            >
-              <span className={`disclaimer-checkbox-modern ${dontShowAgain ? "checked" : ""}`}>
-                {dontShowAgain && (
-                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                    <path
-                      d="M2.5 6L5 8.5L9.5 3.5"
-                      stroke="currentColor"
-                      strokeWidth="1.5"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                )}
-              </span>
-              <span>Don't show this again</span>
-            </button>
-            <button type="button" onClick={handleContinue} className="disclaimer-continue-btn">
-              Continue
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path
-                  d="M6 4L10 8L6 12"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </button>
+        {declined && (
+          <div className="disclaimer-exit-message" role="status">
+            You need to accept to use CoWork OS. Close the app if you disagree.
           </div>
         )}
 
-        {selectedOption === "no" && (
-          <div className="disclaimer-exit-message">
-            You must accept to use CoWork OS. Close the app if you disagree.
+        <div className="disclaimer-footer">
+          <label className="disclaimer-checkbox">
+            <input
+              type="checkbox"
+              checked={dontShowAgain}
+              onChange={(event) => setDontShowAgain(event.target.checked)}
+            />
+            <span>Don't show this again</span>
+          </label>
+          <div className="disclaimer-actions">
+            <button type="button" className="disclaimer-decline" onClick={() => setDeclined(true)}>
+              Decline
+            </button>
+            <button
+              type="button"
+              className="disclaimer-accept"
+              onClick={() => onAccept(dontShowAgain)}
+            >
+              I understand the risks
+            </button>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );

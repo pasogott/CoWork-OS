@@ -12243,467 +12243,242 @@ a,
 }
 
 /* ============================================
-   Disclaimer Modal - Terminal Style (First Launch)
-   ============================================ */
-
-/* ============================================
-   Disclaimer / Security Notice – Modern Theme
+   Disclaimer / Security Notice (first launch)
    ============================================ */
 
 .disclaimer-overlay {
   position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: var(--color-bg-primary, rgba(30, 30, 30, 0.95));
-  backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-saturate, 180%));
-  -webkit-backdrop-filter: blur(var(--glass-blur, 20px)) saturate(var(--glass-saturate, 180%));
+  inset: 0;
+  z-index: 10000;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 10000;
-  padding: 20px;
-  padding-top: 48px;
+  padding: 48px 20px 24px;
+  background: var(--color-bg-primary, rgba(26, 26, 28, 0.97));
   overflow-y: auto;
 }
 
-.disclaimer-container {
-  font-family: var(--font-ui);
-  color: var(--color-text, #ffffff);
-  max-width: 560px;
-  width: 100%;
-  font-size: 14px;
-  line-height: 1.6;
-}
-
-/* Logo */
-.disclaimer-logo {
-  text-align: center;
-  margin-bottom: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-}
-
-.disclaimer-logo-text {
-  font-size: 28px;
-  font-weight: 700;
-  color: var(--color-text, #fff);
-  letter-spacing: -0.5px;
-}
-
-.disclaimer-logo-os {
-  font-size: 28px;
-  font-weight: 700;
-  color: var(--color-accent, #22d3ee);
-  letter-spacing: -0.5px;
-}
-
-.disclaimer-subtitle {
-  text-align: center;
-  color: var(--color-text-muted, rgba(255, 255, 255, 0.45));
-  font-size: 12px;
-  margin-bottom: 32px;
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-  font-weight: 500;
-}
-
-/* Card container */
 .disclaimer-card {
-  background: var(--color-bg-elevated, rgba(45, 45, 48, 0.9));
-  border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
-  border-radius: var(--radius-lg, 20px);
-  margin-bottom: 28px;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 520px;
+  max-height: 100%;
+  margin: auto;
   overflow: hidden;
-  box-shadow: var(--shadow-lg, 0 8px 32px rgba(0, 0, 0, 0.25));
-  position: relative;
+  font-family: var(--font-ui);
+  color: var(--color-text-primary);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 14px;
+  box-shadow: 0 24px 48px -16px rgba(0, 0, 0, 0.45);
 }
 
-.disclaimer-card::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: var(
-    --gradient-glossy,
-    linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0) 100%)
-  );
-  border-radius: var(--radius-lg, 20px) var(--radius-lg, 20px) 0 0;
+.theme-light .disclaimer-card {
+  background: #ffffff;
+  border-color: rgba(15, 23, 42, 0.1);
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 24px 48px -16px rgba(15, 23, 42, 0.22);
 }
 
-.disclaimer-card-header {
+.disclaimer-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 16px 20px;
-  background: rgba(0, 0, 0, 0.15);
-  border-bottom: 1px solid var(--color-border-subtle, rgba(255, 255, 255, 0.06));
+  gap: 8px;
+  padding: 18px 20px 10px;
+  color: var(--color-text-muted);
 }
 
-.disclaimer-card-icon-wrap {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border-radius: var(--radius-sm, 12px);
-  background: rgba(251, 191, 36, 0.12);
-  color: #fbbf24;
+.disclaimer-glyph {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--color-text-primary) 7%, transparent);
+  color: var(--color-text-secondary);
   flex-shrink: 0;
 }
 
-.disclaimer-card-title {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--color-text, #fff);
+.disclaimer-name {
+  font-size: 12px;
+  font-weight: 500;
 }
 
-.disclaimer-card-body {
-  padding: 20px;
+.disclaimer-title {
+  margin: 0;
+  padding: 0 20px;
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--color-text-primary);
 }
 
 .disclaimer-intro {
-  color: var(--color-text-secondary, rgba(255, 255, 255, 0.7));
-  margin: 0 0 20px 0;
+  margin: 6px 0 0;
+  padding: 0 20px 16px;
   font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+
+.disclaimer-body {
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0 20px;
+  border-top: 1px solid var(--color-border-subtle);
 }
 
 .disclaimer-section {
-  margin-bottom: 20px;
+  padding: 14px 0;
 }
 
-.disclaimer-section:last-child {
-  margin-bottom: 0;
+.disclaimer-section + .disclaimer-section {
+  border-top: 1px solid var(--color-border-subtle);
 }
 
-.disclaimer-section h4 {
-  font-size: 11px;
+.disclaimer-section h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
   font-weight: 600;
-  color: var(--color-text-secondary, rgba(255, 255, 255, 0.7));
-  margin: 0 0 10px 0;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
+  color: var(--color-text-primary);
 }
 
 .disclaimer-section ul {
-  list-style: none;
-  padding: 0;
   margin: 0;
+  padding: 0;
+  list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .disclaimer-section li {
   position: relative;
-  padding: 4px 0 4px 22px;
-  color: var(--color-text-muted, rgba(255, 255, 255, 0.55));
-  font-size: 13px;
+  padding-left: 14px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
 }
 
 .disclaimer-section li::before {
   content: "";
   position: absolute;
-  left: 6px;
-  top: 12px;
-  width: 5px;
-  height: 5px;
+  left: 2px;
+  top: 0.68em;
+  width: 4px;
+  height: 4px;
   border-radius: 50%;
-  background: var(--color-accent, #22d3ee);
-  opacity: 0.6;
+  background: var(--color-text-muted);
 }
 
-/* Question section */
-.disclaimer-question-section {
-  margin-bottom: 24px;
+.disclaimer-exit-message {
+  margin: 0 20px 12px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-text-primary) 6%, transparent);
 }
 
-.disclaimer-question {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--color-text, #fff);
-  margin-bottom: 14px;
-}
-
-.disclaimer-options {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.disclaimer-option {
+.disclaimer-footer {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 12px;
-  cursor: pointer;
-  padding: 10px 14px;
-  border-radius: var(--radius-sm, 12px);
-  border: 1px solid var(--color-border-subtle, rgba(255, 255, 255, 0.06));
-  background: var(--color-bg-glass, rgba(255, 255, 255, 0.05));
-  transition: all 0.2s ease;
-  color: var(--color-text-secondary, rgba(255, 255, 255, 0.7));
-  font-size: 13px;
-  font-family: inherit;
-  text-align: left;
-  width: 100%;
-  position: relative;
-  overflow: hidden;
+  margin: 0 20px;
+  padding: 12px 0 14px;
+  border-top: 1px solid var(--color-border-subtle);
 }
 
-.disclaimer-option::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 50%;
-  background: var(
-    --gradient-glossy,
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0) 100%)
-  );
-  pointer-events: none;
-}
-
-.disclaimer-option:hover {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: var(--color-border, rgba(255, 255, 255, 0.12));
-  color: var(--color-text, #fff);
-}
-
-.disclaimer-option.selected {
-  background: var(--color-accent-subtle, rgba(34, 211, 238, 0.08));
-  border-color: var(--color-accent, #22d3ee);
-  color: var(--color-accent, #22d3ee);
-  box-shadow:
-    0 0 0 1px var(--color-accent, #22d3ee) inset,
-    var(--shadow-glow, 0 0 20px rgba(34, 211, 238, 0.1));
-}
-
-/* Modern radio button */
-.disclaimer-radio-modern {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 2px solid var(--color-border, rgba(255, 255, 255, 0.2));
-  flex-shrink: 0;
-  transition: all 0.2s ease;
-}
-
-.disclaimer-option.selected .disclaimer-radio-modern {
-  border-color: var(--color-accent, #22d3ee);
-}
-
-.disclaimer-radio-dot {
-  display: block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--color-accent, #22d3ee);
-}
-
-/* Continue button */
-.disclaimer-continue {
-  text-align: center;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 16px;
-}
-
-.disclaimer-checkbox-label {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--color-text-secondary, rgba(255, 255, 255, 0.7));
-  user-select: none;
-  transition: color 0.15s ease;
-  padding: 0;
-  border: none;
-  background: none;
-  font-family: inherit;
-}
-
-.disclaimer-checkbox-label:hover {
-  color: var(--color-text, #fff);
-}
-
-/* Modern checkbox */
-.disclaimer-checkbox-modern {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  border: 2px solid var(--color-border, rgba(255, 255, 255, 0.2));
-  transition: all 0.2s ease;
-  color: #fff;
-  flex-shrink: 0;
-}
-
-.disclaimer-checkbox-modern.checked {
-  background: var(--color-accent, #22d3ee);
-  border-color: var(--color-accent, #22d3ee);
-}
-
-.disclaimer-continue-btn {
+.disclaimer-checkbox {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  background: linear-gradient(
-    180deg,
-    var(--color-accent-hover, #3ee0f5) 0%,
-    var(--color-accent, #22d3ee) 100%
-  );
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  color: #1a1a1a;
-  padding: 12px 32px;
-  font-family: inherit;
-  font-size: 14px;
-  font-weight: 600;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--color-text-secondary);
   cursor: pointer;
-  transition: all 0.2s ease;
-  border-radius: var(--radius-md, 16px);
-  box-shadow:
-    var(--shadow-sm, 0 2px 8px rgba(0, 0, 0, 0.15)),
-    inset 0 1px 0 rgba(255, 255, 255, 0.2);
-  position: relative;
-  overflow: hidden;
+  user-select: none;
 }
 
-.disclaimer-continue-btn::before {
+.disclaimer-checkbox input {
+  appearance: none;
+  position: relative;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.disclaimer-checkbox input:checked {
+  border-color: var(--color-text-primary);
+  background: var(--color-text-primary);
+}
+
+.disclaimer-checkbox input:checked::after {
   content: "";
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 50%;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0) 100%);
-  pointer-events: none;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 7px;
+  border: solid var(--color-bg-primary);
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
 }
 
-.disclaimer-continue-btn:hover {
-  transform: translateY(-1px);
-  box-shadow:
-    var(--shadow-md, 0 4px 16px rgba(0, 0, 0, 0.2)),
-    var(--shadow-glow, 0 0 20px rgba(34, 211, 238, 0.15));
+.disclaimer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
 }
 
-.disclaimer-continue-btn:active {
-  transform: translateY(0);
-}
-
-/* Exit message */
-.disclaimer-exit-message {
-  text-align: center;
-  color: var(--color-text-muted, rgba(255, 255, 255, 0.45));
+.disclaimer-decline,
+.disclaimer-accept {
+  height: 30px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 8px;
   font-size: 13px;
-  padding: 12px 16px;
-  background: rgba(248, 113, 113, 0.08);
-  border: 1px solid rgba(248, 113, 113, 0.15);
-  border-radius: var(--radius-sm, 12px);
+  font-weight: 500;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease,
+    opacity 0.12s ease;
 }
 
-/* Light theme */
-.theme-light .disclaimer-overlay {
-  background: rgba(245, 245, 245, 0.97);
+.disclaimer-decline {
+  background: transparent;
+  color: var(--color-text-secondary);
 }
 
-.theme-light .disclaimer-logo-text {
-  color: #1a1a1a;
+.disclaimer-decline:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
 }
 
-.theme-light .disclaimer-subtitle {
-  color: #999;
+.disclaimer-accept {
+  background: var(--color-text-primary);
+  color: var(--color-bg-primary);
 }
 
-.theme-light .disclaimer-card {
-  background: #fff;
-  border-color: #e0e0e0;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+.disclaimer-accept:hover {
+  opacity: 0.88;
 }
 
-.theme-light .disclaimer-card::before {
-  display: none;
-}
-
-.theme-light .disclaimer-card-header {
-  background: #fafafa;
-  border-color: #e8e8e8;
-}
-
-.theme-light .disclaimer-card-icon-wrap {
-  background: rgba(251, 191, 36, 0.1);
-}
-
-.theme-light .disclaimer-card-title {
-  color: #1a1a1a;
-}
-
-.theme-light .disclaimer-intro {
-  color: #666;
-}
-
-.theme-light .disclaimer-section h4 {
-  color: #555;
-}
-
-.theme-light .disclaimer-section li {
-  color: #666;
-}
-
-.theme-light .disclaimer-question {
-  color: #1a1a1a;
-}
-
-.theme-light .disclaimer-option {
-  color: #555;
-  background: rgba(0, 0, 0, 0.02);
-  border-color: #e0e0e0;
-}
-
-.theme-light .disclaimer-option::before {
-  display: none;
-}
-
-.theme-light .disclaimer-option:hover {
-  background: rgba(0, 0, 0, 0.04);
-  border-color: #ccc;
-  color: #1a1a1a;
-}
-
-.theme-light .disclaimer-option.selected {
-  background: rgba(8, 145, 178, 0.06);
-  border-color: var(--color-accent);
-}
-
-.theme-light .disclaimer-radio-modern {
-  border-color: #ccc;
-}
-
-.theme-light .disclaimer-checkbox-modern {
-  border-color: #ccc;
-}
-
-.theme-light .disclaimer-continue-btn {
-  color: #fff;
-}
-
-.theme-light .disclaimer-exit-message {
-  color: #888;
-  background: rgba(248, 113, 113, 0.06);
-  border-color: rgba(248, 113, 113, 0.12);
+.disclaimer-checkbox input:focus-visible,
+.disclaimer-decline:focus-visible,
+.disclaimer-accept:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 60%, transparent);
+  outline-offset: 2px;
 }
 
 /* ============================================
