@@ -5371,6 +5371,32 @@ relationship_memory:
     expect(step.status, String(step.error || "")).toBe("completed");
   });
 
+  it.each([
+    "Show the captured command output in the final reply, or report the execution error or permission denial if the command did not succeed.",
+    "Provide Almarion with the captured command output and exit status, or the denial reason.",
+  ])("reports captured command output without a second invocation: %s", async (description) => {
+    executor = createExecutorWithStubs(
+      [textResponse("The exact command ran once with exit code 0. Output: synthetic greeting.")],
+      {},
+    );
+    const step: Any = {
+      id: "report-output",
+      description,
+      status: "pending",
+    };
+    (executor as Any).plan = { description: "Report the previous result", steps: [step] };
+
+    await (executor as Any).executeStep(step);
+
+    expect(step.status, String(step.error || "")).toBe("completed");
+    expect((executor as Any).toolRegistry.executeTool).not.toHaveBeenCalled();
+    const rerun = (executor as Any).resolveStepExecutionContract({
+      ...step,
+      description: "Show the captured command output after you run the shell command again.",
+    });
+    expect(rerun.requiredTools.has("run_command")).toBe(true);
+  });
+
   it("completes analysis steps when PDF vision config is missing but text extraction succeeded", async () => {
     executor = createExecutorWithStubs(
       [
@@ -6939,6 +6965,36 @@ describe("TaskExecutor step loop control", () => {
       executor.sendMessageUnified(message, undefined, undefined, {
         suppressUserMessageEvent: true,
       });
+
+    it.each(["User denied command execution", "Approval request timed out"])(
+      "does not replay the paused plan after a successful explicit retry: %s",
+      async (approvalError) => {
+        const executor = createFollowUpExecutor(
+          [
+            toolCall("run_command", { command: "node greeting.js" }, "retry"),
+            textResponse("The command ran once and returned the greeting."),
+          ],
+          { run_command: () => ({ success: true, stdout: "synthetic greeting", exitCode: 0 }) },
+        );
+        executor.task.status = "paused";
+        executor.waitingForUserInput = true;
+        executor.lastAwaitingUserInputReasonCode = executor.getApprovalBlockMessage(
+          "run_command",
+          approvalError,
+        );
+        executor.plan = {
+          description: "Run once",
+          steps: [{ id: "original", description: "Run node greeting.js once", status: "pending" }],
+        };
+        executor.resumeAfterPause = vi.fn();
+
+        await sendFollowUp(executor, "Run node greeting.js once again and show its output.");
+
+        expect(executor.toolRegistry.executeTool).toHaveBeenCalledTimes(1);
+        expect(executor.resumeAfterPause).not.toHaveBeenCalled();
+        expect(executor.finalizeSuccessfulFollowUp).toHaveBeenCalled();
+      },
+    );
 
     it.each(["User denied command execution", "Approval request timed out"])(
       "does not complete a follow-up whose shell approval failed: %s",

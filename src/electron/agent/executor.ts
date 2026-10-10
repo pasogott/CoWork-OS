@@ -13595,25 +13595,34 @@ ${transcript}
       addRequiredGeneratorIfAvailable("create_spreadsheet");
     }
 
+    const reportsCapturedCommandOutput =
+      /^\s*(?:show|report|summarize|present|relay|quote|provide|give|return|reply|respond)\b/.test(
+        desc,
+      ) &&
+      /\b(?:captured|recorded|previous|existing)\s+(?:shell\s+|terminal\s+)?command\s+output\b/.test(
+        desc,
+      ) &&
+      !/\b(?:run|execute|rerun|re-run|install)\b/.test(desc);
     const requiresRunCommandEvidence =
-      /\b(?:install dependencies|dependency install|npm install|pnpm install|yarn install)\b/.test(
+      !reportsCapturedCommandOutput &&
+      (/\b(?:install dependencies|dependency install|npm install|pnpm install|yarn install)\b/.test(
         desc,
       ) ||
-      /\b(?:run|execute)\b[\s\S]{0,30}\b(?:npm|pnpm|yarn)\b/.test(desc) ||
-      /\b(?:run|execute)\s+(?:the\s+)?(?:project\s+)?(?:test|build)\s+command\b/.test(desc) ||
-      /\b(?:test|build)\s+commands?\b[\s\S]{0,20}\b(?:complete successfully|succeed|pass)\b/.test(
-        desc,
-      ) ||
-      /\bcommands?\s+complete successfully\b/.test(desc) ||
-      /\b(?:run|execute)\b[\s\S]{0,40}\bcommand\b[\s\S]{0,60}\b(?:current session context|stdout|stderr|standard output|standard error|exit code|exit status|print(?:s)?|output(?:s)?|return(?:s)?|emit(?:s)?|produc(?:e|es))\b/.test(
-        desc,
-      ) ||
-      /\b(?:shell|terminal)\s+command\b/.test(desc) ||
-      /\b(?:ffmpeg|ffprobe|mediainfo)\b/.test(desc) ||
-      /\bcommand\b[\s\S]{0,40}\bcurrent session context\b/.test(desc) ||
-      /\bcommand\b[\s\S]{0,40}\b(?:stdout|stderr|standard output|standard error|exit code|exit status|print(?:s)?|output(?:s)?|return(?:s)?|emit(?:s)?|produc(?:e|es))\b/.test(
-        desc,
-      );
+        /\b(?:run|execute)\b[\s\S]{0,30}\b(?:npm|pnpm|yarn)\b/.test(desc) ||
+        /\b(?:run|execute)\s+(?:the\s+)?(?:project\s+)?(?:test|build)\s+command\b/.test(desc) ||
+        /\b(?:test|build)\s+commands?\b[\s\S]{0,20}\b(?:complete successfully|succeed|pass)\b/.test(
+          desc,
+        ) ||
+        /\bcommands?\s+complete successfully\b/.test(desc) ||
+        /\b(?:run|execute)\b[\s\S]{0,40}\bcommand\b[\s\S]{0,60}\b(?:current session context|stdout|stderr|standard output|standard error|exit code|exit status|print(?:s)?|output(?:s)?|return(?:s)?|emit(?:s)?|produc(?:e|es))\b/.test(
+          desc,
+        ) ||
+        /\b(?:shell|terminal)\s+command\b/.test(desc) ||
+        /\b(?:ffmpeg|ffprobe|mediainfo)\b/.test(desc) ||
+        /\bcommand\b[\s\S]{0,40}\bcurrent session context\b/.test(desc) ||
+        /\bcommand\b[\s\S]{0,40}\b(?:stdout|stderr|standard output|standard error|exit code|exit status|print(?:s)?|output(?:s)?|return(?:s)?|emit(?:s)?|produc(?:e|es))\b/.test(
+          desc,
+        ));
     if (requiresRunCommandEvidence) {
       addRequiredToolIfKnown("run_command");
     }
@@ -34014,8 +34023,13 @@ Return ONLY a JSON object:
           return "Action required: Enable/reconnect the integration in Settings > Integrations, then try again.";
         }
 
-        // Tools report a denial as "User denied command execution" (or
-        // AppleScript execution), not "user denied approval".
+        // A denial or expired approval ends this attempt. Preserve that decision
+        // in the pause reason so a later follow-up does not replay this plan.
+        const approvalBlockMessage = this.getApprovalBlockMessage(toolName, message);
+        if (approvalBlockMessage) {
+          return approvalBlockMessage;
+        }
+
         const approvalBlocked =
           lower.includes("approval request timed out") ||
           /\buser denied\b/.test(lower) ||
@@ -42153,6 +42167,9 @@ Return ONLY a JSON object:
     let handledPendingSkillReply = false;
     const shouldResumeAfterFollowup =
       (previousStatus === "paused" || this.waitingForUserInput) &&
+      !/^Approval for the .+ (?:was denied|timed out before)/.test(
+        this.lastAwaitingUserInputReasonCode || this.lastPauseReason || "",
+      ) &&
       !hasPendingSkillParameterCollection;
     const shouldStartNewCanvasSession = ["completed", "failed", "cancelled"].includes(
       previousStatus,

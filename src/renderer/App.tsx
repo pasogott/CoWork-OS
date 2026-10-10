@@ -126,7 +126,7 @@ import {
   BotNotificationPolicy,
 } from "../shared/types";
 import type { ComposerDraft, DraftAttachmentRef } from "../shared/composer-drafts";
-import { TASK_EVENT_STATUS_MAP } from "../shared/task-event-status-map";
+import { getTaskEventStatus } from "../shared/task-event-status-map";
 import { getEffectiveTaskEventType } from "./utils/task-event-compat";
 import {
   clampResizableSidebarWidth,
@@ -4203,9 +4203,7 @@ export function App() {
         });
         const newStatus = isLlmRequestCancelledEvent(event)
           ? undefined
-          : event.type === "task_status"
-            ? event.payload?.status
-            : TASK_EVENT_STATUS_MAP[event.type];
+          : getTaskEventStatus(event.type, event.payload);
         if (newStatus) {
           setRemoteTaskView((prev) =>
             prev && prev.task.id === remoteTaskId && prev.deviceId === remoteDeviceId
@@ -4251,9 +4249,7 @@ export function App() {
           if (!prev || prev.parentTaskId !== event.taskId || !prev.parentTask) return prev;
           const parentStatus = isLlmRequestCancelledEvent(event)
             ? undefined
-            : event.type === "task_status"
-              ? event.payload?.status
-              : TASK_EVENT_STATUS_MAP[event.type];
+            : getTaskEventStatus(event.type, event.payload);
           const nextParentTask =
             parentStatus && typeof parentStatus === "string"
               ? {
@@ -4285,9 +4281,7 @@ export function App() {
           if (!prev?.task || prev.task.id !== event.taskId) return prev;
           const sideStatus = isLlmRequestCancelledEvent(event)
             ? undefined
-            : event.type === "task_status"
-              ? event.payload?.status
-              : TASK_EVENT_STATUS_MAP[event.type];
+            : getTaskEventStatus(event.type, event.payload);
           const nextTask =
             sideStatus && typeof sideStatus === "string"
               ? {
@@ -4424,9 +4418,7 @@ export function App() {
 
       const newStatus = isLlmRequestCancelledEvent(event)
         ? undefined
-        : event.type === "task_status"
-          ? event.payload?.status
-          : TASK_EVENT_STATUS_MAP[event.type];
+        : getTaskEventStatus(event.type, event.payload);
       const isAutoApprovalRequested =
         event.type === "approval_requested" && event.payload?.autoApproved === true;
       const isSessionAutoApproval =
