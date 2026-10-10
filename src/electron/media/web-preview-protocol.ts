@@ -11,9 +11,11 @@ import { createHash, randomUUID } from "crypto";
  * `sandbox="allow-scripts …"` (no `allow-same-origin`), so they run in an
  * opaque origin with no access to the app, its storage or the preload API.
  *
- * Only HTML the main process built itself (from a path the viewer handler has
- * already resolved inside the workspace) is registered, behind an unguessable
- * one-hour token.
+ * Three kinds of page are registered, each behind an unguessable one-hour token:
+ * HTML artifacts the viewer handler resolved inside the workspace, model-written
+ * inline answer surfaces (answer-surfaces/html-surface-document.ts), and the static
+ * runner page that executes surface logic in workers (shared/answer-surfaces/logic.ts).
+ * All are untrusted content as far as this origin is concerned.
  */
 const WEB_PREVIEW_SCHEME = "cowork-preview";
 const TOKEN_TTL_MS = 60 * 60 * 1000;
@@ -37,6 +39,23 @@ export const WEB_PREVIEW_CSP =
   "frame-src 'none'; " +
   "form-action 'none'; " +
   "base-uri 'none'";
+
+/** Previews never need device, payment or clipboard access. */
+export const WEB_PREVIEW_PERMISSIONS_POLICY = [
+  "camera=()",
+  "microphone=()",
+  "geolocation=()",
+  "payment=()",
+  "usb=()",
+  "serial=()",
+  "hid=()",
+  "bluetooth=()",
+  "clipboard-read=()",
+  "clipboard-write=()",
+  "display-capture=()",
+  "screen-wake-lock=()",
+  "publickey-credentials-get=()",
+].join(", ");
 
 type PreviewRecord = { html: string; expiresAt: number };
 
@@ -87,6 +106,10 @@ export function createWebPreviewUrl(html: string): string {
   const existingRecord = existing ? previewStore.get(existing) : undefined;
   if (existing && existingRecord) {
     existingRecord.expiresAt = Date.now() + TOKEN_TTL_MS;
+    // Least recently used goes first: re-inserting moves a reopened page to the back, so
+    // a surface still on screen is not evicted ahead of ones scrolled away long ago.
+    previewStore.delete(existing);
+    previewStore.set(existing, existingRecord);
     return `${WEB_PREVIEW_SCHEME}://local/${existing}`;
   }
   while (previewStore.size >= MAX_ENTRIES) {
@@ -115,10 +138,35 @@ export function resolveWebPreviewRequest(rawUrl: string): Response {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Content-Security-Policy": WEB_PREVIEW_CSP,
+      "Permissions-Policy": WEB_PREVIEW_PERMISSIONS_POLICY,
+      "Referrer-Policy": "no-referrer",
+      // Resource hints are outside the CSP; this keeps the page from resolving hostnames.
+      "X-DNS-Prefetch-Control": "off",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
     },
   });
+}
+
+export function isWebPreviewUrl(url: string | undefined | null): boolean {
+  return typeof url === "string" && url.startsWith(`${WEB_PREVIEW_SCHEME}://`);
+}
+
+/**
+ * Whether a frame's navigation must be stopped: a preview page may reload itself, but not
+ * go anywhere else on its own (another preview's URL, about:blank, a data: page), where
+ * the app would hand it the bridge's nonce and saved inputs on load. The app itself may
+ * still point the frame at a new preview.
+ */
+export function shouldBlockPreviewFrameNavigation(details: {
+  isMainFrame: boolean;
+  currentUrl: string | undefined;
+  targetUrl: string;
+  initiatedByApp: boolean;
+}): boolean {
+  if (details.isMainFrame || details.initiatedByApp) return false;
+  if (!isWebPreviewUrl(details.currentUrl)) return false;
+  return details.targetUrl !== details.currentUrl;
 }
 
 /**

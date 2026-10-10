@@ -3,7 +3,10 @@ import {
   detectTestRequirement,
   extractNamedTestCommands,
   isBuildCheckCommand,
+  isLatexPdfRequest,
   isTestCommand,
+  promptRequestsDecision,
+  stripEmbeddedAgentOutputs,
 } from "../executor-prompt-heuristics-utils";
 
 describe("detectTestRequirement", () => {
@@ -157,5 +160,66 @@ describe("extractNamedTestCommands", () => {
       ),
     ).toEqual(["./scripts/ci.sh --fast"]);
     expect(extractNamedTestCommands("Run `npm run build` to bundle the app.")).toEqual([]);
+  });
+});
+
+describe("promptRequestsDecision with embedded agent outputs", () => {
+  const request =
+    "Help me plan the pilot. Get separate perspectives and combine them into one practical launch plan in chat.";
+  const analysis =
+    "## Planning basis\n---\nDecide whether all 12 staff attend. Recommended learning design: practise.\n---";
+
+  it("ignores decision wording inside dependency outputs of an orchestration node", () => {
+    const prompt = [
+      "You are executing a dependency-aware orchestration node.",
+      "",
+      `Dependency 1 (Explorer) output:\n---\n${analysis}\n---`,
+      "",
+      "Your task:",
+      `ORIGINAL REQUEST:\n${request}`,
+    ].join("\n");
+    expect(stripEmbeddedAgentOutputs(prompt)).toBe(`ORIGINAL REQUEST:\n${request}`);
+    expect(promptRequestsDecision("Launch plan", prompt)).toBe(false);
+  });
+
+  it("ignores decision wording inside embedded team analyses", () => {
+    const prompt = [
+      `ORIGINAL REQUEST: ${request}`,
+      "=== TEAM MEMBER ANALYSES (COMPACTED) ===",
+      analysis,
+      "=== END OF TEAM MEMBER ANALYSES ===",
+    ].join("\n");
+    expect(promptRequestsDecision("Launch plan", prompt)).toBe(false);
+  });
+
+  it("still detects a decision the user asked for", () => {
+    const prompt = [
+      `ORIGINAL REQUEST: Tell me whether we should launch now or wait.`,
+      "=== TEAM MEMBER ANALYSES (COMPLETE) ===",
+      analysis,
+      "=== END OF TEAM MEMBER ANALYSES ===",
+    ].join("\n");
+    expect(promptRequestsDecision("Launch decision", prompt)).toBe(true);
+    expect(promptRequestsDecision("Upgrade", "Should I upgrade the plan?")).toBe(true);
+  });
+});
+
+describe("isLatexPdfRequest", () => {
+  it("treats a Word document with a matching PDF as an ordinary document request", () => {
+    expect(
+      isLatexPdfRequest(
+        "Prepare a polished two-page client brief in Portuguese (Portugal) for the Northstar onboarding pilot. Save both an editable Word document and a matching PDF: Northstar-brief.docx and Northstar-brief.pdf.",
+      ),
+    ).toBe(false);
+    expect(isLatexPdfRequest("Create a report as a PDF for the board")).toBe(false);
+    expect(isLatexPdfRequest("Write the texto do relatório and export a PDF document")).toBe(false);
+  });
+
+  it("recognises explicit LaTeX intent", () => {
+    expect(isLatexPdfRequest("Write the paper in LaTeX")).toBe(true);
+    expect(isLatexPdfRequest("Draw the diagram with TikZ")).toBe(true);
+    expect(isLatexPdfRequest("Update main.tex with the new section")).toBe(true);
+    expect(isLatexPdfRequest("Write a short paper and compile it into a PDF")).toBe(true);
+    expect(isLatexPdfRequest("Draft the article, then compile the PDF")).toBe(true);
   });
 });

@@ -3,7 +3,14 @@ import * as fs from "fs/promises";
 import { Workspace } from "../../../shared/types";
 import { AgentDaemon } from "../daemon";
 import { SpreadsheetBuilder } from "../skills/spreadsheet";
-import { DocumentBuilder, type ContentBlockInput } from "../skills/document";
+import {
+  DocumentBuilder,
+  parseMaxPages,
+  resolveDocumentOutputs,
+  type ContentBlockInput,
+  type DocumentCreateReport,
+  type DocumentFormat,
+} from "../skills/document";
 import { PresentationBuilder } from "../skills/presentation";
 import { FolderOrganizer } from "../skills/organizer";
 import { editPdfRegion } from "../../documents/pdf-region-editor";
@@ -159,19 +166,41 @@ export class SkillTools {
   }
 
   /**
-   * Create document
+   * Create document. With `formats`, every listed format is written from the
+   * same content and options, so a DOCX and its PDF carry identical text.
    */
   async createDocument(input: {
     filename: string;
-    format: "docx" | "pdf";
+    format?: "docx" | "pdf";
+    /** Write each of these formats from the same content, e.g. ["docx", "pdf"]. */
+    formats?: Array<"docx" | "pdf">;
+    /** Names for the `formats` files: an array in the same order, or a map from format to name. */
+    filenames?: string[] | Partial<Record<"docx" | "pdf", string>>;
     content: ContentBlockInput[];
+    pageNumbers?: boolean;
+    /** Page budget; the PDF layout is tightened to fit it. */
+    maxPages?: number;
   }): Promise<{
     success: boolean;
+    /** The first file written; `files` lists every file. */
     path: string;
+    /** Every file this call wrote, in the order of the requested formats. */
+    files: Array<{
+      path: string;
+      format: DocumentFormat;
+      pageCount?: number;
+      fittedToMaxPages?: boolean;
+    }>;
     contentBlocks?: number;
     requestedBlocks?: number;
     droppedBlocks?: Array<{ index: number; type: string; reason: string }>;
     warnings?: string[];
+    /** Pages in the written PDF. */
+    pageCount?: number;
+    /** Whether the PDF is within maxPages; only when maxPages was given for a PDF. */
+    fittedToMaxPages?: boolean;
+    /** Why no page count is reported for a DOCX written with maxPages. */
+    pageCountNote?: string;
   }> {
     if (!this.workspace.permissions.write) {
       throw new Error("Write permission not granted");
@@ -194,46 +223,99 @@ export class SkillTools {
       );
     }
 
-    const filename = input.filename.endsWith(`.${input.format}`)
-      ? input.filename
-      : `${input.filename}.${input.format}`;
+    // The requested names are kept exactly; only a missing extension is added.
+    const outputs = resolveDocumentOutputs(input);
+    const maxPages = parseMaxPages(input.maxPages);
 
-    const outputPath = await this.assertPathAllowed(
-      path.join(this.workspace.path, filename),
-      "write",
-      "document output",
-    );
+    // Check every destination before writing any, so a denied path does not
+    // leave one format written without the other.
+    const outputPaths: string[] = [];
+    for (const { filename } of outputs) {
+      outputPaths.push(
+        await this.assertPathAllowed(
+          path.join(this.workspace.path, filename),
+          "write",
+          "document output",
+        ),
+      );
+    }
 
-    const report = await this.documentBuilder.create(outputPath, input.format, input.content);
+    const files: Array<{
+      path: string;
+      format: DocumentFormat;
+      pageCount?: number;
+      fittedToMaxPages?: boolean;
+    }> = [];
+    const reportWarnings: string[] = [];
+    let report: DocumentCreateReport | undefined;
+    for (const [index, { filename, format }] of outputs.entries()) {
+      const fileReport = await this.documentBuilder.create(
+        outputPaths[index],
+        format,
+        input.content,
+        { pageNumbers: input.pageNumbers === true, maxPages },
+      );
+      report ??= fileReport;
+      for (const warning of fileReport.warnings) {
+        const text = outputs.length > 1 ? `${filename}: ${warning}` : warning;
+        if (!reportWarnings.includes(text)) reportWarnings.push(text);
+      }
 
-    // Count what was written, not what was sent: a block with nothing to
-    // write is reported back instead.
-    const blockCount = report.renderedBlocks;
-    console.log(
-      `[SkillTools] Document created successfully: ${filename} with ${blockCount} content blocks`,
-    );
+      // Count what was written, not what was sent: a block with nothing to
+      // write is reported back instead.
+      const blockCount = fileReport.renderedBlocks;
+      console.log(
+        `[SkillTools] Document created successfully: ${filename} with ${blockCount} content blocks`,
+      );
 
-    this.daemon.logEvent(this.taskId, "file_created", {
-      path: filename,
-      type: "document",
-      format: input.format,
-      contentBlocks: blockCount,
-    });
+      this.daemon.logEvent(this.taskId, "file_created", {
+        path: filename,
+        type: "document",
+        format,
+        contentBlocks: blockCount,
+      });
+      files.push({
+        path: filename,
+        format,
+        ...(fileReport.pageCount !== undefined ? { pageCount: fileReport.pageCount } : {}),
+        ...(fileReport.fittedToMaxPages !== undefined
+          ? { fittedToMaxPages: fileReport.fittedToMaxPages }
+          : {}),
+      });
+    }
+    if (!report) throw new Error("No document format was requested.");
 
+    // Every format renders the same blocks, so dropped blocks are the same for each.
     const warnings = [
       ...report.droppedBlocks.map(
         (block) =>
           `Content block ${block.index + 1} (${block.type}) was not written: ${block.reason}.`,
       ),
-      ...report.warnings,
+      ...reportWarnings,
     ];
+    const pdf = files.find((file) => file.format === "pdf");
+    const writesDocx = files.some((file) => file.format === "docx");
     return {
       success: true,
-      path: filename,
-      contentBlocks: blockCount,
+      path: files[0].path,
+      files,
+      contentBlocks: report.renderedBlocks,
       requestedBlocks: report.requestedBlocks,
       ...(report.droppedBlocks.length > 0 ? { droppedBlocks: report.droppedBlocks } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
+      ...(pdf?.pageCount !== undefined ? { pageCount: pdf.pageCount } : {}),
+      ...(pdf?.fittedToMaxPages !== undefined ? { fittedToMaxPages: pdf.fittedToMaxPages } : {}),
+      ...(maxPages !== undefined && writesDocx
+        ? {
+            pageCountNote: pdf
+              ? "DOCX page breaks are decided by the word processor that opens the file, so the DOCX " +
+                "page count was not measured. The PDF written from the same content has the measured " +
+                "pageCount."
+              : "DOCX page breaks are decided by the word processor that opens the file, so the page " +
+                "count was not measured and maxPages was not checked. When a PDF of the same content " +
+                "is also requested, its pageCount is the measured length.",
+          }
+        : {}),
     };
   }
 

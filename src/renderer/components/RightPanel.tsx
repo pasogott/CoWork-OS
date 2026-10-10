@@ -86,9 +86,16 @@ import {
 } from "lucide-react";
 import { getEmojiIcon } from "../utils/emoji-icon-map";
 import { measureRendererPerf, recordRendererRender } from "../utils/renderer-perf";
+import {
+  isLlmUsageEvent,
+  readLlmUsageTotals,
+  type TaskUsageTotals,
+  type TaskUsageTotalsByTaskId,
+} from "../utils/task-usage-totals";
 import { SessionProgressCard } from "./SessionProgressCard";
 import { SessionDashboardCard } from "./SessionDashboardCard";
 import { SessionMembersCard } from "./SessionMembersCard";
+import { getRecoveredSynthesisTaskIds } from "../../shared/synthesis-agent-detection";
 import "./right-panel.css";
 
 /**
@@ -321,6 +328,8 @@ type CollaborativeAgentRow = {
   task: Task;
   statusKind: CollaborativeAgentStatusKind;
   statusLabel: string;
+  /** A failed synthesis attempt replaced by a successful retry: history, not a failure. */
+  recovered: boolean;
   eventCount: number;
   toolCallCount: number;
   llmCallCount: number;
@@ -342,13 +351,11 @@ type CollaborativeAgentTotals = {
   outputTokens: number;
   cost: number;
   costKnown: boolean;
+  /** False until any sub-agent has reported usage, so the cost reads as unknown, not $0. */
+  hasUsage: boolean;
   wallDurationMs: number;
   rows: CollaborativeAgentRow[];
 };
-
-function toFiniteNumber(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
 
 function formatCompactNumber(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
@@ -405,22 +412,38 @@ function getCollaborativeAgentStatusLabel(kind: CollaborativeAgentStatusKind, ta
 }
 
 function getLatestUsageTotals(events: TaskEvent[]): CollaborativeAgentUsage {
-  const latest = [...events]
-    .reverse()
-    .find((event) => getEffectiveTaskEventType(event) === "llm_usage");
-  const payload =
-    latest?.payload && typeof latest.payload === "object" && !Array.isArray(latest.payload)
-      ? (latest.payload as Record<string, unknown>)
-      : {};
-  const totals =
-    payload.totals && typeof payload.totals === "object" && !Array.isArray(payload.totals)
-      ? (payload.totals as Record<string, unknown>)
-      : payload;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (isLlmUsageEvent(events[index])) return readLlmUsageTotals(events[index]);
+  }
+  return { inputTokens: 0, outputTokens: 0, cost: 0, costKnown: true };
+}
+
+/**
+ * A sub-agent's usage from its retained events combined with the cumulative usage kept
+ * outside the event cap. Totals are cumulative, so the higher value is the current one.
+ */
+function getCollaborativeAgentUsage(
+  taskEvents: TaskEvent[],
+  accumulated: TaskUsageTotals | undefined,
+): { usage: CollaborativeAgentUsage; llmCallCount: number; hasUsage: boolean } {
+  const retainedUsageEvents = taskEvents.filter(isLlmUsageEvent).length;
+  const retained = getLatestUsageTotals(taskEvents);
+  if (!accumulated) {
+    return {
+      usage: retained,
+      llmCallCount: retainedUsageEvents,
+      hasUsage: retainedUsageEvents > 0,
+    };
+  }
   return {
-    inputTokens: toFiniteNumber(totals.inputTokens ?? totals.input_tokens),
-    outputTokens: toFiniteNumber(totals.outputTokens ?? totals.output_tokens),
-    cost: toFiniteNumber(totals.cost ?? totals.totalCost ?? payload.totalCost),
-    costKnown: totals.costKnown !== false,
+    usage: {
+      inputTokens: Math.max(retained.inputTokens, accumulated.inputTokens),
+      outputTokens: Math.max(retained.outputTokens, accumulated.outputTokens),
+      cost: Math.max(retained.cost, accumulated.cost),
+      costKnown: retained.costKnown && accumulated.costKnown,
+    },
+    llmCallCount: Math.max(retainedUsageEvents, accumulated.llmCallCount),
+    hasUsage: true,
   };
 }
 
@@ -587,9 +610,12 @@ const CostSection = memo(function CostSection({
   );
 });
 
+const EMPTY_CHILD_USAGE: TaskUsageTotalsByTaskId = {};
+
 function getCollaborativeAgentTotals(
   childTasks: Task[],
   childEvents: TaskEvent[],
+  childUsageByTaskId: TaskUsageTotalsByTaskId = {},
 ): CollaborativeAgentTotals | null {
   if (childTasks.length === 0) return null;
   const eventsByTaskId = new Map<string, TaskEvent[]>();
@@ -599,25 +625,29 @@ function getCollaborativeAgentTotals(
     eventsByTaskId.set(event.taskId, list);
   }
 
+  let hasUsage = false;
+  const recoveredTaskIds = getRecoveredSynthesisTaskIds(childTasks);
   const rows = childTasks
     .slice()
     .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
     .map((task): CollaborativeAgentRow => {
       const taskEvents = eventsByTaskId.get(task.id) || [];
-      const statusKind = getCollaborativeAgentStatusKind(task);
-      const usage = getLatestUsageTotals(taskEvents);
+      const recovered = recoveredTaskIds.has(task.id);
+      const statusKind = recovered ? "warning" : getCollaborativeAgentStatusKind(task);
+      const agentUsage = getCollaborativeAgentUsage(taskEvents, childUsageByTaskId[task.id]);
+      hasUsage = hasUsage || agentUsage.hasUsage;
       const endMs = task.completedAt ?? task.updatedAt ?? task.createdAt;
       return {
         task,
         statusKind,
-        statusLabel: getCollaborativeAgentStatusLabel(statusKind, task),
+        statusLabel: recovered ? "Retried" : getCollaborativeAgentStatusLabel(statusKind, task),
+        recovered,
         eventCount: taskEvents.length,
         toolCallCount: taskEvents.filter(
           (event) => getEffectiveTaskEventType(event) === "tool_call",
         ).length,
-        llmCallCount: taskEvents.filter((event) => getEffectiveTaskEventType(event) === "llm_usage")
-          .length,
-        usage,
+        llmCallCount: agentUsage.llmCallCount,
+        usage: agentUsage.usage,
         durationMs: Math.max(0, endMs - task.createdAt),
       };
     });
@@ -628,7 +658,7 @@ function getCollaborativeAgentTotals(
   );
   const counts = rows.reduce(
     (acc, row) => {
-      acc[row.statusKind] += 1;
+      if (!row.recovered) acc[row.statusKind] += 1;
       acc.eventCount += row.eventCount;
       acc.toolCallCount += row.toolCallCount;
       acc.llmCallCount += row.llmCallCount;
@@ -657,6 +687,7 @@ function getCollaborativeAgentTotals(
   return {
     total: rows.length,
     ...counts,
+    hasUsage,
     wallDurationMs: Math.max(0, lastEndedAt - firstStartedAt),
     rows,
   };
@@ -822,6 +853,8 @@ interface RightPanelProps {
   hasActiveChildren?: boolean;
   childTasks?: Task[];
   childEvents?: TaskEvent[];
+  /** Cumulative usage per child task, independent of the capped childEvents. */
+  childUsageByTaskId?: TaskUsageTotalsByTaskId;
   onSelectTask?: (taskId: string) => void;
   onOpenSpreadsheetArtifact?: (path: string) => void;
   onOpenDocumentArtifact?: (path: string) => void;
@@ -830,6 +863,11 @@ interface RightPanelProps {
   rendererPerfLoggingEnabled?: boolean;
   /** Opt-in Appearance setting; the Cost section is hidden by default. */
   costReceiptEnabled?: boolean;
+  /** Opt-in Appearance setting; sub-agent runtime/token/cost totals are hidden by default. */
+  subAgentStatsEnabled?: boolean;
+  /** Bumped to expand the Sub Agents section and scroll it into view. */
+  subAgentsFocusRequest?: number;
+  onSubAgentsFocusConsumed?: () => void;
   highlightOutputPath?: string | null;
   onHighlightConsumed?: () => void;
 }
@@ -1545,6 +1583,8 @@ const CollaborativeAgentsSection = memo(
     totals,
     toggleSection,
     onSelectTask,
+    statsEnabled = false,
+    sectionRef,
     rendererPerfLoggingEnabled,
   }: {
     visible: boolean;
@@ -1552,6 +1592,8 @@ const CollaborativeAgentsSection = memo(
     totals: CollaborativeAgentTotals | null;
     toggleSection: () => void;
     onSelectTask?: (taskId: string) => void;
+    statsEnabled?: boolean;
+    sectionRef?: React.Ref<HTMLDivElement>;
     rendererPerfLoggingEnabled?: boolean;
   }) {
     recordRendererRender(
@@ -1573,7 +1615,10 @@ const CollaborativeAgentsSection = memo(
       .join(" · ");
 
     return (
-      <div className="right-panel-section cli-section collaborative-agents-section">
+      <div
+        ref={sectionRef}
+        className="right-panel-section cli-section collaborative-agents-section"
+      >
         <button
           type="button"
           className="cli-section-header"
@@ -1593,46 +1638,48 @@ const CollaborativeAgentsSection = memo(
         </button>
         {expanded && (
           <div className="cli-section-content">
-            <div className="collab-agents-summary-card">
-              <div className="collab-agents-summary-head">
-                <strong>{totals.total} background agents</strong>
-                <span>{statusSummary || "No status yet"}</span>
+            {statsEnabled ? (
+              <div className="collab-agents-summary-card">
+                <div className="collab-agents-summary-head">
+                  <strong>{totals.total} background agents</strong>
+                  <span>{statusSummary || "No status yet"}</span>
+                </div>
+                <div className="collab-agents-stat-grid" aria-label="Sub-agent totals">
+                  <div>
+                    <span>Runtime</span>
+                    <strong>{formatRightPanelDuration(totals.wallDurationMs)}</strong>
+                  </div>
+                  <div>
+                    <span>Events</span>
+                    <strong>{formatCompactNumber(totals.eventCount)}</strong>
+                  </div>
+                  <div>
+                    <span>Tools</span>
+                    <strong>{formatCompactNumber(totals.toolCallCount)}</strong>
+                  </div>
+                  <div>
+                    <span>LLM calls</span>
+                    <strong>{formatCompactNumber(totals.llmCallCount)}</strong>
+                  </div>
+                  <div>
+                    <span>Tokens</span>
+                    <strong>{formatCompactNumber(totalTokens)}</strong>
+                  </div>
+                  <div>
+                    <span>Cost</span>
+                    <strong
+                      title={
+                        totals.costKnown
+                          ? undefined
+                          : "Some models used here have no known price, so the real cost is higher."
+                      }
+                    >
+                      {totals.hasUsage ? formatCost(totals.cost, totals.costKnown) : "—"}
+                    </strong>
+                  </div>
+                </div>
               </div>
-              <div className="collab-agents-stat-grid" aria-label="Sub-agent totals">
-                <div>
-                  <span>Runtime</span>
-                  <strong>{formatRightPanelDuration(totals.wallDurationMs)}</strong>
-                </div>
-                <div>
-                  <span>Events</span>
-                  <strong>{formatCompactNumber(totals.eventCount)}</strong>
-                </div>
-                <div>
-                  <span>Tools</span>
-                  <strong>{formatCompactNumber(totals.toolCallCount)}</strong>
-                </div>
-                <div>
-                  <span>LLM calls</span>
-                  <strong>{formatCompactNumber(totals.llmCallCount)}</strong>
-                </div>
-                <div>
-                  <span>Tokens</span>
-                  <strong>{formatCompactNumber(totalTokens)}</strong>
-                </div>
-                <div>
-                  <span>Cost</span>
-                  <strong
-                    title={
-                      totals.costKnown
-                        ? undefined
-                        : "Some models used here have no known price, so the real cost is higher."
-                    }
-                  >
-                    {formatCost(totals.cost, totals.costKnown)}
-                  </strong>
-                </div>
-              </div>
-            </div>
+            ) : null}
             <div className="collab-agents-list">
               {totals.rows.map((row) => (
                 <div key={row.task.id} className={`collab-agent-summary-row ${row.statusKind}`}>
@@ -1643,13 +1690,15 @@ const CollaborativeAgentsSection = memo(
                       )}
                     </span>
                   </div>
-                  <div className="collab-agent-summary-meta">
-                    <span>{formatRightPanelDuration(row.durationMs)}</span>
-                    <span>{formatCompactNumber(row.toolCallCount)} tools</span>
-                    <span>
-                      {formatCompactNumber(row.usage.inputTokens + row.usage.outputTokens)} tok
-                    </span>
-                  </div>
+                  {statsEnabled ? (
+                    <div className="collab-agent-summary-meta">
+                      <span>{formatRightPanelDuration(row.durationMs)}</span>
+                      <span>{formatCompactNumber(row.toolCallCount)} tools</span>
+                      <span>
+                        {formatCompactNumber(row.usage.inputTokens + row.usage.outputTokens)} tok
+                      </span>
+                    </div>
+                  ) : null}
                   <span className={`collab-agent-summary-status ${row.statusKind}`}>
                     {row.statusLabel}
                   </span>
@@ -1675,6 +1724,7 @@ const CollaborativeAgentsSection = memo(
     prev.expanded === next.expanded &&
     prev.totals === next.totals &&
     prev.onSelectTask === next.onSelectTask &&
+    prev.statsEnabled === next.statsEnabled &&
     prev.rendererPerfLoggingEnabled === next.rendererPerfLoggingEnabled,
 );
 
@@ -1686,6 +1736,7 @@ function RightPanelComponent({
   hasActiveChildren = false,
   childTasks = [],
   childEvents = [],
+  childUsageByTaskId = EMPTY_CHILD_USAGE,
   onSelectTask,
   onOpenSpreadsheetArtifact,
   onOpenDocumentArtifact,
@@ -1693,6 +1744,9 @@ function RightPanelComponent({
   onOpenWebArtifact,
   rendererPerfLoggingEnabled = false,
   costReceiptEnabled = false,
+  subAgentStatsEnabled = false,
+  subAgentsFocusRequest = 0,
+  onSubAgentsFocusConsumed,
   highlightOutputPath = null,
   onHighlightConsumed,
 }: RightPanelProps) {
@@ -2165,12 +2219,29 @@ function RightPanelComponent({
   );
   const showChecklistSection = !!stableChecklistState && stableChecklistState.items.length > 0;
   const collaborativeAgentTotals = useMemo(
-    () => getCollaborativeAgentTotals(childTasks, childEvents),
-    [childTasks, childEvents],
+    () => getCollaborativeAgentTotals(childTasks, childEvents, childUsageByTaskId),
+    [childTasks, childEvents, childUsageByTaskId],
   );
   const showCollaborativeAgentsSection = Boolean(
     collaborativeAgentTotals && (childTasks.length > 0 || task?.agentConfig?.collaborativeMode),
   );
+  const collaborativeAgentsSectionRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!subAgentsFocusRequest) return;
+    if (showCollaborativeAgentsSection) {
+      setExpandedSections((prev) =>
+        prev.collaborativeAgents ? prev : { ...prev, collaborativeAgents: true },
+      );
+      requestAnimationFrame(() => {
+        collaborativeAgentsSectionRef.current?.scrollIntoView({
+          block: "start",
+          behavior: "smooth",
+        });
+      });
+    }
+    // Consume either way so reopening the panel later doesn't jump here again.
+    onSubAgentsFocusConsumed?.();
+  }, [onSubAgentsFocusConsumed, showCollaborativeAgentsSection, subAgentsFocusRequest]);
   const taskCostSummary = useMemo(() => getTaskCostSummary(events), [events]);
   const [taskCostEstimate, setTaskCostEstimate] = useState<TaskCostEstimate | null>(null);
   const taskIdForCost = task?.id;
@@ -2409,6 +2480,8 @@ function RightPanelComponent({
         totals={collaborativeAgentTotals}
         toggleSection={() => toggleSection("collaborativeAgents")}
         onSelectTask={onSelectTask}
+        statsEnabled={subAgentStatsEnabled}
+        sectionRef={collaborativeAgentsSectionRef}
         rendererPerfLoggingEnabled={rendererPerfLoggingEnabled}
       />
 
@@ -2511,12 +2584,16 @@ function areRightPanelPropsEqual(prev: RightPanelProps, next: RightPanelProps): 
     prev.hasActiveChildren === next.hasActiveChildren &&
     areChildTaskStatsEqual(prev.childTasks || [], next.childTasks || []) &&
     areTaskEventListsEqual(prev.childEvents || [], next.childEvents || []) &&
+    prev.childUsageByTaskId === next.childUsageByTaskId &&
     prev.onOpenSpreadsheetArtifact === next.onOpenSpreadsheetArtifact &&
     prev.onOpenDocumentArtifact === next.onOpenDocumentArtifact &&
     prev.onOpenPresentationArtifact === next.onOpenPresentationArtifact &&
     prev.onOpenWebArtifact === next.onOpenWebArtifact &&
     prev.rendererPerfLoggingEnabled === next.rendererPerfLoggingEnabled &&
     prev.costReceiptEnabled === next.costReceiptEnabled &&
+    prev.subAgentStatsEnabled === next.subAgentStatsEnabled &&
+    prev.subAgentsFocusRequest === next.subAgentsFocusRequest &&
+    prev.onSubAgentsFocusConsumed === next.onSubAgentsFocusConsumed &&
     prev.highlightOutputPath === next.highlightOutputPath &&
     prev.onSelectTask === next.onSelectTask &&
     prev.onHighlightConsumed === next.onHighlightConsumed

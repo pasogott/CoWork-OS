@@ -1,3 +1,9 @@
+import { closeBrowserTabViewsForTask } from "../browser/browser-tab-views";
+import { ComposerPredictionCoordinator } from "../agent/ComposerPredictionCoordinator";
+import {
+  COMPOSER_PREDICTION_CHANNEL,
+  COMPOSER_PREDICTION_CANCEL_CHANNEL,
+} from "../../shared/composer-predictions";
 import {
   readAuthorizedApprovalDraftPreview,
   readAuthorizedInlineApprovalDraftReview,
@@ -374,6 +380,11 @@ import {
 } from "../security/workspace-permission-manifest";
 import {
   validateInput,
+  CronJobCreateSchema,
+  CronJobIdSchema,
+  CronJobPatchSchema,
+  CronListOptionsSchema,
+  CronRunModeSchema,
   WorkspaceCreateSchema,
   TaskCreateSchema,
   TaskRenameSchema,
@@ -551,6 +562,9 @@ import {
 import { setupMemoryReviewHandlers } from "./memory-review-handlers";
 import { setupMemoryHealthHandlers } from "./memory-health-handlers";
 import { setupAnswerSurfaceHandlers } from "./answer-surface-handlers";
+import { AnswerDataError, readAnswerDataTable } from "../answer-surfaces/answer-data";
+import { AnswerToolDataStore } from "../answer-surfaces/AnswerToolDataStore";
+import { hasHiddenSegment } from "../../shared/answer-surfaces/data";
 import { answerImageNetworkContext } from "../answer-surfaces/network-context";
 import { configuredImageSearch } from "../answer-surfaces/web-image-search";
 import { AnswerImageService } from "../answer-surfaces/AnswerImageService";
@@ -577,7 +591,6 @@ import { AdaptiveStyleEngine } from "../memory/AdaptiveStyleEngine";
 import type { MemorySettings } from "../database/repositories";
 import { VoiceSettingsManager } from "../voice/voice-settings-manager";
 import { getVoiceService } from "../voice/VoiceService";
-import { EvalService } from "../eval/eval-repository-facades";
 import {
   createUniqueScopedTempWorkspaceDirectorySync,
   ensureTempWorkspaceDirectoryPathSync,
@@ -1163,8 +1176,6 @@ rateLimiter.configure(IPC_CHANNELS.TEAM_ITEM_CREATE, RATE_LIMIT_CONFIGS.limited)
 rateLimiter.configure(IPC_CHANNELS.TEAM_ITEM_UPDATE, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.TEAM_ITEM_DELETE, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.TEAM_ITEM_MOVE, RATE_LIMIT_CONFIGS.limited);
-rateLimiter.configure(IPC_CHANNELS.EVAL_RUN_SUITE, RATE_LIMIT_CONFIGS.limited);
-rateLimiter.configure(IPC_CHANNELS.EVAL_CREATE_CASE_FROM_TASK, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.WORK_SESSION_ROLLOUT_GET, RATE_LIMIT_CONFIGS.frequent);
 rateLimiter.configure(IPC_CHANNELS.WORK_SESSION_ROLLOUT_UPDATE, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.WORK_SESSION_METRICS_LIST, RATE_LIMIT_CONFIGS.frequent);
@@ -1556,6 +1567,96 @@ export async function setupIpcHandlers(
   const taskStore = new TaskStore(db);
   const workspaceStore = new WorkspaceStore(db);
   const taskEventRepo = new TaskEventRepository(db);
+  const composerPredictions = new ComposerPredictionCoordinator();
+  const predictionOwners = new Set<number>();
+  ipcMain.handle(COMPOSER_PREDICTION_CANCEL_CHANNEL, (event, requestId: string) => {
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!senderWindow || senderWindow !== computerUseMainWindow())
+      throw new Error("Predictions require the main app window");
+    if (typeof requestId !== "string" || !requestId || requestId.length > 200) return;
+    composerPredictions.cancel(event.sender.id, requestId);
+  });
+  ipcMain.handle(
+    COMPOSER_PREDICTION_CHANNEL,
+    async (
+      event,
+      request: import("../../shared/composer-predictions").ComposerPredictionRequest,
+    ) => {
+      const senderWindow = BrowserWindow.fromWebContents(event.sender);
+      if (!senderWindow || senderWindow !== computerUseMainWindow())
+        throw new Error("Predictions require the main app window");
+      if (!predictionOwners.has(event.sender.id)) {
+        const owner = event.sender.id;
+        predictionOwners.add(owner);
+        event.sender.once("destroyed", () => {
+          predictionOwners.delete(owner);
+          composerPredictions.cancelOwner(owner);
+        });
+      }
+      const taskId = validateInput(UUIDSchema, request?.taskId, "task ID");
+      if (typeof request?.revision !== "string" || request.revision.length > 200) return null;
+      const task = await taskRepo.findById(taskId);
+      if (!task || task.status !== "completed") return null;
+      const events = await taskEventRepo.findByTaskIdAndTypes(
+        taskId,
+        ["user_message", "assistant_message", "task_completed"],
+        20,
+      );
+      const { predictionRevision } = await import("../../shared/composer-predictions");
+      if (predictionRevision(events) !== request.revision) return null;
+      if (
+        typeof request.requestId !== "string" ||
+        !request.requestId ||
+        request.requestId.length > 200
+      )
+        return null;
+      const { resolveComposerPredictionModel } = await import("../agent/composer-prediction-model");
+      const selection = resolveComposerPredictionModel(task);
+      const key = `${taskId}:${request.revision}:${selection.providerType}:${selection.modelId}`;
+      const prediction = await composerPredictions.request(
+        event.sender.id,
+        request.requestId,
+        key,
+        async (signal) => {
+          const queuedTask = await taskRepo.findById(taskId);
+          const queuedEvents = await taskEventRepo.findByTaskIdAndTypes(
+            taskId,
+            ["user_message", "assistant_message", "task_completed"],
+            20,
+          );
+          if (
+            signal.aborted ||
+            queuedTask?.status !== "completed" ||
+            predictionRevision(queuedEvents) !== request.revision
+          )
+            return null;
+          const provider = LLMProviderFactory.createProvider({
+            type: selection.providerType,
+            model: selection.modelId,
+          });
+          const { generateComposerPrediction } = await import("../agent/ComposerPredictionService");
+          return generateComposerPrediction(
+            task,
+            events,
+            request.revision,
+            provider,
+            selection.modelId,
+            signal,
+          );
+        },
+      );
+      const current = await taskRepo.findById(taskId);
+      const latestEvents = await taskEventRepo.findByTaskIdAndTypes(
+        taskId,
+        ["user_message", "assistant_message", "task_completed"],
+        20,
+      );
+      return current?.status === "completed" &&
+        predictionRevision(latestEvents) === request.revision
+        ? prediction
+        : null;
+    },
+  );
   const composerDraftRepo = new ComposerDraftRepository(db);
   const composerDraftAttachmentStore = new ComposerDraftAttachmentStore(
     path.join(getUserDataDir(), "composer-draft-attachments"),
@@ -1611,7 +1712,6 @@ export async function setupIpcHandlers(
   const teamRunRepo = new AgentTeamRunRepository(db);
   const teamItemRepo = new AgentTeamItemRepository(db);
   const teamThoughtRepo = new AgentTeamThoughtRepository(db);
-  const evalService = new EvalService(db);
   const taskLabelRepo = new TaskLabelRepository(db);
   const workingStateRepo = new WorkingStateRepository(db);
   const documentEditorSessionService = new DocumentEditorSessionService(
@@ -1719,7 +1819,7 @@ export async function setupIpcHandlers(
     listRootUserUpdates: (rootTaskId: string) => agentDaemon.listUserFollowUpMessages(rootTaskId),
     completeRootTask: async (taskId, status, summary, metadata) => {
       if (status === "failed") {
-        agentDaemon.failTask(taskId, summary, {
+        agentDaemon.failTask(taskId, metadata?.failureReason || summary, {
           resultSummary: summary,
         });
         return;
@@ -5681,6 +5781,8 @@ export async function setupIpcHandlers(
 
     // Cancel the task if it's running
     await agentDaemon.cancelTask(id);
+    // Its in-app browser pages (native tab views stay alive while hidden) go with it.
+    closeBrowserTabViewsForTask(id);
 
     // Best-effort cleanup of on-disk worktree resources before metadata deletion.
     if (existingTask?.worktreePath || existingTask?.worktreeBranch) {
@@ -6065,6 +6167,7 @@ export async function setupIpcHandlers(
           ...(validated.integrationMentions !== undefined
             ? { integrationMentions: validated.integrationMentions }
             : {}),
+          ...(validated.surfaceOrigin ? { surfaceOrigin: validated.surfaceOrigin } : {}),
         },
       );
       // If the message was queued for a running executor, the executor owns
@@ -10081,40 +10184,6 @@ export async function setupIpcHandlers(
     return agentDaemon.ensureCollaborativeRunForParentTask(validated) || null;
   });
 
-  // Eval Suites / Runs (Reliability Flywheel)
-  ipcMain.handle(IPC_CHANNELS.EVAL_LIST_SUITES, async (_, options?: { windowDays?: number }) => {
-    const windowDays =
-      typeof options?.windowDays === "number" && Number.isFinite(options.windowDays)
-        ? options.windowDays
-        : 30;
-    return {
-      suites: await evalService.listSuites(),
-      metrics: await evalService.getBaselineMetrics(windowDays),
-    };
-  });
-
-  ipcMain.handle(IPC_CHANNELS.EVAL_CREATE_CASE_FROM_TASK, async (_, data: { taskId: string }) => {
-    checkRateLimit(IPC_CHANNELS.EVAL_CREATE_CASE_FROM_TASK);
-    const taskId = validateInput(UUIDSchema, data?.taskId, "task ID");
-    return evalService.createCaseFromTask(taskId);
-  });
-
-  ipcMain.handle(IPC_CHANNELS.EVAL_GET_CASE, async (_, caseId: string) => {
-    const validated = validateInput(UUIDSchema, caseId, "eval case ID");
-    return evalService.getCase(validated);
-  });
-
-  ipcMain.handle(IPC_CHANNELS.EVAL_RUN_SUITE, async (_, suiteId: string) => {
-    checkRateLimit(IPC_CHANNELS.EVAL_RUN_SUITE);
-    const validated = validateInput(UUIDSchema, suiteId, "eval suite ID");
-    return evalService.runSuite(validated);
-  });
-
-  ipcMain.handle(IPC_CHANNELS.EVAL_GET_RUN, async (_, runId: string) => {
-    const validated = validateInput(UUIDSchema, runId, "eval run ID");
-    return evalService.getRun(validated);
-  });
-
   // Local operator controls for Phase 5 rollout, observability, and replay.
   // These handlers are renderer-local (the remote control plane has explicit
   // scope checks) and still validate all untrusted values before touching DB.
@@ -11074,6 +11143,51 @@ export async function setupIpcHandlers(
       imageSearch: configuredImageSearch,
     }),
     store: AnswerSurfaceStateStore,
+    // Tool results this task kept as data; only the task's own rows can be found.
+    loadToolData: async (taskId, handle, options) => {
+      const row = await AnswerToolDataStore.get(taskId, handle);
+      if (!row) throw new AnswerDataError(`No saved tool result ${handle} in this task`);
+      const limit = Math.max(
+        1,
+        Math.floor(options.maxCells / Math.max(1, row.table.columns.length)),
+      );
+      return {
+        ...row.table,
+        // Tool output (possibly web content), labelled as such under the answer.
+        file: `${row.toolName} output ${handle}`,
+        rows: row.table.rows.slice(0, limit),
+        truncated: row.table.truncated || row.table.rows.length > limit,
+      };
+    },
+    authorizeTaskView: (event, taskId) => {
+      authorizeTaskForEvent(event, taskId, "view");
+    },
+    // Answer data: exactly the named file in the task's own workspace (no fallbacks), after
+    // symlinks, outside hidden folders and the app's data folder, and allowed by the
+    // workspace's read policy, the same rules the agent's file tools follow.
+    loadDataSource: async (taskId, filePath, options) => {
+      const task = await taskRepo.findById(taskId);
+      const workspace = task ? await workspaceRepo.findById(task.workspaceId) : undefined;
+      if (!workspace?.path) throw new AnswerDataError("This task has no workspace folder");
+      const root = await fs.realpath(path.resolve(workspace.path));
+      const target = path.resolve(root, filePath);
+      const readPath = await fs.realpath(target).catch(() => {
+        throw new AnswerDataError(`File not found: ${filePath}`);
+      });
+      const relative = path.relative(root, readPath);
+      if (relative.startsWith("..") || path.isAbsolute(relative) || hasHiddenSegment(relative)) {
+        throw new AnswerDataError("Data files must be in the workspace, outside hidden folders");
+      }
+      const userData = await fs.realpath(getUserDataDir()).catch(() => getUserDataDir());
+      const fromUserData = path.relative(userData, readPath);
+      if (!fromUserData.startsWith("..") && !path.isAbsolute(fromUserData)) {
+        throw new AnswerDataError("CoWork's own data cannot be used as answer data");
+      }
+      if (evaluateWorkspaceFilesystemAccess(workspace, readPath, "read").decision !== "allow") {
+        throw new AnswerDataError("This workspace's settings do not allow reading that file");
+      }
+      return readAnswerDataTable(readPath, relative, options);
+    },
   });
 
   // PACT business agents: the renderer never receives a sign-in link; main opens it in the
@@ -11862,21 +11976,24 @@ function setupCronHandlers(): void {
   });
 
   // List all jobs
-  ipcMain.handle(IPC_CHANNELS.CRON_LIST_JOBS, async (_, opts?: { includeDisabled?: boolean }) => {
+  ipcMain.handle(IPC_CHANNELS.CRON_LIST_JOBS, async (_, rawOpts?: unknown) => {
+    const opts = validateInput(CronListOptionsSchema, rawOpts, "cron list options");
     const service = getCronService();
     if (!service) return [];
     return service.list(opts);
   });
 
   // Get a single job
-  ipcMain.handle(IPC_CHANNELS.CRON_GET_JOB, async (_, id: string) => {
+  ipcMain.handle(IPC_CHANNELS.CRON_GET_JOB, async (_, rawId: unknown) => {
+    const id = validateInput(CronJobIdSchema, rawId, "cron job id");
     const service = getCronService();
     if (!service) return null;
     return service.get(id);
   });
 
   // Add a new job
-  ipcMain.handle(IPC_CHANNELS.CRON_ADD_JOB, async (_, jobData) => {
+  ipcMain.handle(IPC_CHANNELS.CRON_ADD_JOB, async (_, rawJobData: unknown) => {
+    const jobData = validateInput(CronJobCreateSchema, rawJobData, "scheduled task");
     const service = getCronService();
     if (!service) {
       return { ok: false, error: "Cron service not initialized" };
@@ -11885,7 +12002,9 @@ function setupCronHandlers(): void {
   });
 
   // Update an existing job
-  ipcMain.handle(IPC_CHANNELS.CRON_UPDATE_JOB, async (_, id: string, patch) => {
+  ipcMain.handle(IPC_CHANNELS.CRON_UPDATE_JOB, async (_, rawId: unknown, rawPatch: unknown) => {
+    const id = validateInput(CronJobIdSchema, rawId, "cron job id");
+    const patch = validateInput(CronJobPatchSchema, rawPatch, "scheduled task update");
     const service = getCronService();
     if (!service) {
       return { ok: false, error: "Cron service not initialized" };
@@ -11894,7 +12013,8 @@ function setupCronHandlers(): void {
   });
 
   // Remove a job
-  ipcMain.handle(IPC_CHANNELS.CRON_REMOVE_JOB, async (_, id: string) => {
+  ipcMain.handle(IPC_CHANNELS.CRON_REMOVE_JOB, async (_, rawId: unknown) => {
+    const id = validateInput(CronJobIdSchema, rawId, "cron job id");
     const service = getCronService();
     if (!service) {
       return {
@@ -11907,7 +12027,9 @@ function setupCronHandlers(): void {
   });
 
   // Run a job immediately
-  ipcMain.handle(IPC_CHANNELS.CRON_RUN_JOB, async (_, id: string, mode?: "due" | "force") => {
+  ipcMain.handle(IPC_CHANNELS.CRON_RUN_JOB, async (_, rawId: unknown, rawMode?: unknown) => {
+    const id = validateInput(CronJobIdSchema, rawId, "cron job id");
+    const mode = validateInput(CronRunModeSchema, rawMode, "cron run mode");
     const service = getCronService();
     if (!service) {
       return { ok: false, error: "Cron service not initialized" };
@@ -11916,14 +12038,16 @@ function setupCronHandlers(): void {
   });
 
   // Get run history for a job
-  ipcMain.handle(IPC_CHANNELS.CRON_GET_RUN_HISTORY, async (_, id: string) => {
+  ipcMain.handle(IPC_CHANNELS.CRON_GET_RUN_HISTORY, async (_, rawId: unknown) => {
+    const id = validateInput(CronJobIdSchema, rawId, "cron job id");
     const service = getCronService();
     if (!service) return null;
     return service.getRunHistory(id);
   });
 
   // Clear run history for a job
-  ipcMain.handle(IPC_CHANNELS.CRON_CLEAR_RUN_HISTORY, async (_, id: string) => {
+  ipcMain.handle(IPC_CHANNELS.CRON_CLEAR_RUN_HISTORY, async (_, rawId: unknown) => {
+    const id = validateInput(CronJobIdSchema, rawId, "cron job id");
     const service = getCronService();
     if (!service) return false;
     return service.clearRunHistory(id);

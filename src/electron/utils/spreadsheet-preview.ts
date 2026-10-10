@@ -9,7 +9,10 @@ import {
   type SpreadsheetPreviewValueType,
 } from "../../shared/spreadsheet-preview";
 import { formatSpreadsheetValue } from "../../shared/spreadsheet-number-format";
-import { coerceNumericText } from "./document-generators/spreadsheet-cells";
+import {
+  coerceNumericText,
+  coerceSpreadsheetDateText,
+} from "./document-generators/spreadsheet-cells";
 import { computeWorkbookFormulaResults } from "./document-generators/spreadsheet-formulas";
 
 const MAX_PREVIEW_ROWS = 2000;
@@ -65,7 +68,7 @@ function readPlainValue(value: unknown): {
 /**
  * The preview content of one cell: the raw value stays in `value` for editing and saving, and
  * `displayValue` carries what Excel shows (number format applied, or the formula text when the
- * file has no cached result for it).
+ * file has no cached result for it and CoWork cannot compute one).
  */
 function readPreviewCell(cell: ExcelJS.Cell, date1904: boolean): PreviewCellContent {
   const raw = cell.value;
@@ -75,10 +78,13 @@ function readPreviewCell(cell: ExcelJS.Cell, date1904: boolean): PreviewCellCont
       ? cell.numFmt
       : undefined;
   const base = { ...(formula ? { formula } : {}), ...(numFmt ? { numFmt } : {}) };
-  if (formula && isFormulaValue(raw) && (raw.result === null || raw.result === undefined)) {
+  // Cell.result, not raw.result: ExcelJS leaves a 0 or FALSE result out of the cell value, which
+  // would show a zero total as its formula.
+  const result: unknown = isFormulaValue(raw) ? cell.result : undefined;
+  if (formula && isFormulaValue(raw) && (result === null || result === undefined)) {
     return { ...base, value: "", displayValue: `=${formula}`, formulaPending: true };
   }
-  const plain = readPlainValue(isFormulaValue(raw) ? raw.result : raw);
+  const plain = readPlainValue(isFormulaValue(raw) ? result : raw);
   const display =
     plain.typed === undefined ? null : formatSpreadsheetValue(plain.typed, numFmt, { date1904 });
   return {
@@ -106,6 +112,11 @@ export async function buildSpreadsheetPreviewFromFile(
   await workbook.xlsx.load(
     (await readDocumentArchiveBuffer(filePath)) as unknown as ExcelJS.Buffer,
   );
+
+  // Files saved by tools that drop cached formula results (openpyxl, for one) would show every
+  // formula as text: compute the missing results for display. The file is not changed, and
+  // results the file already carries are shown as saved.
+  computeWorkbookFormulaResults(workbook, { onlyMissing: true });
 
   const date1904 = Boolean(workbook.properties?.date1904);
   const sheets = workbook.worksheets.map((worksheet) => {
@@ -166,8 +177,23 @@ export async function buildSpreadsheetPreviewFromFile(
   };
 }
 
-function parseDelimitedRows(text: string, delimiter: string): string[][] {
+/**
+ * Parses delimited text into rows, dropping blank lines. With `maxRows`, rows past the
+ * limit are counted (see `onRowsSkipped`) but not kept, so memory stays bounded.
+ */
+export function parseDelimitedRows(
+  text: string,
+  delimiter: string,
+  options: { maxRows?: number; onRowsSkipped?: (count: number) => void } = {},
+): string[][] {
   const rows: string[][] = [];
+  const maxRows = options.maxRows ?? Infinity;
+  let skipped = 0;
+  const commit = (entry: string[]) => {
+    if (entry.length === 1 && entry[0] === "") return;
+    if (rows.length < maxRows) rows.push(entry);
+    else skipped += 1;
+  };
   let row: string[] = [];
   let cell = "";
   let inQuotes = false;
@@ -205,7 +231,7 @@ function parseDelimitedRows(text: string, delimiter: string): string[][] {
     if (ch === "\n" || ch === "\r") {
       row.push(cell);
       cell = "";
-      rows.push(row);
+      commit(row);
       row = [];
       if (ch === "\r" && text[i + 1] === "\n") i += 2;
       else i += 1;
@@ -218,10 +244,11 @@ function parseDelimitedRows(text: string, delimiter: string): string[][] {
 
   if (cell.length > 0 || row.length > 0) {
     row.push(cell);
-    rows.push(row);
+    commit(row);
   }
 
-  return rows.filter((entry) => !(entry.length === 1 && entry[0] === ""));
+  if (skipped > 0) options.onRowsSkipped?.(skipped);
+  return rows;
 }
 
 function escapeDelimitedCell(value: string, delimiter: string): string {
@@ -395,15 +422,25 @@ function isPreviewCellUnchanged(
 }
 
 /**
- * The value written for an edited cell. Formulas get no cached result here (it is computed
- * before writing, and never the formula text); numeric text becomes a number with the same rules
- * as create_spreadsheet. displayValue, numFmt and valueType are display data and are ignored.
+ * Writes an edited cell. Formulas get no cached result here (it is computed before writing, and
+ * never the formula text); numeric text becomes a number and date text a date with the same
+ * rules as create_spreadsheet, judged by the workbook cell's own number format. displayValue,
+ * numFmt and valueType from the preview are display data and are ignored.
  */
-function getPreviewCellInput(cell: SpreadsheetPreviewCell): ExcelJS.CellValue {
+function writePreviewCellInput(target: ExcelJS.Cell, cell: SpreadsheetPreviewCell): void {
   const formula = previewFormula(cell);
-  if (formula) return { formula } as ExcelJS.CellFormulaValue;
+  if (formula) {
+    target.value = { formula } as ExcelJS.CellFormulaValue;
+    return;
+  }
   const value = typeof cell.value === "string" ? cell.value : String(cell.value ?? "");
-  return value === "" ? null : coerceNumericText(value);
+  const date = value === "" ? null : coerceSpreadsheetDateText(value, target.numFmt);
+  if (date) {
+    target.value = date.date;
+    if (date.numFmt) target.numFmt = date.numFmt;
+    return;
+  }
+  target.value = value === "" ? null : coerceNumericText(value);
 }
 
 export async function writeSpreadsheetPreviewToFile(
@@ -448,7 +485,8 @@ export async function writeSpreadsheetPreviewToFile(
         const cellPreview = rowPreview[columnIndex - 1];
         const cell = row.getCell(columnIndex);
         if (cellPreview && isPreviewCellUnchanged(cellPreview, cell, date1904)) continue;
-        cell.value = cellPreview ? getPreviewCellInput(cellPreview) : null;
+        if (cellPreview) writePreviewCellInput(cell, cellPreview);
+        else cell.value = null;
       }
       row.commit();
     }

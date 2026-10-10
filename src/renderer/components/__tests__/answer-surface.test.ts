@@ -1,8 +1,10 @@
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { ANSWER_SURFACE_EXAMPLES } from "../../../shared/answer-surfaces/prompt";
 import { AnswerSurfaceBlock } from "../AnswerSurface/AnswerSurface";
-import { parseAssistantMessageSegments } from "../AssistantMessageContent";
+import { SurfaceActionProvider } from "../AnswerSurface/SurfaceActions";
+import { AssistantMessageContent, parseAssistantMessageSegments } from "../AssistantMessageContent";
 import { cleanAssistantMessageForDisplay } from "../MainContent/markdown-normalization";
 
 const ROAST = JSON.stringify({
@@ -77,6 +79,109 @@ describe("AnswerSurfaceBlock", () => {
   it("shows a placeholder while the block is still streaming", () => {
     expect(render({ closed: false, streaming: true })).toContain("Building interactive answer");
     expect(render({ closed: false })).toContain("did not finish");
+  });
+
+  it("renders the themed calculator with the result first and editable inputs", () => {
+    const html = render({ source: JSON.stringify(ANSWER_SURFACE_EXAMPLES.calculator) });
+    expect(html).toContain("as-theme-ocean");
+    expect(html).toContain("as-card-gradient");
+    expect(html.indexOf("as-hero")).toBeLessThan(html.indexOf("as-number"));
+    expect(html).toContain("$754");
+    expect(html).toMatch(/<input[^>]*inputMode="decimal"[^>]*value="50,000"/);
+    expect(html).toContain("as-metrics-colorful");
+    expect(html).toContain("--as-fill:40%");
+  });
+
+  it("renders tabs, a timeline and tags for a plan", () => {
+    const html = render({ source: JSON.stringify(ANSWER_SURFACE_EXAMPLES.plan) });
+    expect(html).toContain('role="tablist"');
+    expect(html).toContain('aria-selected="true"');
+    expect(html).toContain("Tram 28 to Alfama");
+    // Only the active tab's panel is rendered.
+    expect(html).not.toContain("LX Factory");
+    expect(html).toContain("as-timeline-marker");
+    expect(html).toContain("as-tag as-tone-orange");
+  });
+
+  it("renders metric deltas with their direction and sentiment", () => {
+    const html = render({ source: JSON.stringify(ANSWER_SURFACE_EXAMPLES.chart) });
+    expect(html).toContain("as-delta as-delta-good");
+    expect(html).toContain("No growth");
+    expect(html).toContain("$76,123");
+  });
+
+  it("renders progress bars and rings from values", () => {
+    const html = render({
+      source: JSON.stringify({
+        type: "stack",
+        children: [
+          { type: "progress", items: [{ label: "Saved", value: 40 }] },
+          { type: "progress", style: "ring", items: [{ label: "Steps", value: 50, max: 200 }] },
+        ],
+      }),
+    });
+    expect(html).toContain("--as-fill:0.4");
+    expect(html).toContain('role="progressbar"');
+    expect(html).toContain("as-ring-fill");
+  });
+
+  it("renders action buttons, enabled only where the view offers actions", () => {
+    const source = JSON.stringify({
+      type: "stack",
+      children: [
+        { type: "slider", id: "n", label: "People", min: 1, max: 8, default: 4 },
+        { type: "button", label: "Book for {{n}}", action: { prompt: "Book a table for {{n}}" } },
+        { type: "button", label: "Menu", style: "secondary", action: { open: "https://a.com" } },
+      ],
+    });
+    const alone = render({ source });
+    expect(alone).toContain("Book for 4");
+    expect(alone).toContain("as-action-button-secondary");
+    expect(alone.match(/disabled=""/g)?.length).toBe(2);
+    const offered = renderToStaticMarkup(
+      React.createElement(SurfaceActionProvider, {
+        onSendPrompt: () => {},
+        onOpenLink: () => {},
+        children: React.createElement(AnswerSurfaceBlock, {
+          source,
+          surfaceKey: "s1-x-0",
+          closed: true,
+        }),
+      }),
+    );
+    expect(offered).not.toContain('disabled=""');
+    // The message itself is only shown in the app's confirmation, never sent on render.
+    expect(offered).not.toContain("Book a table for 4");
+  });
+
+  it("renders bullet and numbered lists", () => {
+    const html = render({
+      source: JSON.stringify({
+        type: "stack",
+        children: [
+          { type: "list", title: "Tips", items: ["Book early", { text: "Walk", icon: "map" }] },
+          { type: "list", style: "number", items: ["Arrive", "Eat"] },
+        ],
+      }),
+    });
+    expect(html).toContain("as-bullet-bullet");
+    expect(html).toContain("Book early");
+    expect(html).toContain("<ol");
+    expect(html).toContain(">2</span>");
+  });
+
+  it("shows a note instead of a block a later message replaces", () => {
+    const message =
+      'Step\n```cowork-ui\n{"type":"card","children":[{"type":"text","text":"Live"}]}\n```';
+    const superseded = renderToStaticMarkup(
+      React.createElement(AssistantMessageContent, {
+        message,
+        markdownComponents: {},
+        surfacesSuperseded: true,
+      }),
+    );
+    expect(superseded).toContain("Interactive answer updated below.");
+    expect(superseded).not.toContain("answer-surface");
   });
 
   it("does not render invalid blocks", () => {

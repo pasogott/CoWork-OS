@@ -2,8 +2,8 @@
   "id": "security-harness-regressions-2026-05-14",
   "title": "Security harness regression coverage",
   "source": {
-    "incident": "uncommitted-web-preview-access",
-    "taskId": "uncommitted-web-preview-access"
+    "incident": "browser-mcp-unreviewed-stdio-launch",
+    "taskId": "browser-mcp-unreviewed-stdio-launch"
   },
   "categories": [
     {
@@ -304,6 +304,42 @@
       }
     },
     {
+      "id": "browser-mcp-unreviewed-stdio-launch-confirmed-fix",
+      "prompt": "Regression guard for Reject browser custom stdio launch plans and stdio environment mutations before persistence: replay the original failure class and verify the fix still holds.",
+      "assertions": {
+        "securityHarnessRule": "confirmed-fix",
+        "expectedNoSilentBypass": true,
+        "expectedFindingFingerprint": "browser-mcp-unreviewed-stdio-launch",
+        "expectedPolicyGate": "production_policy",
+        "requiresProofArtifact": true,
+        "executableTest": "src/host/services/__tests__/browser-mcp-methods.test.ts"
+      }
+    },
+    {
+      "id": "csf-9962c722759f2797a5f0725c-confirmed-fix",
+      "prompt": "Regression guard for Confine LaTeX interpreters to restricted filesystem and offline private output: replay the original failure class and verify the fix still holds.",
+      "assertions": {
+        "securityHarnessRule": "confirmed-fix",
+        "expectedNoSilentBypass": true,
+        "expectedFindingFingerprint": "csf-9962c722759f2797a5f0725c",
+        "expectedPolicyGate": "production_policy",
+        "requiresProofArtifact": true,
+        "executableTest": "src/electron/utils/__tests__/latex-compiler.test.ts"
+      }
+    },
+    {
+      "id": "gateway-attachment-destination-boundary-confirmed-fix",
+      "prompt": "Regression guard for Confine inbound attachment persistence and honor workspace write policy across buffer, local and downloaded sources: replay the original failure class and verify the fix still holds.",
+      "assertions": {
+        "securityHarnessRule": "confirmed-fix",
+        "expectedNoSilentBypass": true,
+        "expectedFindingFingerprint": "gateway-attachment-destination-boundary",
+        "expectedPolicyGate": "production_policy",
+        "requiresProofArtifact": true,
+        "executableTest": "src/electron/gateway/__tests__/router-attachment-boundary.test.ts"
+      }
+    },
+    {
       "id": "harness-read-only-workers-20260914-confirmed-fix",
       "prompt": "Regression guard for Prevent read-only review workers from inheriting parent bypass, shell, write, or external action permissions: replay the original failure class and verify the fix still holds.",
       "assertions": {
@@ -324,6 +360,19 @@
         "expectedPolicyGate": "production_policy",
         "requiresProofArtifact": true,
         "executableTest": "src/electron/agent/tools/__tests__/registry-tool-catalog.test.ts"
+      }
+    },
+    {
+      "id": "qa-server-subprocess-policy-confirmed-fix",
+      "prompt": "Regression guard for QA server subprocesses preserve administrator network policy, backend requirements, fresh task authority, and guarded local listeners: replay the original failure class and verify the fix still holds.",
+      "assertions": {
+        "securityHarnessRule": "confirmed-fix",
+        "expectedNoSilentBypass": true,
+        "expectedFindingFingerprint": "qa-server-subprocess-policy",
+        "expectedPolicyGate": "production_policy",
+        "requiresProofArtifact": true,
+        "executableTest": "src/electron/agent/qa/__tests__/qa-server-policy.test.ts",
+        "liveTest": "src/electron/agent/qa/__tests__/qa-server-policy-live.test.ts"
       }
     },
     {

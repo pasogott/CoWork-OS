@@ -1,3 +1,6 @@
+import { normalizeSurfaceActionUrl, visibleSurfaceText } from "./actions";
+import { isToolDataSource } from "./data";
+import { richEmbedsToPlainText } from "../rich-embeds";
 import {
   initialSurfaceState,
   nodeChildren,
@@ -6,9 +9,14 @@ import {
   type AnswerSurfaceNode,
   type AnswerSurfaceSpec,
   type AnswerSurfaceState,
+  type AnswerSurfaceValue,
 } from "./schema";
 import {
   buildSurfaceScope,
+  logicDependence,
+  resolveSurfaceLabels,
+  resolveSurfaceRows,
+  resolveSurfaceValues,
   formatControlValue,
   formatSurfaceValue,
   interpolateText,
@@ -56,6 +64,11 @@ export function answerSurfaceKey(source: string, occurrence: number): string {
   return `s1-${hashString(source.trim())}-${occurrence}`;
 }
 
+/** The saved-state key of an inline HTML surface, from its document source. */
+export function htmlSurfaceKey(source: string, occurrence = 0): string {
+  return `h1-${hashString(source.trim())}-${occurrence}`;
+}
+
 /** Splits an assistant message into text and ```cowork-ui parts, in order. */
 export function splitAnswerSurfaceBlocks(message: string): AnswerTextPart[] {
   const lines = String(message || "").split("\n");
@@ -96,12 +109,24 @@ export function hasAnswerSurfaceBlock(message: string): boolean {
     .some(isAnswerSurfaceFenceStart);
 }
 
+/**
+ * Marks text that would show a value only the surface's logic can compute. Plain text has
+ * no logic run (channels, the CLI, search), so such lines are left out instead of "—".
+ */
+const NEEDS_LOGIC = "\u0000needs-logic\u0000";
+
+type PlainContext = { dependsOnLogic: (value: AnswerSurfaceValue) => boolean };
+
 function plainLines(
   node: AnswerSurfaceNode,
   scope: SurfaceScope,
   state: AnswerSurfaceState,
+  ctx: PlainContext,
 ): string[] {
-  const text = (value: string) => interpolateText(value, scope);
+  const text = (value: string) =>
+    ctx.dependsOnLogic(value) ? NEEDS_LOGIC : interpolateText(value, scope);
+  const fmt = (value: AnswerSurfaceValue) =>
+    ctx.dependsOnLogic(value) ? NEEDS_LOGIC : formatSurfaceValue(value, scope);
   switch (node.type) {
     case "card": {
       const lines = [
@@ -109,11 +134,54 @@ function plainLines(
         node.title ? `**${text(node.title)}**` : "",
         node.subtitle ? text(node.subtitle) : "",
       ];
-      return [...lines, ...nodeChildren(node).flatMap((child) => plainLines(child, scope, state))];
+      return [
+        ...lines,
+        ...nodeChildren(node).flatMap((child) => plainLines(child, scope, state, ctx)),
+      ];
     }
     case "stack":
     case "grid":
-      return nodeChildren(node).flatMap((child) => plainLines(child, scope, state));
+      return nodeChildren(node).flatMap((child) => plainLines(child, scope, state, ctx));
+    case "tabs":
+      return node.tabs.flatMap((tab) => [
+        `**${text(tab.label)}**`,
+        ...tab.children.flatMap((child) => plainLines(child, scope, state, ctx)),
+      ]);
+    case "hero": {
+      let value = node.value === undefined ? "" : fmt(node.value);
+      let delta = node.delta === undefined ? "" : ` (${fmt(node.delta)})`;
+      if (value === NEEDS_LOGIC) value = "";
+      if (delta.includes(NEEDS_LOGIC)) delta = "";
+      return [
+        node.eyebrow ? text(node.eyebrow) : "",
+        value ? `**${text(node.title)}: ${value}**${delta}` : `**${text(node.title)}**`,
+        node.caption ? text(node.caption) : "",
+      ];
+    }
+    case "progress": {
+      const lines = node.items.map((item) => {
+        const value = fmt(item.value);
+        return `- ${text(item.label)}: ${value}${item.max !== undefined ? ` of ${item.max}` : ""}`;
+      });
+      return node.title ? [`**${text(node.title)}**`, ...lines] : lines;
+    }
+    case "timeline": {
+      const lines = node.items.map((item) => {
+        const time = item.time ? `${text(item.time)} — ` : "";
+        const detail = item.text ? `: ${text(item.text)}` : "";
+        const mark = item.status === "done" ? " ✓" : "";
+        return `- ${time}${text(item.title)}${detail}${mark}`;
+      });
+      return node.title ? [`**${text(node.title)}**`, ...lines] : lines;
+    }
+    case "tags":
+      return [node.items.map((item) => item.label).join(" · ")];
+    case "list": {
+      const lines = node.items.map(
+        (item, index) => `${node.style === "number" ? `${index + 1}.` : "-"} ${text(item.text)}`,
+      );
+      return node.title ? [`**${text(node.title)}**`, ...lines] : lines;
+    }
     case "heading":
       return [`**${text(node.text)}**`];
     case "text":
@@ -124,6 +192,12 @@ function plainLines(
     case "divider":
     case "copy":
       return [];
+    case "button": {
+      // A message button means nothing outside the app; a link is still useful.
+      const link = "open" in node.action ? normalizeSurfaceActionUrl(node.action.open) : null;
+      const label = visibleSurfaceText(text(node.label));
+      return link && label ? [`${label}: ${link.url}`] : [];
+    }
     case "media_list":
       return node.items.map((item) => {
         const detail = item.text ? ` — ${text(item.text)}` : "";
@@ -139,21 +213,23 @@ function plainLines(
       return node.caption ? [...lines, text(node.caption)] : lines;
     }
     case "metrics":
-      return node.items.map(
-        (item) => `- ${text(item.label)}: ${formatSurfaceValue(item.value, scope)}`,
-      );
+      return node.items.map((item) => {
+        const delta = item.delta === undefined ? "" : ` (${fmt(item.delta)})`;
+        return `- ${text(item.label)}: ${fmt(item.value)}${delta}`;
+      });
     case "values": {
-      const lines = node.items.map(
-        (item) => `- ${text(item.label)}: ${formatSurfaceValue(item.value, scope)}`,
-      );
+      const lines = node.items.map((item) => `- ${text(item.label)}: ${fmt(item.value)}`);
       return node.title ? [`**${text(node.title)}**`, ...lines] : lines;
     }
     case "table": {
       const header = `| ${node.columns.join(" | ")} |`;
       const divider = `| ${node.columns.map(() => "---").join(" | ")} |`;
-      const rows = node.rows.map(
+      // Plain text has no logic run, so bound rows are left out rather than shown blank.
+      const tableRows = resolveSurfaceRows(node.rows, {});
+      if (tableRows.length === 0) return node.caption ? [text(node.caption)] : [];
+      const rows = tableRows.map(
         (row) =>
-          `| ${node.columns.map((_column, index) => (row[index] === undefined ? "" : formatSurfaceValue(row[index], scope))).join(" | ")} |`,
+          `| ${node.columns.map((_column, index) => (row[index] === undefined ? "" : fmt(row[index]))).join(" | ")} |`,
       );
       return [header, divider, ...rows];
     }
@@ -166,11 +242,12 @@ function plainLines(
       return node.title ? [`**${node.title}**`, ...lines] : lines;
     }
     case "chart": {
-      const lines = node.labels.map((labelText, index) => {
+      const labels = resolveSurfaceLabels(node.labels, {});
+      const lines = labels.map((labelText, index) => {
         const values = node.series
           .map((series) => {
-            const value = series.values[index];
-            const formatted = value === undefined ? "—" : formatSurfaceValue(value, scope);
+            const value = resolveSurfaceValues(series.values, {})[index];
+            const formatted = value === undefined ? "—" : fmt(value);
             return node.series.length > 1 ? `${series.name} ${formatted}` : formatted;
           })
           .join(", ");
@@ -179,7 +256,8 @@ function plainLines(
       return node.title ? [`**${text(node.title)}**`, ...lines] : lines;
     }
     case "stepper":
-    case "slider": {
+    case "slider":
+    case "number": {
       const value = typeof state[node.id] === "number" ? (state[node.id] as number) : node.default;
       return [`${node.label}: ${formatControlValue(value, node)}`];
     }
@@ -194,6 +272,15 @@ function plainLines(
   }
 }
 
+/** Says where the missing numbers live, naming data files (tool handles mean nothing here). */
+function plainLogicNote(spec: AnswerSurfaceSpec): string {
+  const sources = Object.values(spec.data ?? {}).map((source) =>
+    isToolDataSource(source) ? "a tool result" : source,
+  );
+  const from = sources.length > 0 ? ` from ${[...new Set(sources)].join(", ")}` : "";
+  return `_Some values in this answer are calculated${from} in the CoWork app._`;
+}
+
 /** A readable text version of a surface, for channels, the CLI, search and older clients. */
 export function answerSurfaceToPlainText(
   spec: AnswerSurfaceSpec,
@@ -201,36 +288,44 @@ export function answerSurfaceToPlainText(
 ): string {
   const current = state ?? initialSurfaceState(spec);
   const scope = buildSurfaceScope(spec, current);
-  return plainLines(spec.root, scope, current)
-    .filter((line) => line.trim().length > 0)
-    .join("\n");
+  const dependsOnLogic = logicDependence(spec);
+  const lines = plainLines(spec.root, scope, current, { dependsOnLogic }).filter(
+    (line) => line.trim().length > 0 && !line.includes(NEEDS_LOGIC),
+  );
+  if (spec.logic) lines.push(plainLogicNote(spec));
+  return lines.join("\n");
 }
 
 /**
- * Replaces every ```cowork-ui block with its text version. Invalid or unfinished blocks
- * are dropped rather than shown as raw JSON.
+ * The readable text of an assistant message for every surface without the desktop
+ * renderer (channel gateways, the CLI, notifications, the tray, search): ```cowork-ui
+ * blocks become their text version (invalid or unfinished ones are dropped rather than
+ * shown as raw JSON), and rich embeds (frames, HTML pages, videos) become one line each.
  */
 export function toPlainAnswerText(message: string): string {
-  if (!hasAnswerSurfaceBlock(message)) return message;
-  return splitAnswerSurfaceBlocks(message)
+  if (!hasAnswerSurfaceBlock(message)) return richEmbedsToPlainText(message);
+  const withSurfaces = splitAnswerSurfaceBlocks(message)
     .map((part) => {
       if (part.kind === "text") return part.text;
       if (!part.closed) return "";
       const parsed = parseAnswerSurfaceSource(part.source);
       return parsed.ok ? answerSurfaceToPlainText(parsed.spec) : "";
     })
-    .join("\n")
+    .join("\n");
+  return richEmbedsToPlainText(withSurfaces)
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
 /** Removes every ```cowork-ui block, finished or not, for previews that show prose only. */
 export function withoutAnswerSurfaceBlocks(message: string): string {
-  if (!hasAnswerSurfaceBlock(message)) return message;
-  return splitAnswerSurfaceBlocks(message)
+  // Rich embeds (frames, pages) become one line too, so a preview never shows raw HTML.
+  if (!hasAnswerSurfaceBlock(message)) return richEmbedsToPlainText(message);
+  const prose = splitAnswerSurfaceBlocks(message)
     .filter((part) => part.kind === "text")
     .map((part) => (part.kind === "text" ? part.text : ""))
-    .join("\n")
+    .join("\n");
+  return richEmbedsToPlainText(prose)
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -249,6 +344,7 @@ export function summarizeSurfaceChanges(
     switch (node.type) {
       case "stepper":
       case "slider":
+      case "number":
         if (state[node.id] !== defaults[node.id] && typeof state[node.id] === "number") {
           lines.push(`${node.label}: ${formatControlValue(state[node.id] as number, node)}`);
         }

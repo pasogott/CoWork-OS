@@ -231,6 +231,10 @@ const EventTriggersPanel = lazySettingsPanel(
   "EventTriggersPanel",
 );
 const BriefingPanel = lazySettingsPanel(() => import("./BriefingPanel"), "BriefingPanel");
+const BrowserSettingsPanel = lazySettingsPanel(
+  () => import("./BrowserSettingsPanel"),
+  "BrowserSettingsPanel",
+);
 const WebAccessSettingsPanel = lazySettingsPanel(
   () => import("./WebAccessSettingsPanel"),
   "WebAccessSettingsPanel",
@@ -296,11 +300,13 @@ type SettingsTab =
   | "briefing"
   | "subconscious"
   | "access"
-  | "webaccess";
+  | "webaccess"
+  | "browser";
 
 // A missing browser service should produce an explanation, never an endless loading panel.
 const BROWSER_SETTINGS_METHODS: Partial<Record<SettingsTab, string[]>> = {
   appearance: [],
+  browser: ["getBrowserSettings", "saveBrowserSettings"],
   personality: ["getPersonalityConfigV2", "getRelationshipStats", "savePersonalityConfigV2"],
   aimodels: ["getLLMSettings", "saveLLMSettings"],
   jev: ["testJevProvider"],
@@ -373,6 +379,8 @@ interface SettingsProps {
   onHomeNextActionsEnabledChange: (enabled: boolean) => void;
   costReceiptEnabled: boolean;
   onCostReceiptEnabledChange: (enabled: boolean) => void;
+  subAgentStatsEnabled: boolean;
+  onSubAgentStatsEnabledChange: (enabled: boolean) => void;
   initialTab?: SettingsTab;
   /** Bumped to open the Memory tab's Review view (also when Settings is already open). */
   memoryReviewRequest?: number;
@@ -867,6 +875,12 @@ const sidebarItems: SidebarItem[] = [
     icon: <Monitor {...I} />,
   },
   {
+    tab: "browser",
+    label: "Browser",
+    group: "Advanced",
+    icon: <Globe {...I} />,
+  },
+  {
     tab: "extensions",
     label: "Extensions",
     group: "Advanced",
@@ -944,7 +958,7 @@ const secondaryChannelSearchTerms: Partial<Record<SecondaryChannel, string[]>> =
   bluebubbles: ["bluebubbles", "blue bubbles"],
 };
 
-const sidebarSearchEntries: Partial<Record<SettingsTab, SidebarSearchEntry[]>> = {
+export const sidebarSearchEntries: Partial<Record<SettingsTab, SidebarSearchEntry[]>> = {
   addtools: [{ terms: ["add tools", "discover tools", "plugins", "connectors", "skills", "mcp"] }],
   appearance: [
     {
@@ -957,6 +971,9 @@ const sidebarSearchEntries: Partial<Record<SettingsTab, SidebarSearchEntry[]>> =
         "ui density",
         "developer logging",
         "onboarding",
+        "composer",
+        "predictions",
+        "next message",
       ],
     },
   ],
@@ -1094,6 +1111,8 @@ const sidebarSearchEntries: Partial<Record<SettingsTab, SidebarSearchEntry[]>> =
       terms: ["identity", "contacts", "crm", "contact identity"],
       target: { tab: "integrations", integrationsSubTab: "identity" },
     },
+  ],
+  customize: [
     {
       terms: [
         "feature packs",
@@ -1341,6 +1360,8 @@ export function Settings({
   onHomeNextActionsEnabledChange,
   costReceiptEnabled,
   onCostReceiptEnabledChange,
+  subAgentStatsEnabled,
+  onSubAgentStatsEnabledChange,
   initialTab = "appearance",
   memoryReviewRequest = 0,
   focusAutomation,
@@ -4733,52 +4754,61 @@ export function Settings({
 
       {jevProvider === "typesafe" ? (
         <div style={{ marginTop: "12px" }}>
-          <label className="settings-label">TypeSafe API key</label>
-          <input
-            type="password"
-            className="settings-input"
-            placeholder={
-              jevTypesafeKeyConfigured
-                ? "Stored TypeSafe key configured; enter a replacement"
-                : "TypeSafe API key"
-            }
-            value={jevTypesafeApiKey}
-            onChange={(event) => {
-              setJevTypesafeApiKey(event.target.value);
-              if (event.target.value) {
-                setJevTypesafeKeyConfigured(true);
-                setJevTypesafeClearKey(false);
+          <div className="settings-field">
+            <label htmlFor="jev-typesafe-api-key">TypeSafe API key</label>
+            <input
+              id="jev-typesafe-api-key"
+              type="password"
+              className="settings-input"
+              placeholder={
+                jevTypesafeKeyConfigured
+                  ? "Stored TypeSafe key configured; enter a replacement"
+                  : "TypeSafe API key"
               }
-            }}
-          />
-          {jevTypesafeKeyConfigured && (
-            <button
-              type="button"
-              className="button-secondary"
-              style={{ marginTop: "8px" }}
-              onClick={() => {
-                setJevTypesafeApiKey("");
-                setJevTypesafeKeyConfigured(false);
-                setJevTypesafeClearKey(true);
+              value={jevTypesafeApiKey}
+              onChange={(event) => {
+                setJevTypesafeApiKey(event.target.value);
+                if (event.target.value) {
+                  setJevTypesafeKeyConfigured(true);
+                  setJevTypesafeClearKey(false);
+                }
               }}
-            >
-              Clear saved TypeSafe key
-            </button>
-          )}
-          <label className="settings-label settings-label--spaced">TypeSafe base URL</label>
-          <input
-            className="settings-input"
-            placeholder="https://api.typesafe.ai"
-            value={jevTypesafeBaseUrl}
-            onChange={(event) => setJevTypesafeBaseUrl(event.target.value)}
-          />
-          <label className="settings-label settings-label--spaced">Jev model</label>
-          <input
-            className="settings-input"
-            placeholder="jev-latest"
-            value={jevTypesafeModel}
-            onChange={(event) => setJevTypesafeModel(event.target.value)}
-          />
+            />
+            {jevTypesafeKeyConfigured && (
+              <button
+                type="button"
+                className="button-secondary"
+                style={{ marginTop: "8px" }}
+                onClick={() => {
+                  setJevTypesafeApiKey("");
+                  setJevTypesafeKeyConfigured(false);
+                  setJevTypesafeClearKey(true);
+                }}
+              >
+                Clear saved TypeSafe key
+              </button>
+            )}
+          </div>
+          <div className="settings-field">
+            <label htmlFor="jev-typesafe-base-url">TypeSafe base URL</label>
+            <input
+              id="jev-typesafe-base-url"
+              className="settings-input"
+              placeholder="https://api.typesafe.ai"
+              value={jevTypesafeBaseUrl}
+              onChange={(event) => setJevTypesafeBaseUrl(event.target.value)}
+            />
+          </div>
+          <div className="settings-field">
+            <label htmlFor="jev-typesafe-model">Jev model</label>
+            <input
+              id="jev-typesafe-model"
+              className="settings-input"
+              placeholder="jev-latest"
+              value={jevTypesafeModel}
+              onChange={(event) => setJevTypesafeModel(event.target.value)}
+            />
+          </div>
           <p className="settings-hint">
             See the{" "}
             <a href="https://docs.typesafe.ai/api" target="_blank" rel="noopener noreferrer">
@@ -9163,6 +9193,8 @@ export function Settings({
                   onHomeNextActionsEnabledChange={onHomeNextActionsEnabledChange}
                   costReceiptEnabled={costReceiptEnabled}
                   onCostReceiptEnabledChange={onCostReceiptEnabledChange}
+                  subAgentStatsEnabled={subAgentStatsEnabled}
+                  onSubAgentStatsEnabledChange={onSubAgentStatsEnabledChange}
                   onShowOnboarding={onShowOnboarding}
                   onboardingCompletedAt={onboardingCompletedAt}
                 />
@@ -9544,6 +9576,8 @@ export function Settings({
                   <ChronicleSettingsCard />
                   <ComputerUseSettings />
                 </div>
+              ) : activeTab === "browser" ? (
+                <BrowserSettingsPanel workspaceId={workspaceId} />
               ) : activeTab === "access" ? (
                 <div className="more-channels-panel">
                   <div className="more-channels-header">

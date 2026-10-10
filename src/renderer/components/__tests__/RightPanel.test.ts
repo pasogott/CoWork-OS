@@ -78,6 +78,7 @@ describe("RightPanel checklist rendering", () => {
   it("renders collaborative sub-agent totals in the right panel", () => {
     const markup = renderToStaticMarkup(
       React.createElement(RightPanel, {
+        subAgentStatsEnabled: true,
         task: {
           id: "task-1",
           status: "completed",
@@ -151,6 +152,122 @@ describe("RightPanel checklist rendering", () => {
     expect(markup).toContain("$0.015");
     expect(markup).toContain("Bug and Regression Risk Review");
     expect(markup).toContain("Needs review");
+  });
+
+  it("hides sub-agent stats unless the Appearance setting is on", () => {
+    const markup = renderToStaticMarkup(
+      React.createElement(RightPanel, {
+        task: {
+          id: "task-1",
+          status: "completed",
+          title: "Collaborative review",
+          prompt: "Prompt",
+          agentConfig: { collaborativeMode: true },
+        } as Any,
+        workspace: null,
+        events: [] as Any,
+        childTasks: [
+          {
+            id: "child-1",
+            parentTaskId: "task-1",
+            agentType: "sub",
+            status: "completed",
+            title: "Market research",
+            prompt: "Research",
+            createdAt: 1000,
+            updatedAt: 3000,
+            completedAt: 3000,
+          },
+        ] as Any,
+        childEvents: [] as Any,
+      }),
+    );
+
+    expect(markup).toContain("Sub Agents");
+    expect(markup).toContain("Market research");
+    expect(markup).not.toContain("background agents");
+    expect(markup).not.toContain("LLM calls");
+    expect(markup).not.toContain(" tok");
+  });
+
+  it("uses cumulative child usage when the capped event list no longer has usage events", () => {
+    const childTasks = [
+      {
+        id: "child-1",
+        parentTaskId: "task-1",
+        agentType: "sub",
+        status: "executing",
+        title: "Market research",
+        prompt: "Research",
+        createdAt: 1000,
+        updatedAt: 3000,
+      },
+      {
+        id: "child-2",
+        parentTaskId: "task-1",
+        agentType: "sub",
+        status: "executing",
+        title: "Pricing review",
+        prompt: "Review",
+        createdAt: 2000,
+        updatedAt: 3000,
+      },
+    ] as Any;
+    const render = (childEvents: unknown[], childUsageByTaskId?: unknown) =>
+      renderToStaticMarkup(
+        React.createElement(RightPanel, {
+          task: {
+            id: "task-1",
+            status: "executing",
+            title: "Collaborative plan",
+            prompt: "Prompt",
+            agentConfig: { collaborativeMode: true },
+          } as Any,
+          workspace: null,
+          events: [] as Any,
+          childTasks,
+          childEvents: childEvents as Any,
+          childUsageByTaskId: childUsageByTaskId as Any,
+          subAgentStatsEnabled: true,
+        }),
+      );
+    // Only structural events survive the cap; the usage events were evicted.
+    const cappedEvents = [
+      {
+        id: "evt-tool",
+        taskId: "child-1",
+        timestamp: 2900,
+        schemaVersion: 2,
+        type: "tool_call",
+        payload: { tool: "read_file" },
+      },
+    ];
+
+    const withAccumulated = render(cappedEvents, {
+      "child-1": {
+        inputTokens: 60_000,
+        outputTokens: 8_000,
+        cost: 0.006,
+        costKnown: true,
+        llmCallCount: 10,
+        countedEventKeys: new Set(),
+      },
+      "child-2": {
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0.002,
+        costKnown: false,
+        llmCallCount: 4,
+        countedEventKeys: new Set(),
+      },
+    });
+    expect(withAccumulated).toContain("68K");
+    expect(withAccumulated).toMatch(/LLM calls<\/span><strong>14</);
+    expect(withAccumulated).toContain("$0.0080+");
+
+    const withoutUsage = render(cappedEvents);
+    expect(withoutUsage).toMatch(/Cost<\/span><strong[^>]*>—</);
+    expect(withoutUsage).not.toContain("$0<");
   });
 
   it("renders the latest session checklist state and verification nudge", () => {

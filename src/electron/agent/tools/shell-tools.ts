@@ -3,6 +3,7 @@ import { spawn, ChildProcess, execSync } from "child_process";
 import * as path from "path";
 import * as os from "os";
 import { existsSync } from "fs";
+import * as fsp from "fs/promises";
 import type { Workspace, CommandTerminationReason } from "../../../shared/types";
 import type { AgentDaemon } from "../daemon";
 import { GuardrailManager, containsShellControlOperator } from "../../guardrails/guardrail-manager";
@@ -18,11 +19,21 @@ import { applyNonInteractiveEnvDefaults } from "../sandbox/non-interactive-env";
 import { OUTPUT_TRUNCATED_MARKER, boundOutput } from "../sandbox/bounded-output";
 import { loadPolicies, type AdminPolicies } from "../../admin/policies";
 import { canEnableSubprocessNetwork } from "../../security/subprocess-network-policy";
+import { authorizationFingerprint } from "../../security/authorization-identity";
 import {
   RUN_COMMAND_DEFAULT_TIMEOUT_MS,
   RUN_COMMAND_MAX_TIMEOUT_MS,
 } from "../run-command-timeouts";
 import { createLogger } from "../../utils/logger";
+import {
+  describeFormulaCacheRestore,
+  restoreXlsxFormulaCaches,
+} from "../../utils/document-generators/spreadsheet-formula-cache";
+import {
+  findChangedWorkbooks,
+  snapshotWorkbooks,
+  type WorkbookSnapshot,
+} from "../../utils/document-generators/spreadsheet-workbook-changes";
 
 import { isLikelyNetworkShellCommand } from "../../../shared/shell-network";
 import {
@@ -77,7 +88,12 @@ type RunCommandResult = {
   truncated?: boolean;
   terminationReason?: CommandTerminationReason;
   hint?: string;
+  /** Formula results restored in workbooks the command saved without them (see runCommand). */
+  workbookNotes?: string[];
 };
+
+/** Workbooks restored after one command; more are left as the command saved them. */
+const MAX_RESTORED_WORKBOOKS = 10;
 
 /**
  * Strip ANSI/VT control sequences and normalize line endings produced by the
@@ -776,24 +792,10 @@ export class ShellTools {
   }
 
   private getShellAccessScopeFingerprint(workspace: Workspace): string {
-    const permissions = workspace.permissions || ({} as Workspace["permissions"]);
-    return JSON.stringify({
+    return authorizationFingerprint({
       workspaceId: workspace.id,
       workspacePath: workspace.path,
-      shell: permissions.shell,
-      read: permissions.read,
-      write: permissions.write,
-      delete: permissions.delete,
-      network: permissions.network,
-      accessSandboxMode: permissions.accessSandboxMode,
-      accessApprovalPolicy: permissions.accessApprovalPolicy,
-      sandboxType: permissions.sandboxType,
-      accessNetworkMode: permissions.accessNetworkMode,
-      accessDomainRules: permissions.accessDomainRules,
-      accessWorkspaceRoots: permissions.accessWorkspaceRoots,
-      accessFilesystemRules: permissions.accessFilesystemRules,
-      allowedPaths: permissions.allowedPaths,
-      unrestrictedFileAccess: permissions.unrestrictedFileAccess,
+      permissions: workspace.permissions,
     });
   }
 
@@ -1409,7 +1411,7 @@ export class ShellTools {
         .catch(() => undefined);
     };
     let launch: BackgroundProcessLaunch | null = null;
-    if (shouldSandboxCommand) {
+    if (shouldSandboxCommand || !this.shouldAllowShellNetwork(policies)) {
       const sandbox = await this.acquireCommandSandbox(command, {
         cwd,
         policies,
@@ -1650,8 +1652,55 @@ export class ShellTools {
     },
   ): Promise<RunCommandResult> {
     const { cwd, policies, beforeEffect } = await this.authorizeCommand(command, options);
+    const workbooks = await snapshotWorkbooks(command, cwd, [cwd, this.workspace.path]);
     const result = await this.runAuthorizedCommand(command, cwd, policies, beforeEffect, options);
-    return withLongRunningCommandHint(command, result);
+    return withLongRunningCommandHint(
+      command,
+      await this.restoreWorkbookFormulaResults(workbooks, result),
+    );
+  }
+
+  /**
+   * Scripts that edit workbooks (openpyxl above all) keep formulas but drop their cached results
+   * on save, so previews and data-only readers show "=D2*E2" instead of values. After a command
+   * finishes, compute the missing results of the workbooks it created or changed and write them
+   * into the file in place, leaving formulas and formatting as saved. Only files the workspace
+   * may write are touched; the result says what was restored and what still has no result.
+   */
+  private async restoreWorkbookFormulaResults(
+    snapshot: WorkbookSnapshot,
+    result: RunCommandResult,
+  ): Promise<RunCommandResult> {
+    // A stopped command may have left a half-written file behind.
+    if (result.terminationReason && result.terminationReason !== "normal") return result;
+    if (this.workspace.permissions?.write === false) return result;
+    let changed: string[];
+    try {
+      changed = await findChangedWorkbooks(snapshot);
+    } catch (error) {
+      log.warn("Could not check workbooks changed by a command:", error);
+      return result;
+    }
+    const notes: string[] = [];
+    for (const file of changed.slice(0, MAX_RESTORED_WORKBOOKS)) {
+      try {
+        const realPath = await fsp.realpath(file);
+        if (
+          evaluateWorkspaceFilesystemAccess(this.workspace, realPath, "write").decision !== "allow"
+        ) {
+          continue;
+        }
+        const restore = await restoreXlsxFormulaCaches(realPath);
+        const relative = path.relative(this.workspace.path, file);
+        const label =
+          relative && !relative.startsWith("..") && !path.isAbsolute(relative) ? relative : file;
+        const note = describeFormulaCacheRestore(label, restore);
+        if (note) notes.push(note);
+      } catch (error) {
+        log.warn(`Could not restore formula results in ${file}:`, error);
+      }
+    }
+    return notes.length > 0 ? { ...result, workbookNotes: notes } : result;
   }
 
   /**
@@ -1702,7 +1751,14 @@ export class ShellTools {
 
     const networkCommand = isLikelyNetworkShellCommand(command);
     const policies = loadPolicies();
-    const runtimePolicy = JSON.stringify(policies.runtime);
+    const policyFingerprint = (policy: AdminPolicies) =>
+      authorizationFingerprint({
+        version: policy.version,
+        updatedAt: policy.updatedAt,
+        runtime: policy.runtime,
+      });
+    const runtimePolicy = policyFingerprint(policies);
+    const policyVersion = process.env.COWORK_ACCESS_POLICY_VERSION || "boundary";
     const beforeEffect = async () => {
       const checkScope = () => {
         if (options?.signal?.aborted) throw new Error("Command execution cancelled before effect");
@@ -1714,7 +1770,8 @@ export class ShellTools {
           !effective ||
           this.getShellAccessScopeFingerprint(effective) !== approvedScope ||
           this.getShellAccessScopeFingerprint(this.workspace) !== approvedScope ||
-          JSON.stringify(loadPolicies().runtime) !== runtimePolicy
+          policyFingerprint(loadPolicies()) !== runtimePolicy ||
+          (process.env.COWORK_ACCESS_POLICY_VERSION || "boundary") !== policyVersion
         )
           throw new Error(
             "Shell authority changed after command admission; request approval again.",
@@ -1759,8 +1816,11 @@ export class ShellTools {
         );
       }
     }
-    const networkRequiresApproval =
-      networkCommand && this.workspace.permissions.accessNetworkMode === "on-request";
+    // Shell text cannot prove that arbitrary scripts, dynamic imports, or child
+    // processes stay offline. Even the macOS no-network sandbox permits local
+    // connections that a proxy can relay. Require invocation-specific consent
+    // for every shell command under an on-request network profile.
+    const networkRequiresApproval = this.workspace.permissions.accessNetworkMode === "on-request";
 
     // Check if command is trusted (auto-approve without user confirmation)
     const trustCheck = GuardrailManager.isCommandTrusted(command);
@@ -1768,7 +1828,8 @@ export class ShellTools {
     const approvalMode: RunCommandApprovalMode =
       BuiltinToolsSettingsManager.getRunCommandApprovalMode();
     const safeForAutoApproval = this.isAutoApprovalSafe(command);
-    const bundleEligible = approvalMode === "single_bundle" && safeForAutoApproval;
+    const bundleEligible =
+      !networkRequiresApproval && approvalMode === "single_bundle" && safeForAutoApproval;
     let approved = false;
     const signature = this.getCommandSignature(command);
     const now = Date.now();
@@ -1778,6 +1839,9 @@ export class ShellTools {
     const backgroundNotice = background
       ? " It keeps running in the background until it is stopped or the task is cancelled."
       : "";
+    const approvalDescription = networkRequiresApproval
+      ? "Approve this shell command and its potential network access for this invocation. Shell scripts can access the network even when the command text does not show it."
+      : "Review the shell command below before approving.";
 
     if (typedAuthorizationAvailable) {
       // The daemon is the single execution authority.  In-scope commands are
@@ -1787,14 +1851,14 @@ export class ShellTools {
       approved = await authorizeToolActionWithFallback(this.daemon, this.taskId, {
         toolName: "run_command",
         approvalType: "run_command",
-        description: `Review the shell command below before approving.${backgroundNotice}`,
+        description: approvalDescription + backgroundNotice,
         details: {
           command,
           cwd,
           ...(background ? { background: true } : { timeout: options?.timeout || DEFAULT_TIMEOUT }),
           approvalMode,
           bundleScope: bundleEligible ? "safe_commands_in_this_task" : undefined,
-          network: networkCommand,
+          network: networkCommand || networkRequiresApproval,
         },
         // The daemon's auto-approve path matches trusted rules by bare command
         // prefix, so `git status; rm -rf ~/Documents` matches `git` and is
@@ -1802,6 +1866,9 @@ export class ShellTools {
         // same guards the legacy branches below apply; they must gate the
         // typed path too, or they are dead code in every shipping build.
         allowAutoApprove: safeForAutoApproval && !networkRequiresApproval,
+        ...(networkRequiresApproval
+          ? { requireExplicitApproval: true, noStandingApproval: true }
+          : {}),
         signal: options?.signal,
       });
     } else if (!networkRequiresApproval && bundleEligible && this.isBundleApprovalActive(now)) {
@@ -1851,7 +1918,7 @@ export class ShellTools {
           "run_command",
           (bundleEligible
             ? "Single approval bundle for this task: subsequent safe commands may run without another prompt until you deny or the task ends."
-            : "Review the shell command below before approving.") + backgroundNotice,
+            : approvalDescription) + backgroundNotice,
           {
             command,
             cwd,
@@ -1860,8 +1927,18 @@ export class ShellTools {
               : { timeout: options?.timeout || DEFAULT_TIMEOUT }),
             approvalMode,
             bundleScope: bundleEligible ? "safe_commands_in_this_task" : undefined,
+            network: networkCommand || networkRequiresApproval,
           },
-          { signal: options?.signal },
+          {
+            signal: options?.signal,
+            ...(networkRequiresApproval
+              ? {
+                  allowAutoApprove: false,
+                  requireExplicitApproval: true,
+                  noStandingApproval: true,
+                }
+              : {}),
+          },
         );
 
         if (approved && signature) {

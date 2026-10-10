@@ -1,5 +1,6 @@
 import { TEAMS_CONVERSATION_REFERENCE_SCHEMA } from "../gateway/TeamsConversationReferenceStore";
 import { CHANNEL_DECISION_SCHEMA } from "../gateway/ChannelDecisionStore";
+import { BROWSER_HISTORY_SCHEMA_SQL } from "./BrowserHistoryRepository";
 import { NOTIFICATION_INBOX_SCHEMA } from "../notifications/NotificationInboxStore";
 import { BOT_NOTIFICATION_SCHEMA } from "../notifications/BotNotificationStore";
 import {
@@ -8,6 +9,7 @@ import {
 } from "../automation/responsibility-store";
 import { SCHEDULER_LEASE_SCHEMA } from "../automation/scheduler-lease-store";
 import { ANSWER_SURFACE_STATE_SCHEMA } from "../answer-surfaces/answer-surface-state-sql";
+import { ANSWER_TOOL_DATA_SCHEMA } from "../answer-surfaces/tool-data-sql";
 import { DISPATCH_BUDGET_SCHEMA } from "../automation/dispatch-budget-store";
 import Database from "better-sqlite3";
 import path from "path";
@@ -886,6 +888,7 @@ export class DatabaseManager {
       ${DISPATCH_BUDGET_SCHEMA}
       ${SCHEDULER_LEASE_SCHEMA}
       ${ANSWER_SURFACE_STATE_SCHEMA}
+      ${ANSWER_TOOL_DATA_SCHEMA}
       ${BOT_RESPONSIBILITY_SCHEMA}
       ${BOT_NOTIFICATION_SCHEMA}
       ${NOTIFICATION_INBOX_SCHEMA}
@@ -6741,6 +6744,12 @@ export class DatabaseManager {
         CREATE INDEX IF NOT EXISTS idx_acp_tasks_assignee_status
           ON acp_tasks(assignee_id, status, updated_at DESC);
       `);
+    } catch {
+      // Table or indexes already exist, ignore
+    }
+    try {
+      // In-app browser history (URLs and titles only), per browser profile.
+      this.db.exec(BROWSER_HISTORY_SCHEMA_SQL);
     } catch {
       // Table or indexes already exist, ignore
     }

@@ -1,5 +1,7 @@
 import { lazy, Suspense } from "react";
 import { InlineHtmlPreview, InlineHtmlSourcePreview } from "./InlineHtmlPreview";
+// Shared with the plain-text fallback, so both agree on what counts as a rendered page.
+import { getRenderableHtmlTitle, looksLikeRenderableHtml } from "../../shared/rich-embeds";
 import { InlineVideoPreview } from "./InlineVideoPreview";
 import { normalizeInlineLists, unwrapMarkdownCodeBlocks } from "../utils/markdown-inline-lists";
 import { sanitizeToolCallTextFromAssistant } from "../../shared/tool-call-text-sanitizer";
@@ -19,6 +21,8 @@ type AssistantMessageContentProps = {
   taskId?: string;
   /** The message is a draft still being generated. */
   streaming?: boolean;
+  /** A later message in this turn repeats its interactive answer; show a note instead. */
+  surfacesSuperseded?: boolean;
 };
 
 type VideoDirective = {
@@ -438,33 +442,6 @@ function parseFrameDirective(
   };
 }
 
-function getRenderableHtmlTitle(html: string): string | undefined {
-  const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleMatch?.[1]
-    ?.replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (title) return title;
-
-  const headingMatch = html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i);
-  const heading = headingMatch?.[1]
-    ?.replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return heading || undefined;
-}
-
-function looksLikeRenderableHtml(html: string): boolean {
-  const trimmed = html.trim();
-  if (trimmed.length < 80) return false;
-  if (
-    !/<(?:!doctype|html|head|body|form|style|script|input|textarea|select|button)\b/i.test(trimmed)
-  ) {
-    return false;
-  }
-  return /<(?:form|input|textarea|select|button)\b/i.test(trimmed) || /<html\b/i.test(trimmed);
-}
-
 export function parseAssistantMessageSegments(message: string): MessageSegment[] {
   const sanitized = sanitizeToolCallTextFromAssistant(String(message || "")).text;
   const lines = sanitized.split("\n");
@@ -614,6 +591,7 @@ export function AssistantMessageContent({
   onOpenViewer,
   taskId,
   streaming = false,
+  surfacesSuperseded = false,
 }: AssistantMessageContentProps) {
   const segments = parseAssistantMessageSegments(message);
 
@@ -631,6 +609,13 @@ export function AssistantMessageContent({
         }
 
         if (segment.type === "answer_surface") {
+          if (surfacesSuperseded) {
+            return (
+              <p key={`surface-${segment.key}`} className="as-superseded-note">
+                Interactive answer updated below.
+              </p>
+            );
+          }
           return (
             <AnswerSurfaceBlock
               key={`surface-${segment.key}`}
@@ -678,6 +663,7 @@ export function AssistantMessageContent({
             >
               <InlineHtmlSourcePreview
                 htmlContent={segment.html}
+                taskId={taskId}
                 title={segment.title}
                 className="inline-html-preview-embedded"
               />
@@ -693,6 +679,7 @@ export function AssistantMessageContent({
             >
               <InlineHtmlSourcePreview
                 htmlContent={segment.html}
+                taskId={taskId}
                 title={segment.directive.title}
                 className="inline-html-preview-embedded"
                 variant="frame"
@@ -725,6 +712,7 @@ export function AssistantMessageContent({
               <InlineHtmlPreview
                 filePath={segment.directive.path}
                 workspacePath={workspacePath}
+                taskId={taskId}
                 title={segment.directive.title}
                 onOpenViewer={onOpenViewer}
                 className="inline-html-preview-embedded"
@@ -750,6 +738,7 @@ export function AssistantMessageContent({
               <InlineHtmlPreview
                 filePath={segment.directive.path}
                 workspacePath={workspacePath}
+                taskId={taskId}
                 title={segment.directive.title}
                 onOpenViewer={onOpenViewer}
                 className="inline-html-preview-embedded"

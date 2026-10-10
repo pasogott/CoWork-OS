@@ -2168,6 +2168,9 @@ function isSupportedFollowUpOptions(options: unknown): boolean {
     "permissionMode",
     "shellAccess",
     "expectedTurnId",
+    // Accepted so approved answer actions can be sent, but not forwarded: the browser
+    // session does not carry the surface-action note (desktop only).
+    "surfaceOrigin",
   ]);
   if (Object.keys(options).some((key) => !allowed.has(key))) return false;
   if (options.returnOnAccepted !== undefined && options.returnOnAccepted !== true) return false;
@@ -2351,6 +2354,9 @@ function sanitizeBrowserAppearance(value: Record<string, unknown>): Partial<Appe
   }
   if (typeof value.costReceiptEnabled === "boolean") {
     result.costReceiptEnabled = value.costReceiptEnabled;
+  }
+  if (typeof value.subAgentStatsEnabled === "boolean") {
+    result.subAgentStatsEnabled = value.subAgentStatsEnabled;
   }
   if (typeof value.language === "string" && value.language.length <= 64) {
     result.language = value.language;

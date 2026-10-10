@@ -8,12 +8,15 @@ import {
   Paragraph,
   TextRun,
   HeadingLevel,
-  AlignmentType as _AlignmentType,
+  AlignmentType,
   Table,
   TableRow,
   TableCell,
   WidthType,
   BorderStyle,
+  Footer,
+  PageBreak,
+  PageNumber,
 } from "docx";
 import PDFDocument from "pdfkit";
 import * as mammoth from "mammoth";
@@ -22,7 +25,7 @@ import { parseMarkdownTable } from "../../utils/document-generators/markdown-tab
 import { needsUnicodeFont, resolvePdfFonts } from "../../utils/pdf-unicode-fonts";
 
 export interface ContentBlock {
-  type: string; // 'heading' | 'paragraph' | 'list' | 'table' | 'code'
+  type: string; // 'heading' | 'paragraph' | 'list' | 'table' | 'code' | 'page_break'
   text: string;
   level?: number; // For headings: 1-6
   items?: string[]; // For lists
@@ -47,6 +50,12 @@ export interface DocumentCreateReport {
   /** Blocks with nothing to write, by position in the request. */
   droppedBlocks: Array<{ index: number; type: string; reason: string }>;
   warnings: string[];
+  /** Pages in the written PDF; absent for other formats. */
+  pageCount?: number;
+  /** Whether the PDF is within `maxPages`; present only when a budget was given for a PDF. */
+  fittedToMaxPages?: boolean;
+  /** Index into PDF_FIT_LADDER of the layout the PDF was written with; 0 is the default layout. */
+  layoutLevel?: number;
 }
 
 /** A normalized block: every field a renderer reads is present. */
@@ -60,6 +69,10 @@ interface RenderBlock {
 }
 
 const LIST_MARKER = /^\s*(?:[-*+•]|\d+[.)])\s+/;
+
+/** Block type that ends the current page; it carries no text. */
+const PAGE_BREAK = "page_break";
+const PAGE_BREAK_ALIASES = new Set([PAGE_BREAK, "pagebreak", "page-break", "page break"]);
 
 function blockText(value: unknown): string {
   if (value === null || value === undefined) return "";
@@ -99,6 +112,7 @@ function normalizeBlock(raw: unknown): RenderBlock | { type: string; reason: str
   const rows = normalizeRows(block.rows);
   const level = Math.min(Math.max(Math.trunc(Number(block.level)) || 1, 1), 6);
 
+  if (PAGE_BREAK_ALIASES.has(type)) return renderBlock(PAGE_BREAK, {});
   if (type === "table") {
     if (rows.length > 0) return renderBlock(type, { rows });
     // A markdown table sent as text becomes a real table rather than pipes.
@@ -123,6 +137,139 @@ function normalizeBlock(raw: unknown): RenderBlock | { type: string; reason: str
   return { type, reason: "no text" };
 }
 
+const DOCUMENT_FORMATS = ["docx", "pdf"] as const;
+export type DocumentFormat = (typeof DOCUMENT_FORMATS)[number];
+
+/**
+ * The file name create_document writes. A name that already ends in the
+ * format's extension (in any case) is used exactly as given; a name without
+ * one gets it appended. The format may be left out when the name's
+ * extension states it. A name ending in the other format's extension is
+ * rejected instead of being written as "report.docx.pdf".
+ */
+export function resolveDocumentFilename(
+  filename: unknown,
+  format: unknown,
+): { filename: string; format: DocumentFormat } {
+  const name = typeof filename === "string" ? filename.trim() : "";
+  if (!name) throw new Error('Missing required "filename", for example "report.pdf".');
+  const extension = path.extname(name).slice(1).toLowerCase();
+  const nameFormat = DOCUMENT_FORMATS.find((candidate) => candidate === extension);
+  const requested = typeof format === "string" ? format.trim().toLowerCase() : "";
+  if (requested && !DOCUMENT_FORMATS.some((candidate) => candidate === requested)) {
+    throw new Error(`Unsupported document format "${String(format)}". Use "docx" or "pdf".`);
+  }
+  const resolved = (requested || nameFormat) as DocumentFormat | undefined;
+  if (!resolved) {
+    throw new Error(
+      `Missing "format" for "${name}". Use "docx" or "pdf", or end the filename in .docx or .pdf.`,
+    );
+  }
+  if (nameFormat && nameFormat !== resolved) {
+    const stem = name.slice(0, -(extension.length + 1));
+    throw new Error(
+      `Filename "${name}" ends in .${nameFormat} but format is "${resolved}". ` +
+        `Use filename "${stem}.${resolved}" for a ${resolved.toUpperCase()} file.`,
+    );
+  }
+  return { filename: nameFormat ? name : `${name}.${resolved}`, format: resolved };
+}
+
+function parseDocumentFormat(value: unknown, label: string): DocumentFormat {
+  const requested = typeof value === "string" ? value.trim().toLowerCase().replace(/^\./, "") : "";
+  const format = DOCUMENT_FORMATS.find((candidate) => candidate === requested);
+  if (!format) {
+    throw new Error(
+      `Unsupported document format ${JSON.stringify(value)} in "${label}". Use "docx" or "pdf".`,
+    );
+  }
+  return format;
+}
+
+/**
+ * The files one create_document call writes. Without `formats` this is the
+ * single file resolveDocumentFilename names. With `formats` every listed
+ * format is written from the same content: `filenames` (an array in the
+ * order of `formats`, or a map from format to name) names each file;
+ * otherwise each file is `<base>.<ext>`, where the base is `filename`
+ * without a .docx or .pdf extension.
+ */
+export function resolveDocumentOutputs(input: {
+  filename: unknown;
+  format?: unknown;
+  formats?: unknown;
+  filenames?: unknown;
+}): Array<{ filename: string; format: DocumentFormat }> {
+  if (input.formats === undefined || input.formats === null) {
+    return [resolveDocumentFilename(input.filename, input.format)];
+  }
+  if (!Array.isArray(input.formats) || input.formats.length === 0) {
+    throw new Error('"formats" must be a non-empty array such as ["docx", "pdf"].');
+  }
+  const formats: DocumentFormat[] = [];
+  for (const value of input.formats) {
+    const format = parseDocumentFormat(value, "formats");
+    if (!formats.includes(format)) formats.push(format);
+  }
+  if (input.format !== undefined && input.format !== null && input.format !== "") {
+    const format = parseDocumentFormat(input.format, "format");
+    if (!formats.includes(format)) {
+      throw new Error(
+        `"format" is "${format}" but "formats" is ${JSON.stringify(formats)}. List every format in "formats".`,
+      );
+    }
+  }
+
+  const named = input.filenames;
+  let outputs: Array<{ filename: string; format: DocumentFormat }>;
+  if (named !== undefined && named !== null) {
+    if (Array.isArray(named)) {
+      if (named.length !== formats.length) {
+        throw new Error(
+          `"filenames" has ${named.length} name(s) but "formats" has ${formats.length}; give one name per format, in the same order.`,
+        );
+      }
+      outputs = formats.map((format, index) => resolveDocumentFilename(named[index], format));
+    } else if (typeof named === "object") {
+      const byFormat = new Map<string, unknown>();
+      for (const [key, value] of Object.entries(named as Record<string, unknown>)) {
+        byFormat.set(parseDocumentFormat(key, "filenames"), value);
+      }
+      outputs = formats.map((format) => {
+        if (!byFormat.has(format)) {
+          throw new Error(`"filenames" has no name for the "${format}" file.`);
+        }
+        return resolveDocumentFilename(byFormat.get(format), format);
+      });
+    } else {
+      throw new Error(
+        '"filenames" must be an array of names in the order of "formats" or a map such as {"docx": "brief.docx", "pdf": "brief.pdf"}.',
+      );
+    }
+  } else {
+    const name = typeof input.filename === "string" ? input.filename.trim() : "";
+    if (!name) throw new Error('Missing required "filename", for example "report".');
+    const extension = path.extname(name).slice(1).toLowerCase();
+    const base = DOCUMENT_FORMATS.some((candidate) => candidate === extension)
+      ? name.slice(0, -(extension.length + 1))
+      : name;
+    if (!base.trim()) throw new Error(`Filename "${name}" has no name before its extension.`);
+    outputs = formats.map((format) => ({ filename: `${base}.${format}`, format }));
+  }
+
+  const seen = new Set<string>();
+  for (const output of outputs) {
+    const key = output.filename.toLowerCase();
+    if (seen.has(key)) {
+      throw new Error(
+        `Two of the requested formats would both be written to "${output.filename}".`,
+      );
+    }
+    seen.add(key);
+  }
+  return outputs;
+}
+
 export interface DocumentOptions {
   title?: string;
   author?: string;
@@ -136,6 +283,485 @@ export interface DocumentOptions {
     left?: number;
     right?: number;
   };
+  /** Print "N / M" centered in the footer of every page. */
+  pageNumbers?: boolean;
+  /**
+   * Page budget for a PDF. When the default layout runs longer, the PDF is
+   * laid out again with progressively tighter spacing, fonts and margins
+   * (see PDF_FIT_LADDER) until it fits or the readable floor is reached.
+   * DOCX pagination is decided by the word processor and is not measured.
+   */
+  maxPages?: number;
+}
+
+/** Space between table cell text and the cell's edges and rules, in points. */
+const PDF_CELL_PAD_X = 5;
+const PDF_CELL_PAD_Y = 4;
+/** Space above and below a heading, in points. */
+const PDF_HEADING_SPACE_ABOVE = 8;
+const PDF_HEADING_SPACE_BELOW = 6;
+/** Space after a paragraph or code block, between paragraph lines, and after a list item. */
+const PDF_PARAGRAPH_GAP = 8;
+const PDF_LINE_GAP = 4;
+const PDF_LIST_ITEM_GAP = 4;
+/** Space after each block, in lines of the current font. */
+const PDF_BLOCK_GAP_LINES = 0.5;
+/** How deep a run of consecutive headings is followed when keeping it with its content. */
+const PDF_KEEP_WITH_NEXT_DEPTH = 4;
+/** Fitting never makes body text smaller or margins narrower than this, in points. */
+const PDF_MIN_BODY_FONT_SIZE = 9;
+const PDF_MIN_MARGIN = 36;
+
+/** Multipliers applied to the default PDF layout; 1 everywhere is the default layout. */
+export interface PdfLayoutProfile {
+  /** Space between blocks, list items and paragraph lines, and around headings. */
+  spacing: number;
+  /** Table cell padding. */
+  cellPadding: number;
+  /** Body, heading, table and code font sizes (not the page number). */
+  fontScale: number;
+  /** Page margins. */
+  marginScale: number;
+}
+
+/**
+ * Layouts tried, in order, when a PDF must fit a page budget: tighter
+ * spacing first, then table padding, then smaller type, then narrower
+ * margins. The first entry is the default layout. Font sizes and margins
+ * are also held at PDF_MIN_BODY_FONT_SIZE and PDF_MIN_MARGIN.
+ */
+export const PDF_FIT_LADDER: readonly PdfLayoutProfile[] = [
+  { spacing: 1, cellPadding: 1, fontScale: 1, marginScale: 1 },
+  { spacing: 0.75, cellPadding: 1, fontScale: 1, marginScale: 1 },
+  { spacing: 0.5, cellPadding: 1, fontScale: 1, marginScale: 1 },
+  { spacing: 0.5, cellPadding: 0.6, fontScale: 1, marginScale: 1 },
+  { spacing: 0.5, cellPadding: 0.6, fontScale: 0.95, marginScale: 1 },
+  { spacing: 0.5, cellPadding: 0.6, fontScale: 0.9, marginScale: 1 },
+  { spacing: 0.5, cellPadding: 0.6, fontScale: 0.86, marginScale: 1 },
+  { spacing: 0.5, cellPadding: 0.6, fontScale: 0.86, marginScale: 0.75 },
+  { spacing: 0.5, cellPadding: 0.6, fontScale: 0.86, marginScale: 0.5 },
+];
+
+export interface PageFit {
+  /** Index of the chosen layout. */
+  level: number;
+  pageCount: number;
+  fitted: boolean;
+}
+
+/**
+ * Picks the first layout level whose page count is within `maxPages`.
+ * `pagesAt(level)` lays the content out at that level and returns its page
+ * count. The default level is tried first and kept when it fits; when even
+ * the last (tightest) level does not fit, that level is returned unfitted
+ * without trying the levels in between.
+ */
+export function choosePageFit(
+  maxPages: number,
+  levelCount: number,
+  pagesAt: (level: number) => number,
+): PageFit {
+  const first = pagesAt(0);
+  if (first <= maxPages || levelCount <= 1) {
+    return { level: 0, pageCount: first, fitted: first <= maxPages };
+  }
+  const last = levelCount - 1;
+  const tightest = pagesAt(last);
+  if (tightest > maxPages) return { level: last, pageCount: tightest, fitted: false };
+  for (let level = 1; level < last; level++) {
+    const pageCount = pagesAt(level);
+    if (pageCount <= maxPages) return { level, pageCount, fitted: true };
+  }
+  return { level: last, pageCount: tightest, fitted: true };
+}
+
+/**
+ * Reads a page budget sent with a tool call: a positive whole number, or
+ * its decimal string. Absent means no budget.
+ */
+export function parseMaxPages(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = typeof value === "string" ? Number(value.trim()) : value;
+  if (typeof parsed !== "number" || !Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(
+      `Invalid "maxPages" ${JSON.stringify(value)}: use a positive whole number such as 2.`,
+    );
+  }
+  return parsed;
+}
+
+type PdfDocument = InstanceType<typeof PDFDocument>;
+
+/** Sizes the renderer draws with, after a layout profile is applied. */
+interface PdfMetrics {
+  baseFontSize: number;
+  /** Points added to the body size per heading level above h6. */
+  headingStep: number;
+  headingSpaceAbove: number;
+  headingSpaceBelow: number;
+  paragraphGap: number;
+  lineGap: number;
+  listItemGap: number;
+  blockGapLines: number;
+  cellPadX: number;
+  cellPadY: number;
+}
+
+function pdfMetrics(baseFontSize: number, profile: PdfLayoutProfile): PdfMetrics {
+  const { spacing, cellPadding, fontScale } = profile;
+  return {
+    // A font already below the floor is kept as given rather than enlarged.
+    baseFontSize: Math.max(
+      baseFontSize * fontScale,
+      Math.min(baseFontSize, PDF_MIN_BODY_FONT_SIZE),
+    ),
+    headingStep: 2 * fontScale,
+    headingSpaceAbove: PDF_HEADING_SPACE_ABOVE * spacing,
+    headingSpaceBelow: PDF_HEADING_SPACE_BELOW * spacing,
+    paragraphGap: PDF_PARAGRAPH_GAP * spacing,
+    lineGap: PDF_LINE_GAP * spacing,
+    listItemGap: PDF_LIST_ITEM_GAP * spacing,
+    blockGapLines: PDF_BLOCK_GAP_LINES * spacing,
+    cellPadX: PDF_CELL_PAD_X * cellPadding,
+    cellPadY: PDF_CELL_PAD_Y * cellPadding,
+  };
+}
+
+/** A page margin in points: `inches` (default 1) scaled, but never below PDF_MIN_MARGIN unless given that way. */
+function pdfMargin(inches: number | undefined, marginScale: number): number {
+  const points = (inches || 1) * 72;
+  return Math.max(points * marginScale, Math.min(points, PDF_MIN_MARGIN));
+}
+
+/**
+ * Lays content blocks out on a pdfkit document.
+ *
+ * Tables use one layout model: a row is as tall as its tallest wrapped cell
+ * plus top and bottom padding, its rule is drawn exactly at the row's bottom
+ * edge, and the next row starts there. Rules therefore always sit in the
+ * padding between rows. A row that does not fit above the bottom margin
+ * starts a new page, where the header row is drawn again. Headings move to a
+ * new page when the first part of the content they introduce would not fit
+ * below them.
+ */
+class PdfBlockRenderer {
+  private readonly warnings: string[] = [];
+
+  private readonly baseFontSize: number;
+
+  constructor(
+    private readonly doc: PdfDocument,
+    private readonly fonts: { regular: string; bold: string },
+    private readonly metrics: PdfMetrics,
+    private readonly codeFont: (text: string) => string,
+  ) {
+    this.baseFontSize = metrics.baseFontSize;
+  }
+
+  render(blocks: RenderBlock[]): string[] {
+    blocks.forEach((block, index) => this.renderBlock(blocks, index));
+    return this.warnings;
+  }
+
+  /** Writes "N / M" centered in the bottom margin of every page. */
+  stampPageNumbers(): void {
+    const { doc } = this;
+    const range = doc.bufferedPageRange();
+    for (let index = 0; index < range.count; index++) {
+      doc.switchToPage(range.start + index);
+      const { margins } = doc.page;
+      const bottomMargin = margins.bottom;
+      // Text inside the bottom margin would otherwise start another page.
+      margins.bottom = 0;
+      doc
+        .font(this.fonts.regular)
+        .fontSize(9)
+        .fillColor("#666666")
+        .text(
+          `${index + 1} / ${range.count}`,
+          margins.left,
+          doc.page.height - bottomMargin / 2 - 4,
+          { width: this.contentWidth, align: "center", lineBreak: false },
+        );
+      margins.bottom = bottomMargin;
+    }
+    doc.fillColor("#000000");
+  }
+
+  private get contentWidth(): number {
+    const { page } = this.doc;
+    return page.width - page.margins.left - page.margins.right;
+  }
+
+  private get contentBottom(): number {
+    const { page } = this.doc;
+    return page.height - page.margins.bottom;
+  }
+
+  private get contentHeight(): number {
+    const { page } = this.doc;
+    return page.height - page.margins.top - page.margins.bottom;
+  }
+
+  private atPageTop(): boolean {
+    return this.doc.y <= this.doc.page.margins.top + 0.5;
+  }
+
+  /** Starts a new page unless `height` fits below the cursor or the page is still empty. */
+  private ensureSpace(height: number): void {
+    if (this.atPageTop()) return;
+    if (this.doc.y + Math.min(height, this.contentHeight) > this.contentBottom) {
+      this.doc.addPage();
+    }
+  }
+
+  private headingFontSize(level: number): number {
+    // h1 = base + 6 steps (12pt at the default layout).
+    return (
+      this.baseFontSize + (7 - Math.min(Math.max(level || 1, 1), 6)) * this.metrics.headingStep
+    );
+  }
+
+  /** Height of a heading including the space above and below it. */
+  private headingHeight(block: RenderBlock): number {
+    const { doc } = this;
+    doc.font(this.fonts.bold).fontSize(this.headingFontSize(block.level));
+    return (
+      this.metrics.headingSpaceAbove +
+      doc.heightOfString(block.text, {
+        width: this.contentWidth,
+        paragraphGap: this.metrics.headingSpaceBelow,
+      })
+    );
+  }
+
+  /**
+   * The part of block `index` that must share a page with a heading before
+   * it: up to two lines of text, the first list item, or a table's header
+   * and first row. A heading counts with what follows it.
+   */
+  private minimumHeight(blocks: RenderBlock[], index: number, depth = 0): number {
+    const block = blocks[index];
+    if (!block || block.type === PAGE_BREAK) return 0;
+    const { doc, metrics } = this;
+    const width = this.contentWidth;
+    switch (block.type) {
+      case "heading":
+        return (
+          this.headingHeight(block) +
+          (depth < PDF_KEEP_WITH_NEXT_DEPTH ? this.minimumHeight(blocks, index + 1, depth + 1) : 0)
+        );
+      case "table": {
+        const heights = this.tableRowHeights(block.rows);
+        return heights[0] + (heights[1] ?? 0);
+      }
+      case "list":
+        doc.font(this.fonts.regular).fontSize(this.baseFontSize);
+        return doc.heightOfString(`• ${block.items[0] ?? ""}`, {
+          width,
+          indent: 20,
+          paragraphGap: metrics.listItemGap,
+        });
+      case "code": {
+        doc.font(this.codeFont(block.text)).fontSize(this.baseFontSize - 2);
+        const full = doc.heightOfString(block.text, { width, paragraphGap: metrics.paragraphGap });
+        return Math.min(full, doc.currentLineHeight(true) * 2);
+      }
+      default: {
+        doc.font(this.fonts.regular).fontSize(this.baseFontSize);
+        const full = doc.heightOfString(block.text, {
+          width,
+          paragraphGap: metrics.paragraphGap,
+          lineGap: metrics.lineGap,
+        });
+        return Math.min(full, (doc.currentLineHeight(true) + metrics.lineGap) * 2);
+      }
+    }
+  }
+
+  private renderBlock(blocks: RenderBlock[], index: number): void {
+    const { doc, metrics } = this;
+    const block = blocks[index];
+    const baseFontSize = this.baseFontSize;
+    switch (block.type) {
+      case PAGE_BREAK:
+        // A break on an empty page, or with nothing after it, would only add a blank page.
+        if (!this.atPageTop() && blocks.slice(index + 1).some((next) => next.type !== PAGE_BREAK)) {
+          doc.addPage();
+        }
+        break;
+
+      case "heading": {
+        this.ensureSpace(this.minimumHeight(blocks, index));
+        // More space above a heading than below it ties it to its own section.
+        if (!this.atPageTop()) doc.y += metrics.headingSpaceAbove;
+        doc
+          .font(this.fonts.bold)
+          .fontSize(this.headingFontSize(block.level))
+          .text(block.text, { paragraphGap: metrics.headingSpaceBelow });
+        break;
+      }
+
+      case "paragraph":
+        doc
+          .font(this.fonts.regular)
+          .fontSize(baseFontSize)
+          .text(block.text, { paragraphGap: metrics.paragraphGap, lineGap: metrics.lineGap });
+        doc.moveDown(metrics.blockGapLines);
+        break;
+
+      case "list": {
+        doc.font(this.fonts.regular).fontSize(baseFontSize);
+        for (const item of block.items) {
+          doc.text(`• ${item}`, { indent: 20, paragraphGap: metrics.listItemGap });
+        }
+        doc.moveDown(metrics.blockGapLines);
+        break;
+      }
+
+      case "table":
+        if (block.rows.length > 0) this.renderTable(block.rows);
+        break;
+
+      case "code":
+        doc
+          .font(this.codeFont(block.text))
+          .fontSize(baseFontSize - 2)
+          .fillColor("#333333")
+          .text(block.text, { paragraphGap: metrics.paragraphGap });
+        doc.fillColor("#000000");
+        doc.moveDown(metrics.blockGapLines);
+        break;
+
+      default:
+        doc.font(this.fonts.regular).fontSize(baseFontSize).text(block.text);
+        doc.moveDown(metrics.blockGapLines);
+    }
+  }
+
+  private get tableFontSize(): number {
+    return this.baseFontSize - 1;
+  }
+
+  private cellTextWidth(columnCount: number): number {
+    return this.contentWidth / columnCount - this.metrics.cellPadX * 2;
+  }
+
+  /** Height of each row: its tallest wrapped cell plus top and bottom padding. */
+  private tableRowHeights(rows: string[][]): number[] {
+    const { doc } = this;
+    const width = this.cellTextWidth(rows[0].length);
+    doc.fontSize(this.tableFontSize);
+    return rows.map((row, rowIndex) => {
+      doc.font(rowIndex === 0 ? this.fonts.bold : this.fonts.regular);
+      const textHeight = Math.max(...row.map((cell) => doc.heightOfString(cell || " ", { width })));
+      return textHeight + this.metrics.cellPadY * 2;
+    });
+  }
+
+  private tableRule(y: number, strong: boolean): void {
+    const { doc } = this;
+    const left = doc.page.margins.left;
+    doc
+      .save()
+      .lineWidth(strong ? 0.8 : 0.5)
+      .strokeColor(strong ? "#444444" : "#AAAAAA")
+      .moveTo(left, y)
+      .lineTo(left + this.contentWidth, y)
+      .stroke()
+      .restore();
+  }
+
+  private renderTable(rows: string[][]): void {
+    const { doc } = this;
+    const { cellPadX, cellPadY } = this.metrics;
+    const columnCount = rows[0].length;
+    const colWidth = this.contentWidth / columnCount;
+    const cellWidth = this.cellTextWidth(columnCount);
+    const hasHeader = rows.length > 1;
+    const heights = this.tableRowHeights(rows);
+
+    // The header never ends a page without the first row under it.
+    this.ensureSpace(heights[0] + (hasHeader ? heights[1] : 0));
+    let y = doc.y;
+    this.tableRule(y, true);
+
+    const drawRow = (rowIndex: number, available: number): void => {
+      const row = rows[rowIndex];
+      const left = doc.page.margins.left;
+      // A row taller than a whole page is cut at the page bottom rather
+      // than letting its cells flow onto pages of their own.
+      const clip = heights[rowIndex] > available;
+      const rowHeight = clip ? available : heights[rowIndex];
+      if (clip) {
+        this.warnings.push(
+          `Table row ${rowIndex + 1} is taller than a page and was shortened to fit.`,
+        );
+      }
+      doc.font(rowIndex === 0 ? this.fonts.bold : this.fonts.regular).fontSize(this.tableFontSize);
+      for (let colIndex = 0; colIndex < row.length; colIndex++) {
+        doc.text(row[colIndex], left + colIndex * colWidth + cellPadX, y + cellPadY, {
+          width: cellWidth,
+          ...(clip ? { height: rowHeight - cellPadY * 2, ellipsis: true } : {}),
+        });
+      }
+      y += rowHeight;
+      this.tableRule(y, rowIndex === 0 && hasHeader);
+    };
+
+    // Body rows drawn on the current page; a page holding only the header
+    // keeps the next row even when that row has to be shortened.
+    let bodyRowsOnPage = 0;
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      if (rowIndex > 0 && bodyRowsOnPage > 0 && y + heights[rowIndex] > this.contentBottom) {
+        doc.addPage();
+        y = doc.y;
+        this.tableRule(y, true);
+        if (hasHeader) drawRow(0, this.contentHeight);
+        bodyRowsOnPage = 0;
+      }
+      drawRow(rowIndex, this.contentBottom - y);
+      if (rowIndex > 0 || !hasHeader) bodyRowsOnPage++;
+    }
+
+    // Cells moved the cursor into the last column; later blocks start at the margin.
+    doc.x = doc.page.margins.left;
+    doc.y = y;
+    doc.font(this.fonts.regular).fontSize(this.baseFontSize).moveDown(this.metrics.blockGapLines);
+  }
+}
+
+/** All text a PDF will draw, for choosing fonts that can encode it. */
+function pdfText(blocks: RenderBlock[]): string {
+  return blocks.flatMap((block) => [block.text, ...block.items, ...block.rows.flat()]).join("\n");
+}
+
+/** Pages the page_break blocks alone require: breaks with content on both sides, runs counted once. */
+function pagesForcedByBreaks(blocks: RenderBlock[]): number {
+  let pages = 0;
+  let pendingBreak = true;
+  for (const block of blocks) {
+    if (block.type === PAGE_BREAK) {
+      pendingBreak = true;
+    } else if (pendingBreak) {
+      pages++;
+      pendingBreak = false;
+    }
+  }
+  return pages;
+}
+
+/** Tells the model a PDF is over its page budget and that the text must be shortened. */
+function pageBudgetWarning(blocks: RenderBlock[], pageCount: number, maxPages: number): string {
+  const forced = pagesForcedByBreaks(blocks);
+  const cause =
+    forced > maxPages
+      ? ` The page_break blocks alone start ${forced} pages; remove page breaks or merge pages.`
+      : " Shorten the content (trim long paragraphs, list items and table cells, or drop a section) and create the document again.";
+  return (
+    `The PDF has ${pageCount} pages, more than maxPages ${maxPages}, even with the tightest ` +
+    `readable layout (smaller spacing, type and margins); it was written that way.${cause}`
+  );
 }
 
 /**
@@ -179,7 +805,11 @@ export class DocumentBuilder {
     }
 
     if (ext === ".pdf" || format === "pdf") {
-      report.warnings.push(...(await this.createPDF(outputPath, blocks, options)));
+      const pdf = await this.createPDF(outputPath, blocks, options);
+      report.warnings.push(...pdf.warnings);
+      report.pageCount = pdf.pageCount;
+      report.layoutLevel = pdf.layoutLevel;
+      if (pdf.fittedToMaxPages !== undefined) report.fittedToMaxPages = pdf.fittedToMaxPages;
       return report;
     }
 
@@ -236,7 +866,7 @@ export class DocumentBuilder {
       if ("reason" in normalized) droppedBlocks.push({ index, ...normalized });
       else blocks.push(normalized);
     });
-    if (blocks.length === 0) {
+    if (!blocks.some((block) => block.type !== PAGE_BREAK)) {
       throw new Error(
         "All content blocks are empty. Provide text, list items, or table rows. " +
           `Received ${input.length} block(s), none with anything to write.`,
@@ -254,10 +884,24 @@ export class DocumentBuilder {
     content: RenderBlock[],
     options: DocumentOptions,
   ): Promise<void> {
-    const children: Paragraph[] = [];
+    const children: Array<Paragraph | Table> = [];
+    const textSize = (options.fontSize || 12) * 2;
+    // A page break starts the next paragraph on a new page, so the new page
+    // does not open with an empty line. A break with nothing after it is
+    // written as an explicit break.
+    let breakBeforeNext = false;
+    const takePageBreak = (): boolean => {
+      const value = breakBeforeNext;
+      breakBeforeNext = false;
+      return value;
+    };
 
     for (const block of content) {
       switch (block.type) {
+        case PAGE_BREAK:
+          breakBeforeNext = true;
+          break;
+
         case "heading": {
           const level = Math.min(Math.max(block.level || 1, 1), 6);
           const headingLevel = this.getHeadingLevel(level);
@@ -266,6 +910,10 @@ export class DocumentBuilder {
               text: block.text,
               heading: headingLevel,
               spacing: { before: 240, after: 120 },
+              // A heading never ends a page apart from the content it introduces.
+              keepNext: true,
+              keepLines: true,
+              pageBreakBefore: takePageBreak(),
             }),
           );
           break;
@@ -274,8 +922,9 @@ export class DocumentBuilder {
         case "paragraph":
           children.push(
             new Paragraph({
-              children: [new TextRun({ text: block.text, size: (options.fontSize || 12) * 2 })],
+              children: [new TextRun({ text: block.text, size: textSize })],
               spacing: { after: 200 },
+              pageBreakBefore: takePageBreak(),
             }),
           );
           break;
@@ -284,9 +933,10 @@ export class DocumentBuilder {
           for (const item of block.items) {
             children.push(
               new Paragraph({
-                children: [new TextRun({ text: item, size: (options.fontSize || 12) * 2 })],
+                children: [new TextRun({ text: item, size: textSize })],
                 bullet: { level: 0 },
                 spacing: { after: 100 },
+                pageBreakBefore: takePageBreak(),
               }),
             );
           }
@@ -300,22 +950,28 @@ export class DocumentBuilder {
             const textWidth =
               11906 - ((options.margins?.left || 1) + (options.margins?.right || 1)) * 1440;
             const columnCount = block.rows[0].length;
+            const hasHeader = block.rows.length > 1;
             const table = new Table({
               width: { size: 100, type: WidthType.PERCENTAGE },
               columnWidths: Array<number>(columnCount).fill(Math.floor(textWidth / columnCount)),
               rows: block.rows.map(
                 (row, rowIndex) =>
                   new TableRow({
+                    // The header repeats on every page the table reaches.
+                    tableHeader: hasHeader && rowIndex === 0 ? true : undefined,
+                    cantSplit: true,
                     children: row.map(
                       (cell) =>
                         new TableCell({
                           children: [
                             new Paragraph({
+                              // Keeps the header on the same page as the first row.
+                              keepNext: hasHeader && rowIndex === 0 ? true : undefined,
                               children: [
                                 new TextRun({
                                   text: cell,
                                   bold: rowIndex === 0,
-                                  size: (options.fontSize || 12) * 2,
+                                  size: textSize,
                                 }),
                               ],
                             }),
@@ -331,8 +987,12 @@ export class DocumentBuilder {
                   }),
               ),
             });
-            children.push(new Paragraph({ children: [] })); // Spacing before table
-            children.push(table as Any);
+            // Spacing before the table; it carries the page break and stays
+            // with the table so a preceding heading does too.
+            children.push(
+              new Paragraph({ children: [], keepNext: true, pageBreakBefore: takePageBreak() }),
+            );
+            children.push(table);
             children.push(new Paragraph({ children: [] })); // Spacing after table
           }
           break;
@@ -350,6 +1010,7 @@ export class DocumentBuilder {
                 }),
               ],
               spacing: { before: 200, after: 200 },
+              pageBreakBefore: takePageBreak(),
             }),
           );
           break;
@@ -357,11 +1018,13 @@ export class DocumentBuilder {
         default:
           children.push(
             new Paragraph({
-              children: [new TextRun({ text: block.text, size: (options.fontSize || 12) * 2 })],
+              children: [new TextRun({ text: block.text, size: textSize })],
+              pageBreakBefore: takePageBreak(),
             }),
           );
       }
     }
+    if (breakBeforeNext) children.push(new Paragraph({ children: [new PageBreak()] }));
 
     const doc = new Document({
       creator: options.author || "CoWork OS",
@@ -379,6 +1042,25 @@ export class DocumentBuilder {
               },
             },
           },
+          ...(options.pageNumbers
+            ? {
+                footers: {
+                  default: new Footer({
+                    children: [
+                      new Paragraph({
+                        alignment: AlignmentType.CENTER,
+                        children: [
+                          new TextRun({
+                            children: [PageNumber.CURRENT, " / ", PageNumber.TOTAL_PAGES],
+                            size: 18,
+                          }),
+                        ],
+                      }),
+                    ],
+                  }),
+                },
+              }
+            : {}),
           children,
         },
       ],
@@ -389,142 +1071,126 @@ export class DocumentBuilder {
   }
 
   /**
-   * Creates a PDF document. Returns warnings about text it cannot draw.
+   * Page count of `content` as a PDF at each layout in PDF_FIT_LADDER, in
+   * ladder order. Nothing is written.
+   */
+  measurePdfLayouts(
+    content: ContentBlockInput[] | ContentBlockInput | string | undefined,
+    options: DocumentOptions = {},
+  ): number[] {
+    const { blocks } = this.normalizeContent(content);
+    const fontChoice = resolvePdfFonts(pdfText(blocks));
+    return PDF_FIT_LADDER.map(
+      (profile) => this.layoutPdf(blocks, options, fontChoice, profile).pageCount,
+    );
+  }
+
+  /**
+   * Lays content out on a new PDF document with one layout profile. The
+   * document is not ended or written, so the same pass can be measured and,
+   * when chosen, saved.
+   */
+  private layoutPdf(
+    content: RenderBlock[],
+    options: DocumentOptions,
+    fontChoice: ReturnType<typeof resolvePdfFonts>,
+    profile: PdfLayoutProfile,
+  ): { doc: PdfDocument; renderer: PdfBlockRenderer; warnings: string[]; pageCount: number } {
+    const doc = new PDFDocument({
+      size: "LETTER",
+      margins: {
+        top: pdfMargin(options.margins?.top, profile.marginScale),
+        bottom: pdfMargin(options.margins?.bottom, profile.marginScale),
+        left: pdfMargin(options.margins?.left, profile.marginScale),
+        right: pdfMargin(options.margins?.right, profile.marginScale),
+      },
+      // Pages stay open until the end so footers can be stamped once the page count is known.
+      bufferPages: true,
+      info: {
+        Title: options.title || "",
+        Author: options.author || "CoWork OS",
+        Subject: options.subject || "",
+      },
+    });
+
+    const fonts = { regular: "Helvetica", bold: "Helvetica-Bold" };
+    if (fontChoice.font) {
+      const { regular, bold } = fontChoice.font;
+      doc.registerFont("UnicodeRegular", regular.path, regular.postscriptName);
+      doc.registerFont("UnicodeBold", bold.path, bold.postscriptName);
+      fonts.regular = "UnicodeRegular";
+      fonts.bold = "UnicodeBold";
+    }
+
+    const renderer = new PdfBlockRenderer(
+      doc,
+      fonts,
+      pdfMetrics(options.fontSize || 12, profile),
+      (text) =>
+        // Courier is Latin-1 only; code with other characters uses the Unicode font.
+        fontChoice.font && needsUnicodeFont(text) ? fonts.regular : "Courier",
+    );
+    const warnings = renderer.render(content);
+    return { doc, renderer, warnings, pageCount: doc.bufferedPageRange().count };
+  }
+
+  /**
+   * Creates a PDF document. With `maxPages`, a layout that runs over the
+   * budget is redone with tighter layouts from PDF_FIT_LADDER and the first
+   * that fits is written; if none fits, the tightest is written and a
+   * warning gives its page count. Returns warnings about text it cannot draw.
    */
   private async createPDF(
     outputPath: string,
     content: RenderBlock[],
     options: DocumentOptions,
-  ): Promise<string[]> {
+  ): Promise<{
+    warnings: string[];
+    pageCount: number;
+    layoutLevel: number;
+    fittedToMaxPages?: boolean;
+  }> {
     // The built-in PDF fonts only encode Latin-1; text beyond that needs an
     // embedded Unicode font or it is written as the wrong glyphs.
-    const fontChoice = resolvePdfFonts(
-      content.flatMap((block) => [block.text, ...block.items, ...block.rows.flat()]).join("\n"),
-    );
-    return new Promise((resolve, reject) => {
-      const doc = new PDFDocument({
-        size: "LETTER",
-        margins: {
-          top: (options.margins?.top || 1) * 72,
-          bottom: (options.margins?.bottom || 1) * 72,
-          left: (options.margins?.left || 1) * 72,
-          right: (options.margins?.right || 1) * 72,
-        },
-        info: {
-          Title: options.title || "",
-          Author: options.author || "CoWork OS",
-          Subject: options.subject || "",
-        },
-      });
+    const fontChoice = resolvePdfFonts(pdfText(content));
+    const layouts = new Map<number, ReturnType<DocumentBuilder["layoutPdf"]>>();
+    const layoutAt = (level: number): ReturnType<DocumentBuilder["layoutPdf"]> => {
+      let layout = layouts.get(level);
+      if (!layout) {
+        layout = this.layoutPdf(content, options, fontChoice, PDF_FIT_LADDER[level]);
+        layouts.set(level, layout);
+      }
+      return layout;
+    };
 
+    const { maxPages } = options;
+    const fit =
+      maxPages === undefined
+        ? undefined
+        : choosePageFit(maxPages, PDF_FIT_LADDER.length, (level) => layoutAt(level).pageCount);
+    const level = fit?.level ?? 0;
+    const { doc, renderer, warnings: layoutWarnings, pageCount } = layoutAt(level);
+    if (options.pageNumbers) renderer.stampPageNumbers();
+
+    const warnings = [...fontChoice.warnings, ...layoutWarnings];
+    if (fit && !fit.fitted) {
+      warnings.push(pageBudgetWarning(content, pageCount, maxPages as number));
+    }
+
+    await new Promise<void>((resolve, reject) => {
       const stream = fs.createWriteStream(outputPath);
-      doc.pipe(stream);
-
-      const fonts = { regular: "Helvetica", bold: "Helvetica-Bold" };
-      if (fontChoice.font) {
-        const { regular, bold } = fontChoice.font;
-        doc.registerFont("UnicodeRegular", regular.path, regular.postscriptName);
-        doc.registerFont("UnicodeBold", bold.path, bold.postscriptName);
-        fonts.regular = "UnicodeRegular";
-        fonts.bold = "UnicodeBold";
-      }
-
-      const baseFontSize = options.fontSize || 12;
-
-      for (const block of content) {
-        switch (block.type) {
-          case "heading": {
-            const level = Math.min(Math.max(block.level || 1, 1), 6);
-            const fontSize = baseFontSize + (7 - level) * 2; // h1 = base+12, h6 = base+2
-            doc.font(fonts.bold).fontSize(fontSize).text(block.text, { paragraphGap: 10 });
-            doc.moveDown(0.5);
-            break;
-          }
-
-          case "paragraph":
-            doc
-              .font(fonts.regular)
-              .fontSize(baseFontSize)
-              .text(block.text, { paragraphGap: 8, lineGap: 4 });
-            doc.moveDown(0.5);
-            break;
-
-          case "list": {
-            doc.font(fonts.regular).fontSize(baseFontSize);
-            for (const item of block.items) {
-              doc.text(`• ${item}`, { indent: 20, paragraphGap: 4 });
-            }
-            doc.moveDown(0.5);
-            break;
-          }
-
-          case "table": {
-            if (block.rows.length > 0) {
-              doc.font(fonts.regular).fontSize(baseFontSize - 1);
-              const columnCount = block.rows[0].length;
-              const pageWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-              const colWidth = pageWidth / columnCount;
-
-              for (let rowIndex = 0; rowIndex < block.rows.length; rowIndex++) {
-                const row = block.rows[rowIndex];
-                doc.font(rowIndex === 0 ? fonts.bold : fonts.regular);
-                // A row is as tall as its tallest cell and starts on a new
-                // page when it would cross the bottom margin.
-                const rowHeight = Math.max(
-                  ...row.map((cell) => doc.heightOfString(cell || " ", { width: colWidth - 10 })),
-                );
-                if (doc.y + rowHeight > doc.page.height - doc.page.margins.bottom) {
-                  doc.addPage();
-                }
-                const startY = doc.y;
-
-                // Draw cells
-                for (let colIndex = 0; colIndex < row.length; colIndex++) {
-                  const x = doc.page.margins.left + colIndex * colWidth;
-                  doc.text(row[colIndex], x, startY, {
-                    width: colWidth - 10,
-                    continued: false,
-                  });
-                }
-                doc.y = startY + rowHeight;
-
-                // Draw horizontal line
-                doc
-                  .moveTo(doc.page.margins.left, doc.y + 5)
-                  .lineTo(doc.page.margins.left + pageWidth, doc.y + 5)
-                  .stroke();
-
-                doc.moveDown(0.3);
-              }
-              // Cells moved the cursor into the last column; later blocks start at the margin.
-              doc.x = doc.page.margins.left;
-              doc.moveDown(0.5);
-            }
-            break;
-          }
-
-          case "code":
-            doc
-              // Courier is Latin-1 only; code with other characters uses the Unicode font.
-              .font(fontChoice.font && needsUnicodeFont(block.text) ? fonts.regular : "Courier")
-              .fontSize(baseFontSize - 2)
-              .fillColor("#333333")
-              .text(block.text, { paragraphGap: 8 });
-            doc.fillColor("#000000");
-            doc.moveDown(0.5);
-            break;
-
-          default:
-            doc.font(fonts.regular).fontSize(baseFontSize).text(block.text);
-            doc.moveDown(0.5);
-        }
-      }
-
-      doc.end();
-
-      stream.on("finish", () => resolve(fontChoice.warnings));
       stream.on("error", reject);
+      stream.on("finish", () => resolve());
+      doc.pipe(stream);
+      doc.end();
     });
+
+    return {
+      warnings,
+      pageCount,
+      layoutLevel: level,
+      ...(fit ? { fittedToMaxPages: fit.fitted } : {}),
+    };
   }
 
   /**
@@ -555,6 +1221,9 @@ export class DocumentBuilder {
           }
           case "code":
             return `\`\`\`${block.language || ""}\n${block.text}\n\`\`\`\n`;
+          case PAGE_BREAK:
+            // Markdown has no page break; this is what HTML and PDF converters honor.
+            return '<div style="page-break-after: always;"></div>\n';
           default:
             return `${block.text}\n`;
         }
@@ -709,6 +1378,10 @@ export class DocumentBuilder {
           }
           break;
         }
+
+        case PAGE_BREAK:
+          xmlParts.push('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
+          break;
 
         default:
           xmlParts.push(this.createOoxmlParagraph(block.text));

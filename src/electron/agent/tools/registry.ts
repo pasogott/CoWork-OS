@@ -125,6 +125,8 @@ import {
 } from "../../security/access-profile-paths";
 import { evaluateNetworkPolicy } from "../../security/network-policy";
 import { BuiltinToolsSettingsManager } from "./builtin-settings";
+import { BrowserSettingsManager } from "../../settings/browser-settings-manager";
+import { DEVELOPER_MODE_BROWSER_TOOLS } from "../../../shared/browser-settings";
 import { getCustomSkillLoader } from "../custom-skill-loader";
 import { SkillProposalService } from "../skills/SkillProposalService";
 import { SkillEvalService, type SkillEvalCase } from "../skills/SkillEvalService";
@@ -1665,6 +1667,14 @@ export class ToolRegistry {
         ].includes(tool.name)
       ) {
         return true;
+      }
+      // Page scripts, storage and traces need developer mode (Settings > Browser).
+      if (
+        DEVELOPER_MODE_BROWSER_TOOLS.has(tool.name) &&
+        !BrowserSettingsManager.loadSettings().developerMode
+      ) {
+        disabledBySettings.push(tool.name);
+        return false;
       }
       // Check built-in tool settings
       const isEnabled = BuiltinToolsSettingsManager.isToolEnabled(tool.name);
@@ -4284,7 +4294,7 @@ File Operations:
 Skills:
 - create_spreadsheet: Create Excel spreadsheets with data and formulas
 - generate_spreadsheet: Generate XLSX spreadsheets from structured sheets
-- create_document: Create Word/PDF (only when user explicitly requests DOCX or PDF — otherwise use write_file with .md)
+- create_document: Create Word/PDF (only when user explicitly requests DOCX or PDF — otherwise use write_file with .md); for a DOCX and a matching PDF, one call with formats: ["docx","pdf"]
 - generate_document: Generate PDF documents from markdown/sections
 - compile_latex: Compile a workspace .tex file into PDF using a system LaTeX engine
 - edit_document: Edit/append content to existing DOCX files
@@ -7573,7 +7583,10 @@ ${skillDescriptions}`;
         description:
           "Create an Excel spreadsheet with data, formulas, and number formats (currency, decimals, percentages, dates). " +
           "Results of common formulas (SUM, SUMIF(S), AVERAGE, COUNT(IF), MIN, MAX, ROUND, IF) are saved with the file; " +
-          "the result lists any formula left for Excel to calculate on open.",
+          "the result lists any formula left for Excel to calculate on open. " +
+          'Pass dates as ISO text ("2026-10-05"); they are saved as real Excel dates, shown with a date numFmt such as "dd/mm/yyyy" if you give one. ' +
+          'To keep a column as text (IDs with leading zeros), give it numFmt "@". ' +
+          "Apply formats here rather than post-processing with openpyxl; if a command does change a workbook, dropped formula results are restored afterwards and the run_command result lists them in workbookNotes.",
         input_schema: {
           type: "object",
           properties: {
@@ -7620,26 +7633,65 @@ ${skillDescriptions}`;
       {
         name: "create_document",
         description:
-          "Create a Word document (.docx) or PDF. Only use when the user EXPLICITLY requests Word/DOCX/PDF format. For all other documents, prefer writing Markdown (.md) files with write_file.",
+          "Create a Word document (.docx) or PDF. Only use when the user EXPLICITLY requests Word/DOCX/PDF format. For all other documents, prefer writing Markdown (.md) files with write_file. " +
+          'When the user wants the same document in several formats (an editable Word file and a matching PDF), make ONE create_document call with formats: ["docx","pdf"] so both come from the same content. Do not convert DOCX to PDF with shell tools. ' +
+          'With formats, filename is the shared base name (e.g. "Northstar-brief" writes "Northstar-brief.docx" and "Northstar-brief.pdf"); use filenames only when the files need different names. The result lists every written file in files. ' +
+          'When the user asks for content on a specific page ("Page 2: ..."), insert a page_break block where that page starts. When the user asks for page numbers, set pageNumbers: true. ' +
+          "When the user asks for a document of N pages (e.g. 'a two-page brief'), set maxPages: N. " +
+          "A PDF that runs longer is laid out again with tighter spacing, type and margins until it fits; the result reports pageCount and fittedToMaxPages, and if it still does not fit, a warning gives the actual page count and the content must be shortened. " +
+          "Headings stay on the same page as the content after them, and table header rows repeat on every page a table continues onto.",
         input_schema: {
           type: "object",
           properties: {
-            filename: { type: "string", description: "Name of the document" },
-            format: { type: "string", enum: ["docx", "pdf"], description: "Output format" },
+            filename: {
+              type: "string",
+              description:
+                'Exact output file name including the extension, e.g. "Northstar-brief.pdf". When the user names the file, pass that name unchanged; never add suffixes such as "-pdf". A name without an extension gets the format\'s extension appended. With formats, the shared base name (an extension of .docx or .pdf is replaced by each format\'s).',
+            },
+            format: {
+              type: "string",
+              enum: ["docx", "pdf"],
+              description:
+                "Output format for a single file; must match the filename's extension. Leave it out when using formats.",
+            },
+            formats: {
+              type: "array",
+              items: { type: "string", enum: ["docx", "pdf"] },
+              minItems: 1,
+              description:
+                'Write the same content in every listed format, e.g. ["docx", "pdf"] for an editable Word file and a matching PDF. Each file is "<filename without extension>.<format>" unless filenames is given.',
+            },
+            filenames: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Optional, with formats: one exact file name per entry of formats, in the same order, when the files need different names.",
+            },
+            pageNumbers: {
+              type: "boolean",
+              description:
+                'Print the page number ("N / M") centered in the footer of every page. Use when the user asks for page numbers.',
+            },
+            maxPages: {
+              type: "integer",
+              minimum: 1,
+              description:
+                "Most pages the document may have. When the user asks for a document of N pages (e.g. 'a two-page brief'), set maxPages: N. Measured and enforced for PDF; DOCX pagination is left to the word processor.",
+            },
             content: {
               type: "array",
               description:
-                "Document content blocks. heading/paragraph/code use text; list uses items; table uses rows.",
+                "Document content blocks. heading/paragraph/code use text; list uses items; table uses rows; page_break takes no other fields and starts a new page.",
               items: {
                 type: "object",
                 properties: {
                   type: {
                     type: "string",
-                    enum: ["heading", "paragraph", "list", "table", "code"],
+                    enum: ["heading", "paragraph", "list", "table", "code", "page_break"],
                   },
                   text: {
                     type: "string",
-                    description: "Block text (not needed for list or table blocks)",
+                    description: "Block text (not needed for list, table or page_break blocks)",
                   },
                   level: { type: "number", description: "For headings: 1-6" },
                   items: {
@@ -7657,7 +7709,7 @@ ${skillDescriptions}`;
               },
             },
           },
-          required: ["filename", "format", "content"],
+          required: ["filename", "content"],
         },
       },
       {
@@ -7690,18 +7742,19 @@ ${skillDescriptions}`;
             },
             newContent: {
               type: "array",
-              description: "For append/insert_after_section/replace_blocks: Content blocks to add",
+              description:
+                "For append/insert_after_section/replace_blocks: Content blocks to add. Use a page_break block (no other fields) where new content must start on a new page.",
               items: {
                 type: "object",
                 properties: {
                   type: {
                     type: "string",
-                    enum: ["heading", "paragraph", "list", "table"],
+                    enum: ["heading", "paragraph", "list", "table", "page_break"],
                     description: "Type of content block",
                   },
                   text: {
                     type: "string",
-                    description: "Text content for the block",
+                    description: "Text content for the block (not needed for page_break)",
                   },
                   level: {
                     type: "number",
@@ -7721,7 +7774,7 @@ ${skillDescriptions}`;
                     description: "For tables: 2D array of cell values",
                   },
                 },
-                required: ["type", "text"],
+                required: ["type"],
               },
             },
             blockIds: {
@@ -9450,7 +9503,7 @@ ${skillDescriptions}`;
       {
         name: "run_command",
         description:
-          "Execute a shell command in the workspace directory. IMPORTANT: Commands run within the active access profile. Additional authority is requested only when the operation requires it. If additional authority is needed, the request identifies that boundary. Use this for installing packages (npm, pip, brew), running build commands, git operations, or terminal commands. Commands run non-interactively, with no terminal to answer prompts: pass flags such as -y/--yes, --no-input, or git commit -m, and avoid editors and pagers. For anything that runs until stopped (dev servers such as npm run dev or vite, python -m http.server, file watchers, --watch modes), set background: true: the call returns after a short startup window with the process_id and startup output, and the process keeps running; then use process_output to read its output and stop_process to stop it. Without background, such commands block until the timeout and are killed. Do not use shell heredocs or echo/printf redirection to create artifact files when write_file or edit_file is available; use file tools for file creation and editing.",
+          "Execute a shell command in the workspace directory. IMPORTANT: Commands run within the active access profile. Additional authority is requested only when the operation requires it. If additional authority is needed, the request identifies that boundary. Use this for installing packages (npm, pip, brew), running build commands, git operations, or terminal commands. Commands run non-interactively, with no terminal to answer prompts: pass flags such as -y/--yes, --no-input, or git commit -m, and avoid editors and pagers. For anything that runs until stopped (dev servers such as npm run dev or vite, python -m http.server, file watchers, --watch modes), set background: true: the call returns after a short startup window with the process_id and startup output, and the process keeps running; then use process_output to read its output and stop_process to stop it. Without background, such commands block until the timeout and are killed. Do not use shell heredocs or echo/printf redirection to create artifact files when write_file or edit_file is available; use file tools for file creation and editing. To read or check the contents of .xlsx, .docx, .pptx, or .pdf files, use parse_document instead of unzipping them or parsing their XML in a script.",
         input_schema: {
           type: "object",
           properties: {

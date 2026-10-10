@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useComposerPredictionsEnabled } from "../hooks/useComposerPredictions";
 import {
   ThemeMode,
   AccentColor,
@@ -35,6 +36,8 @@ interface AppearanceSettingsProps {
   onHomeNextActionsEnabledChange: (enabled: boolean) => void;
   costReceiptEnabled: boolean;
   onCostReceiptEnabledChange: (enabled: boolean) => void;
+  subAgentStatsEnabled: boolean;
+  onSubAgentStatsEnabledChange: (enabled: boolean) => void;
   onShowOnboarding?: () => void;
   onboardingCompletedAt?: string;
 }
@@ -60,9 +63,12 @@ export function AppearanceSettings({
   onHomeNextActionsEnabledChange,
   costReceiptEnabled,
   onCostReceiptEnabledChange,
+  subAgentStatsEnabled,
+  onSubAgentStatsEnabledChange,
   onShowOnboarding,
   onboardingCompletedAt,
 }: AppearanceSettingsProps) {
+  const [predictionsEnabled, setPredictionsEnabled] = useComposerPredictionsEnabled();
   const [currentLanguage, setCurrentLanguage] = useState<SupportedLanguage>("en");
   const isModernVisualTheme = visualTheme === "warm" || visualTheme === "oblivion";
   const formatCompletedDate = (isoString?: string) => {
@@ -113,6 +119,22 @@ export function AppearanceSettings({
         <p className="settings-description">Customize the look and feel of the application</p>
       </div>
 
+      <div className="appearance-section">
+        <h4>Composer</h4>
+        <label className="settings-checkbox">
+          <input
+            type="checkbox"
+            checked={predictionsEnabled}
+            onChange={(event) => setPredictionsEnabled(event.target.checked)}
+          />
+          <span>Enable composer predictions</span>
+        </label>
+        <p className="settings-description">
+          Suggest your next message after a response. Press Tab to accept, then review and send.
+          Uses your selected LLM provider and consumes tokens, even when you do not accept a
+          suggestion. Your provider's normal usage limits and charges apply.
+        </p>
+      </div>
       {/* Visual Style */}
       <div className="appearance-section">
         <h4>Visual style</h4>
@@ -452,6 +474,14 @@ export function AppearanceSettings({
             onChange={(event) => onCostReceiptEnabledChange(event.target.checked)}
           />
           <span>Show cost receipt</span>
+        </label>
+        <label className="settings-checkbox">
+          <input
+            type="checkbox"
+            checked={subAgentStatsEnabled}
+            onChange={(event) => onSubAgentStatsEnabledChange(event.target.checked)}
+          />
+          <span>Show sub-agent stats</span>
         </label>
       </div>
 

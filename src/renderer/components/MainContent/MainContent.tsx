@@ -1,3 +1,5 @@
+import { useComposerPrediction } from "../../hooks/useComposerPredictions";
+import { predictionRevision } from "../../../shared/composer-predictions";
 import { useFullAccessConfirmation } from "../FullAccessConfirmationDialog";
 import { createPortal } from "react-dom";
 import { BrowserProfileNotice } from "./BrowserProfileNotice";
@@ -23,6 +25,7 @@ import { BotGlyph } from "../BotGlyph";
 import { BotMascot } from "../bot-mascot/BotMascot";
 import { mascotExpressionForBotConversation } from "../bot-mascot/mascot-expressions";
 import { withoutAnswerSurfaceBlocks } from "../../../shared/answer-surfaces/blocks";
+import { supersededAnswerSurfaceEvents } from "../../utils/superseded-answer-surfaces";
 import { resolveBotMascot } from "../../../shared/bot-mascots";
 import {
   BOT_CONVERSATION_HISTORY_OPEN_EVENT,
@@ -196,6 +199,7 @@ import {
   ChevronDown,
   ChevronRight,
   ClipboardCopy,
+  Code,
   Copy,
   Ellipsis,
   FileText,
@@ -204,12 +208,14 @@ import {
   Globe,
   History,
   Link as LinkIcon,
+  ListTree,
   Loader2,
   MessageCircle,
   Mic,
   Pencil,
   Pin,
   PinOff,
+  Play,
   Plus,
   Square,
   ShieldAlert,
@@ -491,6 +497,8 @@ import { ParallelGroupFeed } from "../timeline/ParallelGroupFeed";
 import { ActionBlock } from "../timeline/ActionBlock";
 import { TurnHeader } from "../timeline/TurnHeader";
 import { SelectionReplyPopover } from "./SelectionReplyPopover";
+import { SurfaceActionProvider } from "../AnswerSurface/SurfaceActions";
+import type { SurfaceActionOrigin } from "../../../shared/answer-surfaces/actions";
 import {
   forgetRememberedAccessProfileId,
   getAccessProfileIdForPermissionMode,
@@ -501,7 +509,7 @@ import {
 import { FileChangeTitle } from "../timeline/FileChangeTitle";
 import { isFileEventCoveredByToolCall, summarizeFileChange } from "../timeline/file-change-row";
 import { buildActionBlockSummary } from "../timeline/ActionBlockSummary";
-import { TaskStatusStrip } from "../TaskStatusStrip";
+import { SubAgentsStripButton, TaskStatusStrip } from "../TaskStatusStrip";
 import { truncateLabel } from "../../utils/timeline-tool-labels";
 import {
   buildParallelGroupProjection,
@@ -617,6 +625,8 @@ interface MainContentProps {
       accessProfileId?: AccessProfileId;
       integrationMentions?: IntegrationMentionSelection[];
       returnOnAccepted?: boolean;
+      verbatim?: boolean;
+      surfaceOrigin?: "answer" | "page";
     },
   ) => void | boolean | Promise<void | boolean>;
   onOpenSideChat?: (request: {
@@ -649,6 +659,8 @@ interface MainContentProps {
   onDismissInputRequest?: (requestId: string) => void;
   onOpenBrowserView?: (url?: string) => void;
   onViewTaskOutputs?: (taskId: string, primaryOutputPath?: string) => void;
+  /** Opens the right panel scrolled to its Sub Agents section. */
+  onViewSubAgents?: () => void;
   onTasksChanged?: () => void | Promise<void>;
   onOpenSpreadsheetArtifact?: (path: string) => void;
   onOpenDocumentArtifact?: (path: string) => void;
@@ -944,6 +956,33 @@ function MeasuredTaskFeedRow({
   }, [enabled, visiblePerfEventId]);
 
   return <div ref={rowRef}>{children}</div>;
+}
+
+/**
+ * Render revision for a sub-agent lifecycle row. It covers every child-task field the row shows:
+ * status updates land before the finished task's summary or error, so status alone would keep
+ * the cached row without its outcome.
+ */
+export function getAgentLifecycleRowRevision(
+  row: AgentLifecycleRowModel,
+  childTasksById: ReadonlyMap<string, Task>,
+): string {
+  return JSON.stringify([
+    row.id,
+    row.state,
+    row.taskIds.map((taskId) => {
+      const childTask = childTasksById.get(taskId);
+      return childTask
+        ? [
+            taskId,
+            childTask.status,
+            childTask.title,
+            childTask.resultSummary ?? null,
+            childTask.error ?? null,
+          ]
+        : [taskId, null];
+    }),
+  ]);
 }
 
 function getTaskFeedRowsSignature(rows: TaskFeedRow[]): string {
@@ -1527,6 +1566,7 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
   const currentStep = props.currentStep as { description: string } | null;
   const eventTitleMarkdownComponents = props.eventTitleMarkdownComponents as any;
   const events = props.events as TaskEvent[];
+  const supersededSurfaceEventIds = useMemo(() => supersededAnswerSurfaceEvents(events), [events]);
   const activityGroupsById = props.activityGroupsById as Map<
     string,
     SharedTaskEventUiState["activityGroups"][number]
@@ -1821,9 +1861,7 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
                   .map((childTask) => `${childTask.id}:${childTask.status}`)
                   .join(",")}:${childEvents.length}:${collaborativeRun?.id ?? "none"}`
               : item.kind === "agent-lifecycle"
-                ? `${item.row.id}:${(item.row.taskIds as string[])
-                    .map((taskId) => `${taskId}:${childTasksById.get(taskId)?.status ?? "none"}`)
-                    .join(",")}`
+                ? getAgentLifecycleRowRevision(item.row as AgentLifecycleRowModel, childTasksById)
                 : item.kind === "action_block"
                   ? `${item.blockId}:${item.events.length}:${
                       item.events[item.events.length - 1]?.id ?? "none"
@@ -2966,6 +3004,7 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
                 const quotedAssistantMessage = event.payload?.quotedAssistantMessage as
                   | QuotedAssistantMessage
                   | undefined;
+                const surfaceOrigin = event.payload?.surfaceOrigin;
                 const attachmentNames = extractAttachmentNames(rawMessage);
                 const attachmentMetadata = parseUserMessageAttachmentMetadata(
                   event.payload?.images,
@@ -2977,6 +3016,13 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
                 return (
                   <Fragment key={event.id || `event-${item.eventIndex}`}>
                     <div className="chat-message user-message">
+                      {(surfaceOrigin === "answer" || surfaceOrigin === "page") && (
+                        <div className="user-message-surface-origin">
+                          {surfaceOrigin === "page"
+                            ? "Sent from an interactive page"
+                            : "Sent from a button in the answer"}
+                        </div>
+                      )}
                       <UserMessageImageGallery
                         attachments={attachmentMetadata}
                         workspacePath={workspace?.path}
@@ -3155,6 +3201,9 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
                                 workspacePath={workspace?.path}
                                 onOpenViewer={setViewerFilePath}
                                 taskId={event.taskId}
+                                surfacesSuperseded={
+                                  Boolean(event.id) && supersededSurfaceEventIds.has(event.id)
+                                }
                               />
                             </div>
                           </div>
@@ -3867,6 +3916,7 @@ function MainContentComponent({
   onDismissInputRequest,
   onOpenBrowserView,
   onViewTaskOutputs,
+  onViewSubAgents,
   onTasksChanged,
   onOpenSpreadsheetArtifact,
   onOpenDocumentArtifact,
@@ -5323,6 +5373,22 @@ function MainContentComponent({
     [task, events, hasActiveChildren],
   );
 
+  const composerPredictionRevision = useMemo(() => predictionRevision(rawEvents), [rawEvents]);
+  const composerPrediction = useComposerPrediction(
+    task?.id,
+    composerPredictionRevision,
+    task?.status === "completed" &&
+      !isTaskWorking &&
+      !isReplayMode &&
+      !inputValue &&
+      pendingAttachments.length === 0 &&
+      !quotedAssistantMessage &&
+      !isPreparingMessage &&
+      !isUploadingAttachments &&
+      voiceInput.state === "idle" &&
+      !talkMode.isActive,
+  );
+
   // Reset wrappingUp state when task stops working or task changes
   useEffect(() => {
     if (!isTaskWorking) setWrappingUp(false);
@@ -5433,6 +5499,11 @@ function MainContentComponent({
 
   const isTaskFinished =
     task?.status === "completed" || task?.status === "failed" || task?.status === "cancelled";
+  // The live agent strip above the composer goes away once agents settle, so a
+  // finished run with sub agents gets a jump to the right panel's Sub Agents list.
+  const showSubAgentsStripButton = Boolean(
+    onViewSubAgents && isTaskFinished && childTasks.length > 0,
+  );
   const defaultTranscriptMode = getDefaultTranscriptMode({
     isTaskWorking,
     isReplayMode,
@@ -7039,6 +7110,36 @@ function MainContentComponent({
     ],
   );
 
+  // An answer surface's approved action (SurfaceActions): sent like a message the user typed.
+  const handleSurfaceActionPrompt = useCallback(
+    async (text: string, origin: SurfaceActionOrigin) => {
+      if (!task?.id || !permissionSettingsLoaded) throw new Error("No conversation to send to");
+      const messageId =
+        globalThis.crypto?.randomUUID?.() ||
+        `ui-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const result = await onSendMessage(text, undefined, undefined, {
+        interactionMode: selectedInteractionMode,
+        returnOnAccepted: true,
+        messageId,
+        verbatim: true,
+        surfaceOrigin: origin,
+        ...(taskAccessProfileId ? { accessProfileId: taskAccessProfileId } : {}),
+      });
+      if (result === false) throw new Error("The message was not sent");
+    },
+    [
+      onSendMessage,
+      permissionSettingsLoaded,
+      selectedInteractionMode,
+      task?.id,
+      taskAccessProfileId,
+    ],
+  );
+  const handleSurfaceActionOpen = useCallback(
+    (url: string) => window.electronAPI.openExternal(url),
+    [],
+  );
+
   // Programmatic input updates still need a resize pass.
   useEffect(() => {
     if (!pendingProgrammaticResizeRef.current) return;
@@ -8106,6 +8207,15 @@ function MainContentComponent({
           fingerprint: message.trim().replace(/\s+/g, " ").toLowerCase(),
           messageId,
         };
+        // @Browser opens the visible in-app browser for this task right away.
+        if (
+          selectedIntegrationMentions.some((mention) => mention.id === "builtin:browser-use") &&
+          task &&
+          !remoteSession &&
+          workspace?.path
+        ) {
+          onOpenBrowserWorkbenchSidebar?.();
+        }
         const submission = onSendMessage(
           message,
           imagePayload,
@@ -11851,6 +11961,87 @@ function MainContentComponent({
                         {taskHeaderRoutineUnavailableReason}
                       </div>
                     )}
+                    {!isBotConversation && (
+                      <>
+                        <div className="main-header-task-menu-divider" role="separator" />
+                        <button
+                          type="button"
+                          className="main-header-task-menu-item"
+                          role="menuitemcheckbox"
+                          aria-checked={verboseSteps}
+                          data-task-header-menu-option
+                          onClick={() => {
+                            closeTaskHeaderMenu();
+                            toggleVerboseSteps();
+                          }}
+                        >
+                          <ListTree size={17} aria-hidden="true" />
+                          <span>Verbose timeline</span>
+                          {verboseSteps && (
+                            <CheckIcon
+                              className="main-header-task-menu-check"
+                              size={14}
+                              aria-hidden="true"
+                            />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          className="main-header-task-menu-item"
+                          role="menuitemcheckbox"
+                          aria-checked={codePreviewsExpanded}
+                          data-task-header-menu-option
+                          onClick={() => {
+                            closeTaskHeaderMenu();
+                            toggleCodePreviews();
+                          }}
+                        >
+                          <Code size={17} aria-hidden="true" />
+                          <span>Expand code previews</span>
+                          {codePreviewsExpanded && (
+                            <CheckIcon
+                              className="main-header-task-menu-check"
+                              size={14}
+                              aria-hidden="true"
+                            />
+                          )}
+                        </button>
+                        {replayControls &&
+                          !replayControls.isReplayMode &&
+                          (task.status === "completed" ||
+                            task.status === "failed" ||
+                            task.status === "cancelled") && (
+                            <button
+                              type="button"
+                              className="main-header-task-menu-item"
+                              role="menuitem"
+                              data-task-header-menu-option
+                              onClick={() => {
+                                closeTaskHeaderMenu();
+                                replayControls.startReplay();
+                              }}
+                            >
+                              <Play size={17} aria-hidden="true" />
+                              <span>Replay session</span>
+                            </button>
+                          )}
+                        {replayControls?.isReplayMode && !replayControls.areControlsVisible && (
+                          <button
+                            type="button"
+                            className="main-header-task-menu-item"
+                            role="menuitem"
+                            data-task-header-menu-option
+                            onClick={() => {
+                              closeTaskHeaderMenu();
+                              replayControls.showControls();
+                            }}
+                          >
+                            <SlidersHorizontal size={17} aria-hidden="true" />
+                            <span>Show replay controls</span>
+                          </button>
+                        )}
+                      </>
+                    )}
                     {hasTaskOutputs(taskOutputSummary) && onViewTaskOutputs && (
                       <button
                         type="button"
@@ -11932,229 +12123,169 @@ function MainContentComponent({
         />
       )}
       {/* Body */}
-      <div className="main-body" ref={mainBodyRef} onScroll={handleScroll}>
-        {!isBotConversation && (
-          <SelectionReplyPopover
-            containerRef={mainBodyRef}
-            agentName={agentContext.agentName || "CoWork"}
-            onReply={handleReplyToSelection}
-          />
-        )}
-        <div
-          className={`task-content${botRevealed ? "" : " bot-transcript-pending"}`}
-          ref={taskContentRef}
-        >
-          {isBotConversation && task && !remoteSession && (
-            <BotEarlierConversations
-              key={task.id}
-              currentTask={task}
-              botName={botName || "Bot"}
-              botMascot={botMascot}
-              scrollContainerRef={mainBodyRef}
-              loadInitialPage={botEventsLoaded && !hasMoreTimelineHistory}
-              onInitialPageDone={markBotHistoryReady}
-              canLoadMore={
-                botHistoryUnlocked && !hasMoreTimelineHistory && !isLoadingTimelineHistory
-              }
-              currentFirstMessageAt={botConversationFirstMessageAt}
-              renderMarkdown={renderBotHistoryMarkdown}
-              mascotForSender={botMascotForSender}
-            />
-          )}
-          {/* Always anchor the initial user prompt above the timeline. */}
-          {initialPromptBubble}
-          {isBotConversation && task && (
-            <BotCollaborationHeader
-              task={task}
-              botName={botName || "Bot"}
-              botIcon={botIcon}
-              events={events}
-              childEvents={childEvents}
-              childTasks={childTasks}
-              botConversations={botConversations}
-              onOpenBotConversation={onSelectBotConversation}
-              conversationProjection={conversationProjection}
-            />
-          )}
-          {showLegalWorkflowCard &&
-            (legalWorkflowInvocation.kind === "demand-intake" ? (
-              <LegalDemandIntakePromptCard
-                prompt={trimmedPrompt}
-                onSubmit={(message) => {
-                  onSendMessage(message);
-                  setDismissedLegalWorkflowTaskId(task.id);
-                }}
-                onDismiss={() => setDismissedLegalWorkflowTaskId(task.id)}
-              />
-            ) : (
-              <GenericLegalWorkflowPromptCard
-                invocation={legalWorkflowInvocation}
-                onSubmit={(message) => {
-                  onSendMessage(message);
-                  setDismissedLegalWorkflowTaskId(task.id);
-                }}
-                onDismiss={() => setDismissedLegalWorkflowTaskId(task.id)}
-              />
-            ))}
-
-          {task?.agentConfig?.executionMode === "debug" && <DebugSessionPanel events={events} />}
-
-          {researchWorkflowEnabled && (
-            <div
-              className="research-mode-badge"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                marginBottom: 8,
-                padding: "3px 10px",
-                borderRadius: 12,
-                fontSize: "0.72rem",
-                fontWeight: 500,
-                color: "var(--color-text-muted, #6b7280)",
-                background: "var(--color-bg-elevated, #f4f3ff)",
-                letterSpacing: "0.02em",
-              }}
-            >
-              <span style={{ fontSize: "0.65rem" }}>&#9679;</span>
-              Research mode
-            </div>
-          )}
-
-          {/* Timeline controls - show right after original prompt */}
-          {!isBotConversation && (hasNonConversationEvents || isTaskWorking || isTaskFinished) && (
-            <div className={`timeline-controls ${turnHeadersShown ? "with-turn-headers" : ""}`}>
-              <div className="timeline-controls-status">
-                {turnHeadersShown ? null : canToggleCompletedTranscript ? (
-                  <button
-                    type="button"
-                    className="timeline-controls-label timeline-controls-label-button with-duration"
-                    onClick={toggleCompletedTranscriptMode}
-                    aria-expanded={transcriptMode !== "delivery"}
-                    title={
-                      transcriptMode === "delivery"
-                        ? "Show full timeline"
-                        : "Show only final output"
-                    }
-                  >
-                    <span>{workDurationLabel}</span>
-                    <span className="timeline-controls-label-chevron" aria-hidden="true">
-                      <ChevronRight size={14} strokeWidth={2} />
-                    </span>
-                  </button>
-                ) : liveActivityHeaderVisible ? null : (
-                  <span
-                    className={`timeline-controls-label ${
-                      isTaskWorking || isTaskFinished ? "with-duration" : ""
-                    }`}
-                  >
-                    {workDurationLabel}
-                  </span>
-                )}
-                {isTaskWorking && continuationStatusChip && (
-                  <span className="header-continuation-chip" title="Adaptive continuation status">
-                    <span>{continuationStatusChip.window}</span>
-                    {continuationStatusChip.progress && (
-                      <span className="header-continuation-chip-sep">·</span>
-                    )}
-                    {continuationStatusChip.progress && (
-                      <span>{continuationStatusChip.progress}</span>
-                    )}
-                    {continuationStatusChip.loopRisk && (
-                      <span className="header-continuation-chip-sep">·</span>
-                    )}
-                    {continuationStatusChip.loopRisk && (
-                      <span>{continuationStatusChip.loopRisk}</span>
-                    )}
-                  </span>
-                )}
-              </div>
-              <div className="timeline-controls-actions">
-                <button
-                  type="button"
-                  className="verbose-switch"
-                  role="switch"
-                  aria-checked={verboseSteps}
-                  aria-label={`Verbose mode ${verboseSteps ? "on" : "off"}`}
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    toggleVerboseSteps();
-                  }}
-                  title={`Verbose mode ${verboseSteps ? "on" : "off"} (click to toggle)`}
-                >
-                  <span className="goal-mode-toggle-switch-content">
-                    <span className="goal-mode-toggle-text">
-                      <span className="verbose-switch-label">Verbose</span>
-                    </span>
-                    <span
-                      className={`goal-mode-switch-track ${verboseSteps ? "on" : ""}`}
-                      aria-hidden="true"
-                    >
-                      <span className="goal-mode-switch-thumb" />
-                    </span>
-                  </span>
-                </button>
-                <button
-                  className={`verbose-toggle-btn ${codePreviewsExpanded ? "active" : ""}`}
-                  onClick={toggleCodePreviews}
-                  title={
-                    codePreviewsExpanded
-                      ? "Collapse code previews by default"
-                      : "Expand code previews by default"
-                  }
-                >
-                  {codePreviewsExpanded ? "Code: Open" : "Code: Collapsed"}
-                </button>
-                {replayControls &&
-                  !replayControls.isReplayMode &&
-                  (task?.status === "completed" ||
-                    task?.status === "failed" ||
-                    task?.status === "cancelled") && (
-                    <button
-                      className="replay-entry-btn"
-                      onClick={replayControls.startReplay}
-                      title="Replay this session step by step"
-                    >
-                      <svg
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      >
-                        <polygon points="5 3 19 12 5 21 5 3" />
-                      </svg>
-                      Replay
-                    </button>
-                  )}
-                {replayControls?.isReplayMode && !replayControls.areControlsVisible && (
-                  <button
-                    className="replay-entry-btn"
-                    onClick={replayControls.showControls}
-                    title="Show replay controls"
-                  >
-                    <SlidersHorizontal aria-hidden="true" />
-                    Replay controls
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Replay controls bar — shown when replay mode is active */}
-          {replayControls?.isReplayMode && replayControls.areControlsVisible && (
-            <ReplayControlsBar controls={replayControls} />
-          )}
-
-          {conversationFlow}
-          {/* A bot's earlier conversations scroll in above instead. */}
+      <SurfaceActionProvider
+        scopeKey={task?.id}
+        onSendPrompt={handleSurfaceActionPrompt}
+        onOpenLink={handleSurfaceActionOpen}
+      >
+        <div className="main-body" ref={mainBodyRef} onScroll={handleScroll}>
           {!isBotConversation && (
-            <TaskSessionLineageFooter task={task} onSelectTask={onSelectTask} />
+            <SelectionReplyPopover
+              containerRef={mainBodyRef}
+              agentName={agentContext.agentName || "CoWork"}
+              onReply={handleReplyToSelection}
+            />
           )}
+          <div
+            className={`task-content${botRevealed ? "" : " bot-transcript-pending"}`}
+            ref={taskContentRef}
+          >
+            {isBotConversation && task && !remoteSession && (
+              <BotEarlierConversations
+                key={task.id}
+                currentTask={task}
+                botName={botName || "Bot"}
+                botMascot={botMascot}
+                scrollContainerRef={mainBodyRef}
+                loadInitialPage={botEventsLoaded && !hasMoreTimelineHistory}
+                onInitialPageDone={markBotHistoryReady}
+                canLoadMore={
+                  botHistoryUnlocked && !hasMoreTimelineHistory && !isLoadingTimelineHistory
+                }
+                currentFirstMessageAt={botConversationFirstMessageAt}
+                renderMarkdown={renderBotHistoryMarkdown}
+                mascotForSender={botMascotForSender}
+              />
+            )}
+            {/* Always anchor the initial user prompt above the timeline. */}
+            {initialPromptBubble}
+            {isBotConversation && task && (
+              <BotCollaborationHeader
+                task={task}
+                botName={botName || "Bot"}
+                botIcon={botIcon}
+                events={events}
+                childEvents={childEvents}
+                childTasks={childTasks}
+                botConversations={botConversations}
+                onOpenBotConversation={onSelectBotConversation}
+                conversationProjection={conversationProjection}
+              />
+            )}
+            {showLegalWorkflowCard &&
+              (legalWorkflowInvocation.kind === "demand-intake" ? (
+                <LegalDemandIntakePromptCard
+                  prompt={trimmedPrompt}
+                  onSubmit={(message) => {
+                    onSendMessage(message);
+                    setDismissedLegalWorkflowTaskId(task.id);
+                  }}
+                  onDismiss={() => setDismissedLegalWorkflowTaskId(task.id)}
+                />
+              ) : (
+                <GenericLegalWorkflowPromptCard
+                  invocation={legalWorkflowInvocation}
+                  onSubmit={(message) => {
+                    onSendMessage(message);
+                    setDismissedLegalWorkflowTaskId(task.id);
+                  }}
+                  onDismiss={() => setDismissedLegalWorkflowTaskId(task.id)}
+                />
+              ))}
+
+            {task?.agentConfig?.executionMode === "debug" && <DebugSessionPanel events={events} />}
+
+            {researchWorkflowEnabled && (
+              <div
+                className="research-mode-badge"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  marginBottom: 8,
+                  padding: "3px 10px",
+                  borderRadius: 12,
+                  fontSize: "0.72rem",
+                  fontWeight: 500,
+                  color: "var(--color-text-muted, #6b7280)",
+                  background: "var(--color-bg-elevated, #f4f3ff)",
+                  letterSpacing: "0.02em",
+                }}
+              >
+                <span style={{ fontSize: "0.65rem" }}>&#9679;</span>
+                Research mode
+              </div>
+            )}
+
+            {/* Timeline controls - show right after original prompt */}
+            {!isBotConversation &&
+              (hasNonConversationEvents || isTaskWorking || isTaskFinished) &&
+              (!turnHeadersShown || Boolean(isTaskWorking && continuationStatusChip)) && (
+                <div className={`timeline-controls ${turnHeadersShown ? "with-turn-headers" : ""}`}>
+                  <div className="timeline-controls-status">
+                    {turnHeadersShown ? null : canToggleCompletedTranscript ? (
+                      <button
+                        type="button"
+                        className="timeline-controls-label timeline-controls-label-button with-duration"
+                        onClick={toggleCompletedTranscriptMode}
+                        aria-expanded={transcriptMode !== "delivery"}
+                        title={
+                          transcriptMode === "delivery"
+                            ? "Show full timeline"
+                            : "Show only final output"
+                        }
+                      >
+                        <span>{workDurationLabel}</span>
+                        <span className="timeline-controls-label-chevron" aria-hidden="true">
+                          <ChevronRight size={14} strokeWidth={2} />
+                        </span>
+                      </button>
+                    ) : liveActivityHeaderVisible ? null : (
+                      <span
+                        className={`timeline-controls-label ${
+                          isTaskWorking || isTaskFinished ? "with-duration" : ""
+                        }`}
+                      >
+                        {workDurationLabel}
+                      </span>
+                    )}
+                    {isTaskWorking && continuationStatusChip && (
+                      <span
+                        className="header-continuation-chip"
+                        title="Adaptive continuation status"
+                      >
+                        <span>{continuationStatusChip.window}</span>
+                        {continuationStatusChip.progress && (
+                          <span className="header-continuation-chip-sep">·</span>
+                        )}
+                        {continuationStatusChip.progress && (
+                          <span>{continuationStatusChip.progress}</span>
+                        )}
+                        {continuationStatusChip.loopRisk && (
+                          <span className="header-continuation-chip-sep">·</span>
+                        )}
+                        {continuationStatusChip.loopRisk && (
+                          <span>{continuationStatusChip.loopRisk}</span>
+                        )}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+            {/* Replay controls bar — shown when replay mode is active */}
+            {replayControls?.isReplayMode && replayControls.areControlsVisible && (
+              <ReplayControlsBar controls={replayControls} />
+            )}
+
+            {conversationFlow}
+            {/* A bot's earlier conversations scroll in above instead. */}
+            {!isBotConversation && (
+              <TaskSessionLineageFooter task={task} onSelectTask={onSelectTask} />
+            )}
+          </div>
         </div>
-      </div>
+      </SurfaceActionProvider>
 
       {headerActionError && (
         <div className="task-header-action-error" role="alert">
@@ -12234,15 +12365,19 @@ function MainContentComponent({
               markdownComponents={markdownComponents}
               leading={isBuildTaskView ? <BuildStripBadge /> : undefined}
               actions={
-                isBuildTaskView && (buildChangedPaths.size > 0 || buildPreviewPath) ? (
+                (isBuildTaskView && (buildChangedPaths.size > 0 || buildPreviewPath)) ||
+                showSubAgentsStripButton ? (
                   <>
-                    {buildChangedPaths.size > 0 && (
+                    {showSubAgentsStripButton && onViewSubAgents && (
+                      <SubAgentsStripButton count={childTasks.length} onOpen={onViewSubAgents} />
+                    )}
+                    {isBuildTaskView && buildChangedPaths.size > 0 && (
                       <BuildChangesButton
                         count={buildChangedPaths.size}
                         onOpen={() => setBuildChangesOpen(true)}
                       />
                     )}
-                    {buildPreviewPath && (
+                    {isBuildTaskView && buildPreviewPath && (
                       <BuildPreviewButton path={buildPreviewPath} onOpen={openWebArtifact} />
                     )}
                   </>
@@ -12619,7 +12754,12 @@ function MainContentComponent({
                 value={inputValue}
                 mentions={integrationMentionSpans}
                 ariaLabel="Message"
-                onChange={handleInputChange}
+                prediction={composerPrediction.prediction}
+                onDismissPrediction={composerPrediction.dismiss}
+                onChange={(...args) => {
+                  composerPrediction.dismiss();
+                  handleInputChange(...args);
+                }}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
                 onCursorChange={handleInputCursorChange}

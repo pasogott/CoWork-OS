@@ -337,6 +337,11 @@ import {
 } from "../../shared/pact";
 import type { PactRuntime } from "../pact/runtime";
 import { createDaemonPactRuntime } from "../pact/daemon-host";
+import {
+  SUPERSEDED_SYNTHESIS_ITEM_TITLE,
+  getLatestSynthesisChildTask,
+  isSynthesisChildTask,
+} from "../../shared/synthesis-agent-detection";
 
 export interface AgentDaemonOptions {
   startupRecovery?: boolean;
@@ -441,6 +446,64 @@ export function shouldRestartInterruptedTask(input: {
     !input.hasRecoveredBotHandoff &&
     !input.hasQueuedUserFollowUp
   );
+}
+
+/** Where a user update on a collaborative root went while its team run was working. */
+export interface CollaborativeUpdateDelivery {
+  /** Running specialist lanes that accepted the forwarded update. */
+  forwarded: string[];
+  /** Specialist lanes that had already finished when the update arrived. */
+  finished: string[];
+  /** Specialist lanes that are not running (not started yet, or could not take it). */
+  notRunning: string[];
+  /** The synthesis drafting the final answer accepted the forwarded update. */
+  synthesisForwarded: boolean;
+  /** The synthesis had already finished when the update arrived. */
+  synthesisFinished: boolean;
+}
+
+/**
+ * Deterministic reply to a user update on a collaborative root. It states only
+ * what the daemon actually did with the update, so the user is never told the
+ * team could not be briefed when it was.
+ */
+export function buildCollaborativeUpdateAcknowledgement(
+  delivery: CollaborativeUpdateDelivery,
+): string {
+  const names = (list: string[]): string => list.join(", ");
+  const sentences: string[] = [];
+  if (delivery.forwarded.length > 0) {
+    const count = delivery.forwarded.length;
+    sentences.push(
+      `Passed your update to the ${count} ${count === 1 ? "specialist" : "specialists"} still working: ${names(delivery.forwarded)}. ${count === 1 ? "It applies" : "They apply"} it to the rest of their work.`,
+    );
+  }
+  if (delivery.synthesisForwarded) {
+    sentences.push(
+      "Passed your update to the synthesis drafting the final answer; it applies it before finishing.",
+    );
+  }
+  if (delivery.forwarded.length === 0 && !delivery.synthesisForwarded) {
+    sentences.push(
+      delivery.synthesisFinished
+        ? "The team's final answer was already drafted before your update arrived, so it does not include this update. Send it again once the answer is delivered to revise it."
+        : "No specialist is still working, so your update goes to the synthesis that drafts the final answer.",
+    );
+  }
+  if (delivery.finished.length > 0) {
+    sentences.push(
+      `${names(delivery.finished)} had already finished, so the synthesis reconciles ${delivery.finished.length === 1 ? "that result" : "those results"} with your update.`,
+    );
+  }
+  if (delivery.notRunning.length > 0) {
+    sentences.push(
+      `${names(delivery.notRunning)} ${delivery.notRunning.length === 1 ? "is" : "are"} not running right now, so the synthesis applies your update to ${delivery.notRunning.length === 1 ? "its result" : "their results"}.`,
+    );
+  }
+  if (!delivery.synthesisFinished) {
+    sentences.push("The final answer follows when the team finishes and uses your update.");
+  }
+  return sentences.join(" ");
 }
 
 const RESUME_STATE_EVENT_TYPES = [
@@ -623,6 +686,7 @@ type DaemonFollowUpOptions = Pick<
   | "senderLabel"
   | "inReplyToMessageId"
   | "inReplyToTaskId"
+  | "surfaceOrigin"
 > & {
   /** Return to the renderer once the follow-up is durably admitted, not after provider completion. */
   returnOnAccepted?: boolean;
@@ -7561,6 +7625,7 @@ export class AgentDaemon extends EventEmitter {
       allowAutoApprove?: boolean;
       signal?: AbortSignal;
       requireExplicitApproval?: boolean;
+      noStandingApproval?: boolean;
     },
   ): Promise<boolean> {
     if (request.signal?.aborted) throw new Error("Tool authorization cancelled");
@@ -7588,6 +7653,7 @@ export class AgentDaemon extends EventEmitter {
         allowAutoApprove: request.allowAutoApprove,
         signal: request.signal,
         requireExplicitApproval: request.requireExplicitApproval,
+        ...(request.noStandingApproval ? { noStandingApproval: true } : {}),
       },
     );
   }
@@ -11688,6 +11754,10 @@ export class AgentDaemon extends EventEmitter {
     const itemRepo = new AgentTeamItemStore(this.dbManager.getDatabase());
     const existing = itemRepo.findById(node.teamItemId);
     if (!existing) return;
+    // A synthesis attempt already replaced by a retry keeps its failed status and
+    // retry note; the late node notification would overwrite them with the
+    // attempt's raw output. The orchestrator has already acted on it.
+    if (existing.title === SUPERSEDED_SYNTHESIS_ITEM_TITLE) return;
 
     const nextStatus =
       notification.status === "completed"
@@ -14803,6 +14873,7 @@ export class AgentDaemon extends EventEmitter {
     if (isTerminalTaskStatus(currentStatus)) {
       return;
     }
+    if (this.reconcilePendingUserUpdateBeforeCompletion(taskId).deferred) return;
 
     this.cleanupPendingApprovalsForTask(
       taskId,
@@ -16047,6 +16118,13 @@ export class AgentDaemon extends EventEmitter {
     if (options?.deliveryMode === "message") {
       return this.queueMessageOnly(task, message, images, quotedAssistantMessage, options);
     }
+    const collaborativeUpdate = await this.acknowledgeCollaborativeRootUpdate(
+      task,
+      message,
+      images,
+      options,
+    );
+    if (collaborativeUpdate) return collaborativeUpdate;
     // Renderer retries may arrive after the IPC call returned but before the
     // composer receives the acceptance callback. A stable message_id is the
     // idempotency boundary for ordinary follow-ups too; never create a second
@@ -16317,6 +16395,9 @@ export class AgentDaemon extends EventEmitter {
           : {}),
         ...(integrationMentions && integrationMentions.length > 0 ? { integrationMentions } : {}),
         ...(quotedAssistantMessage ? { quotedAssistantMessage } : {}),
+        ...(effectiveOptions?.surfaceOrigin
+          ? { surfaceOrigin: effectiveOptions.surfaceOrigin }
+          : {}),
         ...(effectiveOptions?.queuedAttachmentRefs?.length
           ? { queuedAttachmentRefs: effectiveOptions.queuedAttachmentRefs }
           : {}),
@@ -16344,6 +16425,7 @@ export class AgentDaemon extends EventEmitter {
         deliveryMode,
         effectiveOptions?.inReplyToMessageId,
         effectiveOptions?.inReplyToTaskId,
+        effectiveOptions?.surfaceOrigin,
       );
       // queueFollowUp snapshots the pending item; include that row in the return
       // boundary so the accepted queue item survives an immediate restart.
@@ -16352,7 +16434,7 @@ export class AgentDaemon extends EventEmitter {
       // found the queue empty. Nothing would then pick this item up, so drain now.
       if (!executor.isRunning) this.processOrphanedFollowUps(taskId, executor);
       if (effectiveOptions?.messageSource !== "agent") {
-        this.forwardRootFollowUpToActiveTeamLanes(
+        void this.forwardRootFollowUpToActiveTeamLanes(
           effectiveTask,
           message,
           effectiveOptions?.messageId,
@@ -16412,6 +16494,9 @@ export class AgentDaemon extends EventEmitter {
           ? { integrationMentions: effectiveOptions.integrationMentions }
           : {}),
         ...(quotedAssistantMessage ? { quotedAssistantMessage } : {}),
+        ...(effectiveOptions?.surfaceOrigin
+          ? { surfaceOrigin: effectiveOptions.surfaceOrigin }
+          : {}),
         ...(effectiveOptions?.queuedAttachmentRefs?.length
           ? { queuedAttachmentRefs: effectiveOptions.queuedAttachmentRefs }
           : {}),
@@ -16427,7 +16512,7 @@ export class AgentDaemon extends EventEmitter {
       }
     }
     if (effectiveOptions?.messageSource !== "agent") {
-      this.forwardRootFollowUpToActiveTeamLanes(
+      void this.forwardRootFollowUpToActiveTeamLanes(
         effectiveTask,
         message,
         effectiveOptions?.messageId,
@@ -16565,6 +16650,7 @@ export class AgentDaemon extends EventEmitter {
           senderLabel: effectiveOptions?.senderLabel,
           inReplyToMessageId: effectiveOptions?.inReplyToMessageId,
           inReplyToTaskId: effectiveOptions?.inReplyToTaskId,
+          surfaceOrigin: effectiveOptions?.surfaceOrigin,
           onAccepted: onAgentMessageAccepted ?? onQueuedUserFollowUpAccepted,
           onProviderDispatchStarted: onQueuedUserFollowUpProviderDispatchStarted,
           onProviderDispatchCompleted: onQueuedUserFollowUpProviderDispatchCompleted,
@@ -18005,6 +18091,54 @@ export class AgentDaemon extends EventEmitter {
   }
 
   /**
+   * A child task's result is consumed by its parent as soon as the child
+   * completes. When a user update was accepted for the child but is still
+   * waiting in its executor queue, the finishing turn never saw it, so its
+   * answer predates the newest revision. Keep the child executing instead:
+   * the queued update runs as the next turn once this one returns, and that
+   * turn's answer becomes the stored result the parent's synthesis reads.
+   * Follow-up turns call this before their own completion as well.
+   */
+  reconcilePendingUserUpdateBeforeCompletion(taskId: string): {
+    deferred: boolean;
+    pendingMessageIds: string[];
+  } {
+    const task = this.taskRepo.findById(taskId);
+    if (!task?.parentTaskId) return { deferred: false, pendingMessageIds: [] };
+    const executor = this.activeTasks.get(taskId)?.executor;
+    let queued: TaskFollowUpInput[] = [];
+    try {
+      const pending = executor?.runtime?.state?.queues?.pendingFollowUps;
+      queued = Array.isArray(pending) ? pending : [];
+    } catch (error) {
+      log.warn(`Could not read queued follow-ups for task ${taskId}:`, error);
+      return { deferred: false, pendingMessageIds: [] };
+    }
+    const pendingUserUpdates = queued.filter(
+      (followUp) =>
+        followUp?.deliveryMode === "follow_up" &&
+        followUp.messageSource !== "agent" &&
+        typeof followUp.message === "string" &&
+        followUp.message.trim().length > 0,
+    );
+    if (pendingUserUpdates.length === 0) return { deferred: false, pendingMessageIds: [] };
+    const pendingMessageIds = pendingUserUpdates
+      .map((followUp) => (typeof followUp.messageId === "string" ? followUp.messageId : ""))
+      .filter(Boolean);
+    if (task.status !== "executing") this.updateTaskStatus(taskId, "executing");
+    this.logEvent(taskId, "log", {
+      message:
+        "Completion deferred: a user update arrived after this answer was drafted; the update runs next and its answer becomes the result.",
+      metric: "completion_deferred_for_user_update",
+      pendingUpdateCount: pendingUserUpdates.length,
+      ...(pendingMessageIds.length > 0 ? { pendingMessageIds } : {}),
+    });
+    // A running executor drains its queue when its current run returns.
+    if (executor && !executor.isRunning) this.processOrphanedFollowUps(taskId, executor);
+    return { deferred: true, pendingMessageIds };
+  }
+
+  /**
    * A follow-up on a collaborative root while its team run is still working
    * must not complete the root: the team's synthesis is the final answer, and
    * the orchestrator completes the root when it lands.
@@ -18035,38 +18169,151 @@ export class AgentDaemon extends EventEmitter {
 
   /**
    * Forward a user's update on a collaborative root to the team lanes that are
-   * still running, so they apply it at their next turn boundary.
+   * still running, so they apply it at their next turn boundary. Resolves to
+   * the ids of the lanes that accepted it.
    */
-  private forwardRootFollowUpToActiveTeamLanes(
+  private async forwardRootFollowUpToActiveTeamLanes(
     rootTask: Task,
     message: string,
     rootMessageId?: string,
-  ): void {
+  ): Promise<Set<string>> {
+    const accepted = new Set<string>();
     const config = rootTask.agentConfig;
     if (!config?.collaborativeMode || config.childAgentCollaborativeRun) {
-      return;
+      return accepted;
     }
     const text = String(message || "").trim();
-    if (!text) return;
+    if (!text) return accepted;
     const run = this.findTeamRunByRootTaskId(rootTask.id);
-    if (!run || run.status !== "running") return;
+    if (!run || run.status !== "running") return accepted;
     const forwarded =
       "The user updated the parent request while you were working. This supersedes any " +
       "conflicting value in your original task; apply it to the rest of your work and recheck " +
       `figures you already produced:\n${text}`;
+    const deliveries: Promise<void>[] = [];
     for (const child of this.taskRepo.findByParent(rootTask.id)) {
       if (isTerminalTaskStatus(deriveCanonicalTaskStatus(child))) continue;
       // Only lanes already running take the update; one not yet started reads
       // it from the synthesis-time USER UPDATES section instead.
       if (!this.activeTasks.get(child.id)?.executor.isRunning) continue;
-      void this.sendMessage(child.id, forwarded, undefined, undefined, {
-        deliveryMode: "follow_up",
-        messageSource: "user",
-        ...(rootMessageId ? { messageId: `${rootMessageId}:lane:${child.id}` } : {}),
-      }).catch((error) =>
-        log.warn(`Could not forward a root follow-up to team lane ${child.id}:`, error),
+      deliveries.push(
+        this.sendMessage(child.id, forwarded, undefined, undefined, {
+          deliveryMode: "follow_up",
+          messageSource: "user",
+          ...(rootMessageId ? { messageId: `${rootMessageId}:lane:${child.id}` } : {}),
+        }).then(
+          () => {
+            accepted.add(child.id);
+          },
+          (error) =>
+            log.warn(`Could not forward a root follow-up to team lane ${child.id}:`, error),
+        ),
       );
     }
+    await Promise.all(deliveries);
+    return accepted;
+  }
+
+  /**
+   * A user update on a collaborative root while its team run is working goes
+   * to the team, not to a free-form root turn: the root's own executor has no
+   * view of the specialists and would wrongly report that it cannot brief
+   * them. Forward the update to the running lanes, record it for the
+   * synthesis (which reads root user updates), and reply with exactly what
+   * happened. The root stays executing; the synthesis remains its answer.
+   * Returns null when the regular follow-up path applies.
+   */
+  private async acknowledgeCollaborativeRootUpdate(
+    rootTask: Task,
+    message: string,
+    images: ImageAttachment[] | undefined,
+    options: DaemonFollowUpOptions | undefined,
+  ): Promise<AgentMessageSendResult | null> {
+    const config = rootTask.agentConfig;
+    if (!config?.collaborativeMode || config.childAgentCollaborativeRun) return null;
+    if (options?.messageSource === "agent" || options?.queuedFollowUp) return null;
+    // Attachments cannot be relayed to the lanes; keep the regular path for them.
+    if (
+      images?.length ||
+      options?.capturedAttachments?.length ||
+      options?.queuedAttachmentRefs?.length
+    ) {
+      return null;
+    }
+    const text = String(message || "").trim();
+    if (!text) return null;
+    const run = this.findTeamRunByRootTaskId(rootTask.id);
+    if (!run || run.status !== "running") return null;
+
+    const acceptedAt = Date.now();
+    const messageId = options?.messageId?.trim() || undefined;
+    this.taskRepo.touch(rootTask.id);
+    // The synthesis prompt lists root user updates from these receipts, so
+    // commit it before any lane can finish and trigger the synthesis.
+    this.logEvent(rootTask.id, "user_message", {
+      message,
+      messageSource: options?.messageSource ?? "user",
+      ...(messageId ? { messageId } : {}),
+      deliveryMode: "follow_up",
+      deliveryStatus: "delivered",
+      acceptedAt,
+      deliveredAt: acceptedAt,
+      collaborativeRunUpdate: true,
+      ...(options?.requestFingerprint ? { requestFingerprint: options.requestFingerprint } : {}),
+      ...(options?.interactionMode ? { interactionMode: options.interactionMode } : {}),
+      ...(options?.integrationMentions?.length
+        ? { integrationMentions: options.integrationMentions }
+        : {}),
+    });
+    await this.timelineRowsCommitted(rootTask.id);
+
+    const acceptedLaneIds = await this.forwardRootFollowUpToActiveTeamLanes(
+      rootTask,
+      text,
+      messageId,
+    );
+    const delivery: CollaborativeUpdateDelivery = {
+      forwarded: [],
+      finished: [],
+      notRunning: [],
+      synthesisForwarded: false,
+      synthesisFinished: false,
+    };
+    const children = this.taskRepo.findByParent(rootTask.id);
+    const latestSynthesis = getLatestSynthesisChildTask(children);
+    for (const child of children) {
+      const status = deriveCanonicalTaskStatus(child);
+      const label = String(child.title || "").trim() || "A specialist";
+      if (isSynthesisChildTask(child)) {
+        if (child.id !== latestSynthesis?.id) continue;
+        if (acceptedLaneIds.has(child.id)) delivery.synthesisForwarded = true;
+        else if (status === "completed") delivery.synthesisFinished = true;
+        continue;
+      }
+      if (child.title === SUPERSEDED_SYNTHESIS_ITEM_TITLE) continue;
+      if (acceptedLaneIds.has(child.id)) delivery.forwarded.push(label);
+      else if (status === "completed") delivery.finished.push(label);
+      else if (!isTerminalTaskStatus(status)) delivery.notRunning.push(label);
+    }
+    const acknowledgement = buildCollaborativeUpdateAcknowledgement(delivery);
+    this.logEvent(rootTask.id, "assistant_message", {
+      message: acknowledgement,
+      source: "collaborative_update_ack",
+      forwardedLaneCount: delivery.forwarded.length + (delivery.synthesisForwarded ? 1 : 0),
+    });
+    if (this.teamOrchestrator) {
+      void this.teamOrchestrator
+        .tickRun(run.id, "root_follow_up_forwarded")
+        .catch((error) => log.warn(`Team run tick after a root update failed:`, error));
+    }
+    return {
+      queued: false,
+      ...(messageId ? { messageId } : {}),
+      deliveryMode: "follow_up",
+      deliveryStatus: "delivered",
+      acceptedAt,
+      deliveredAt: acceptedAt,
+    };
   }
 
   /** User follow-up messages on a task, in order, excluding its original request. */

@@ -654,6 +654,15 @@ export function createBrowserMCPDefinitions(
       z.object({ workspaceId: identifier, config: createServerSchema }).strict(),
       async (context, { workspaceId, config }) => {
         await authorize(context, workspaceId, true);
+        // Persisted enabled servers can also launch through auto-connect. Reject
+        // custom process plans here, before any settings write, not just at connect.
+        if (config.transport === "stdio") {
+          throw new WebApplicationError(
+            "FORBIDDEN",
+            "Custom stdio MCP servers must be configured on the host. Browser clients can add remote servers or review a registry launch plan.",
+            403,
+          );
+        }
         assertEnableAllowed(undefined, { ...config, id: "" } as MCPServerConfig);
         const created = settings.addServer(config as Omit<MCPServerConfig, "id">);
         return projectServer(created);
@@ -681,6 +690,18 @@ export function createBrowserMCPDefinitions(
           );
         }
         const current = requireServer(serverId);
+        // Environment values affect executable lookup, runtime loading, and
+        // ${VAR} argument substitution just as command/args/cwd affect the plan.
+        if (
+          current.transport === "stdio" &&
+          (updates.env !== undefined || (updates.removeEnvKeys?.length ?? 0) > 0)
+        ) {
+          throw new WebApplicationError(
+            "FORBIDDEN",
+            "Stdio MCP environment changes must be configured on the host.",
+            403,
+          );
+        }
         // registryId is the connector identity admin policy matches on; it is set at install.
         if (updates.registryId !== undefined && updates.registryId !== current.registryId) {
           throw new WebApplicationError(

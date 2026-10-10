@@ -8,7 +8,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { Task, AgentTeamRun, AgentThought, TaskEvent } from "../../shared/types";
-import { isSynthesisChildTask } from "../../shared/synthesis-agent-detection";
+import {
+  getRecoveredSynthesisTaskIds,
+  isSynthesisChildTask,
+} from "../../shared/synthesis-agent-detection";
 import { AgentGlyph, type AgentGlyphState } from "./AgentGlyph";
 import {
   assignAgentGlyphs,
@@ -43,6 +46,8 @@ interface AgentLine {
   taskId: string | null; // null when not yet spawned
   glyph: AgentGlyphSpec;
   task?: Task | null;
+  /** A failed synthesis attempt replaced by a successful retry: history, not a failure. */
+  recovered?: boolean;
 }
 
 type AgentLineStatusKind = "completed" | "failed" | "warning" | "running" | "pending";
@@ -266,6 +271,22 @@ const glyphStateFor = (kind: AgentLineStatusKind): AgentGlyphState =>
         ? "failed"
         : "idle";
 
+/**
+ * Whether any agent is still working. A team item that never spawned stays "pending"
+ * forever, so it stops counting as live once the main task has finished.
+ */
+export function hasLiveAgentLine(
+  lines: ReadonlyArray<Pick<AgentLine, "statusKind" | "recovered" | "task">>,
+  mainTaskCompleted: boolean,
+): boolean {
+  return lines.some(
+    (line) =>
+      !line.recovered &&
+      (line.statusKind === "running" ||
+        (line.statusKind === "pending" && (Boolean(line.task) || !mainTaskCompleted))),
+  );
+}
+
 export function CollaborativeAgentLines({
   collaborativeRun,
   childTasks,
@@ -370,6 +391,7 @@ export function CollaborativeAgentLines({
 
   // Build agent lines: prefer child tasks, fall back to team items (before spawn)
   const childByTaskId = new Map(childTasks.map((t) => [t.id, t]));
+  const recoveredTaskIds = getRecoveredSynthesisTaskIds(childTasks);
   const agentLines: AgentLine[] = [];
 
   // From child tasks (spawned agents)
@@ -377,13 +399,15 @@ export function CollaborativeAgentLines({
     const roleId = t.assignedAgentRoleId ?? taskToRole.get(t.id);
     const isStreaming = !!roleId && streamingByAgent.has(roleId);
     const status = getLatestStepLabel(t.id, childEvents, t, isStreaming);
-    const statusKind = getAgentLineStatusKind(t, status, isStreaming);
+    const recovered = recoveredTaskIds.has(t.id);
+    const statusKind = recovered ? "warning" : getAgentLineStatusKind(t, status, isStreaming);
     agentLines.push({
       id: t.id,
       title: t.title,
-      status,
+      status: recovered ? "Failed, then recovered by a successful retry" : status,
       statusKind,
-      statusLabel: getAgentLineStatusLabel(statusKind, t),
+      statusLabel: recovered ? "Retried" : getAgentLineStatusLabel(statusKind, t),
+      recovered,
       isStreaming,
       taskId: t.id,
       glyph: agentGlyphs.get(t.id) ?? getAgentGlyphForSeed(t.id),
@@ -428,11 +452,15 @@ export function CollaborativeAgentLines({
 
   const statusCounts = agentLines.reduce<Record<AgentLineStatusKind, number>>(
     (acc, line) => {
-      acc[line.statusKind] += 1;
+      if (!line.recovered) acc[line.statusKind] += 1;
       return acc;
     },
     { completed: 0, failed: 0, warning: 0, running: 0, pending: 0 },
   );
+
+  // Live strip only: once every agent has settled, the right panel's Sub Agents
+  // section is the record, so don't keep finished rows above the composer.
+  if (!hasLiveAgentLine(agentLines, mainTaskCompleted)) return null;
 
   return (
     <div className="collaborative-agent-lines">

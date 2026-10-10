@@ -15,7 +15,9 @@ import {
   hasVerificationEvidence,
   getBestFinalResponseCandidate,
   parseVerificationProtocolOutcome,
+  responseDirectlyAddressesPrompt,
   responseHasDecisionSignal,
+  responseIsStructuredRecommendation,
   responseLooksOperationalOnly,
   responseHasExecutionReportEvidenceSignal,
 } from "../executor-completion-utils";
@@ -134,6 +136,17 @@ describe("TaskExecutor completion contract integration", () => {
     expect(responseHasDecisionSignal("The read-back matched all requested totals.")).toBe(true);
     expect(responseHasDecisionSignal("The report did not match the source totals.")).toBe(true);
   });
+
+  it.each(["VERDICT: PASS", "VERDICT: FAIL", "VERDICT: PARTIAL", "**Verdict:** pass"])(
+    "recognizes the verifier verdict format as a decision signal: %s",
+    (verdict) => {
+      expect(
+        responseHasDecisionSignal(
+          `${verdict}\n\n- The saved workbook contains Transactions and Summary sheets with euro formats.`,
+        ),
+      ).toBe(true);
+    },
+  );
 
   it("recognizes a factual header-presence statement as a decision signal", () => {
     expect(responseHasDecisionSignal("orders.csv includes one header row.")).toBe(true);
@@ -1458,7 +1471,7 @@ Saved to scratchpad under \`repo-state-recent-commits-alt-log\`.`;
     await (executor as Any).execute();
 
     expect((executor as Any).createMessageWithTimeout).toHaveBeenCalledWith(
-      expect.objectContaining({ maxTokens: 1200 }),
+      expect.objectContaining({ maxTokens: 4000 }),
       35_000,
       "Final answer synthesis",
     );
@@ -1517,7 +1530,7 @@ Saved to scratchpad under \`repo-state-recent-commits-alt-log\`.`;
     await (executor as Any).execute();
 
     expect((executor as Any).createMessageWithTimeout).toHaveBeenCalledWith(
-      expect.objectContaining({ maxTokens: 1200 }),
+      expect.objectContaining({ maxTokens: 4000 }),
       35_000,
       "Final answer synthesis",
     );
@@ -2280,7 +2293,7 @@ End with a final section titled "Verification Evidence".`,
 
     expect((executor as Any).createMessageWithTimeout).toHaveBeenCalledTimes(1);
     expect((executor as Any).createMessageWithTimeout).toHaveBeenCalledWith(
-      expect.objectContaining({ maxTokens: 1200 }),
+      expect.objectContaining({ maxTokens: 4000 }),
       35_000,
       "Final answer verification synthesis",
     );
@@ -3431,5 +3444,102 @@ describe("buildCompletionGuidancePrompt", () => {
     });
     expect(result).toContain("TASK COMPLETION GUIDANCE");
     expect(result).toContain("Never fabricate tool output");
+  });
+});
+
+describe("decision requirement for structured deliverables", () => {
+  const decisionContract = {
+    ...buildCompletionContract({
+      taskTitle: "Launch plan",
+      taskPrompt: "Recommend a launch plan for the pilot.",
+      requiresDirectAnswer: true,
+      requiresDecisionSignal: true,
+    }),
+    requiresDirectAnswer: true,
+    requiresDecisionSignal: true,
+    allowsOperationalStatus: false,
+  };
+  const section = (heading: string, body: string) => `## ${heading}\n\n${body}\n`;
+  const filler =
+    "Each session builds on the last, and owners confirm logistics two days ahead of time. ";
+  const launchPlan = [
+    "# Northstar Onboarding Pilot — Launch Plan",
+    section("Planning basis", filler.repeat(4)),
+    section(
+      "Proposed first-week schedule",
+      "| Date | Session |\n|---|---|\n| Mon 26 Oct | Orientation |\n| Wed 28 Oct | Practice |",
+    ),
+    section("Responsibilities", "- Trainer A: sessions\n- Trainer B: materials\n- Lead: comms"),
+    section("Materials budget", filler.repeat(3)),
+    section("Risks and mitigations", filler.repeat(3)),
+    section("Readiness checklist", "- [ ] Confirm dates\n- [ ] Book room\n- [ ] Share guide"),
+  ].join("\n");
+
+  it("accepts a long sectioned plan without a stock decision phrase", () => {
+    expect(launchPlan.length).toBeGreaterThan(1200);
+    expect(responseHasDecisionSignal(launchPlan)).toBe(false);
+    expect(responseIsStructuredRecommendation(launchPlan)).toBe(true);
+    expect(
+      responseDirectlyAddressesPrompt({
+        text: launchPlan,
+        contract: decisionContract,
+        minResultSummaryLength: 20,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not treat short or unstructured text as a structured recommendation", () => {
+    expect(responseIsStructuredRecommendation("## Plan\n\nShort.")).toBe(false);
+    expect(responseIsStructuredRecommendation(filler.repeat(30))).toBe(false);
+    const sectionedWithoutCommitment = [
+      section("Background", filler.repeat(5)),
+      section("Observations", filler.repeat(5)),
+      section("Context", filler.repeat(5)),
+    ].join("\n");
+    expect(responseIsStructuredRecommendation(sectionedWithoutCommitment)).toBe(false);
+  });
+
+  it("names the missing decision instead of calling a substantive answer status-only", () => {
+    const analysis = [
+      section("Background", filler.repeat(5)),
+      section("Observations", filler.repeat(5)),
+    ].join("\n");
+    const error = getFinalOutcomeGuardError({
+      contract: decisionContract,
+      preferBestEffortCompletion: false,
+      softDeadlineTriggered: false,
+      cancelReason: null,
+      bestCandidate: analysis,
+      hasExecutionEvidence: true,
+      hasArtifactEvidence: true,
+      createdFiles: [],
+      responseDirectlyAddressesPrompt: (text, contract) =>
+        responseDirectlyAddressesPrompt({ text, contract, minResultSummaryLength: 20 }),
+      fallbackContainsDirectAnswer: () => false,
+      hasVerificationEvidence: () => true,
+      minResultSummaryLength: 20,
+    });
+    expect(error).toBe(
+      "Task missing direct answer: the request asks for a decision or recommendation, but the final response does not state one.",
+    );
+    expect(error).not.toContain("operational status only");
+  });
+
+  it("keeps the operational-status message for status-only answers", () => {
+    const error = getFinalOutcomeGuardError({
+      contract: decisionContract,
+      preferBestEffortCompletion: false,
+      softDeadlineTriggered: false,
+      cancelReason: null,
+      bestCandidate: "Created report.pdf.",
+      hasExecutionEvidence: true,
+      hasArtifactEvidence: true,
+      createdFiles: [],
+      responseDirectlyAddressesPrompt: (text, contract) =>
+        responseDirectlyAddressesPrompt({ text, contract, minResultSummaryLength: 20 }),
+      fallbackContainsDirectAnswer: () => false,
+      hasVerificationEvidence: () => true,
+    });
+    expect(error).toContain("appears to be operational status only");
   });
 });

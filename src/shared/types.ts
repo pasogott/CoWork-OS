@@ -40,6 +40,7 @@ export interface AppearanceSettings {
   homeResearchVaultEnabled?: boolean;
   homeNextActionsEnabled?: boolean;
   costReceiptEnabled?: boolean; // Show the Cost section in the right panel (default: off)
+  subAgentStatsEnabled?: boolean; // Show sub-agent totals in the right panel (default: off)
   language?: string; // Persisted language preference (e.g. 'en', 'ja', 'zh')
   disclaimerAccepted?: boolean;
   onboardingCompleted?: boolean;
@@ -1378,6 +1379,8 @@ export type ToolType =
   | "browser_tabs"
   | "browser_switch_tab"
   | "browser_close_tab"
+  | "browser_new_tab"
+  | "browser_history_search"
   | "browser_get_content"
   | "browser_click"
   | "browser_hover"
@@ -1641,6 +1644,8 @@ export const TOOL_GROUPS = {
     "browser_tabs",
     "browser_switch_tab",
     "browser_close_tab",
+    "browser_new_tab",
+    "browser_history_search",
     "browser_get_content",
     "browser_click",
     "browser_hover",
@@ -1842,6 +1847,8 @@ export const TOOL_RISK_LEVELS: Record<ToolType, ToolRiskLevel> = {
   browser_tabs: "network",
   browser_switch_tab: "network",
   browser_close_tab: "network",
+  browser_new_tab: "network",
+  browser_history_search: "read",
   browser_get_content: "network",
   browser_click: "network",
   browser_hover: "network",
@@ -3175,6 +3182,12 @@ export interface TaskFollowUpInput {
   inReplyToMessageId?: string;
   /** Sender task that owns the message being replied to. */
   inReplyToTaskId?: string;
+  /**
+   * The user sent this exact text by approving an action in an interactive answer: a
+   * button the model wrote ("answer") or a request from page code in an HTML frame
+   * ("page"). Set only by the desktop app's own send path.
+   */
+  surfaceOrigin?: "answer" | "page";
 }
 
 export type AgentMessageDeliveryStatus =
@@ -4363,55 +4376,6 @@ export interface TaskFileChanges {
   deleted: string[];
 }
 
-export interface EvalCase {
-  id: string;
-  name: string;
-  workspaceId?: string;
-  sourceTaskId?: string;
-  prompt: string;
-  sanitizedPrompt: string;
-  assertions?: {
-    expectedTerminalStatus?: Task["terminalStatus"];
-    mustContainAll?: string[];
-    mustCreatePaths?: string[];
-  };
-  metadata?: Record<string, unknown>;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface EvalSuite {
-  id: string;
-  name: string;
-  description?: string;
-  caseIds: string[];
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface EvalRun {
-  id: string;
-  suiteId: string;
-  status: "running" | "completed" | "failed" | "skipped";
-  startedAt: number;
-  completedAt?: number;
-  passCount: number;
-  failCount: number;
-  skippedCount: number;
-  metadata?: Record<string, unknown>;
-}
-
-export interface EvalCaseRun {
-  id: string;
-  runId: string;
-  caseId: string;
-  status: "pass" | "fail" | "skipped";
-  details?: string;
-  startedAt: number;
-  completedAt?: number;
-  durationMs?: number;
-}
-
 export interface EvalBaselineMetrics {
   generatedAt: number;
   windowDays: number;
@@ -4591,6 +4555,14 @@ export interface BrowserAnnotationTargetRef {
   accessibleName?: string;
   textQuote?: string;
   computedStyle?: Record<string, string>;
+  /** An annotated area: the outermost elements inside the dragged rectangle. */
+  elements?: Array<{
+    selector?: string;
+    tagName?: string;
+    role?: string;
+    accessibleName?: string;
+    textQuote?: string;
+  }>;
 }
 
 export interface BrowserAnnotationTargetResolveResult {
@@ -4648,6 +4620,8 @@ export interface AnnotationStylePatch {
   fontWeight?: string;
   lineHeight?: string;
   spacing?: string;
+  margin?: string;
+  padding?: string;
   alignment?: string;
   borderRadius?: string;
   notes?: string;
@@ -7683,6 +7657,16 @@ export const IPC_CHANNELS = {
   SPREADSHEET_APPLY_PATCHES: "spreadsheet:applyPatches",
   SPREADSHEET_SAVE_WORKBOOK: "spreadsheet:saveWorkbook",
   SPREADSHEET_CLOSE_WORKBOOK: "spreadsheet:closeWorkbook",
+  BROWSER_IMPORT_DETECT: "browserImport:detect",
+  BROWSER_IMPORT_PREPARE: "browserImport:prepare",
+  BROWSER_IMPORT_COMMIT: "browserImport:commit",
+  BROWSER_IMPORT_CANCEL: "browserImport:cancel",
+  BROWSER_IMPORT_DELETE_FILE: "browserImport:deleteFile",
+  BROWSER_VAULT_LIST: "browserVault:list",
+  BROWSER_VAULT_FOR_PAGE: "browserVault:forPage",
+  BROWSER_VAULT_REMOVE: "browserVault:remove",
+  BROWSER_VAULT_CLEAR: "browserVault:clear",
+  BROWSER_VAULT_FILL: "browserVault:fill",
   BROWSER_WORKBENCH_REGISTER: "browserWorkbench:register",
   BROWSER_WORKBENCH_UNREGISTER: "browserWorkbench:unregister",
   BROWSER_WORKBENCH_STATUS: "browserWorkbench:status",
@@ -7692,6 +7676,51 @@ export const IPC_CHANNELS = {
   BROWSER_WORKBENCH_OPEN_REQUEST: "browserWorkbench:openRequest",
   BROWSER_WORKBENCH_CURSOR: "browserWorkbench:cursor",
   BROWSER_WORKBENCH_VIEWPORT: "browserWorkbench:viewport",
+  BROWSER_WORKBENCH_TAB_ACTIVATE: "browserWorkbench:tabActivate",
+  BROWSER_WORKBENCH_TAB_CLOSE_CHECK: "browserWorkbench:tabCloseCheck",
+  BROWSER_WORKBENCH_PAGE_DIALOG: "browserWorkbench:pageDialog",
+  BROWSER_WORKBENCH_SCREEN_SHARE_REQUEST: "browserWorkbench:screenShareRequest",
+  BROWSER_WORKBENCH_SCREEN_SHARE_RESPOND: "browserWorkbench:screenShareRespond",
+  BROWSER_WORKBENCH_SCREEN_SHARE_LIST: "browserWorkbench:screenShareList",
+  BROWSER_WORKBENCH_PAGE_DIALOG_RESPOND: "browserWorkbench:pageDialogRespond",
+  // Native tab views (Settings > Browser > Browser engine: native)
+  BROWSER_TAB_VIEW_OPEN: "browserTabView:open",
+  BROWSER_TAB_VIEW_LOAD: "browserTabView:load",
+  BROWSER_TAB_VIEW_COMMAND: "browserTabView:command",
+  BROWSER_TAB_VIEW_LAYOUT: "browserTabView:layout",
+  BROWSER_TAB_VIEW_CAPTURE: "browserTabView:capture",
+  BROWSER_TAB_VIEW_CLOSE: "browserTabView:close",
+  BROWSER_TAB_VIEW_EVENT: "browserTabView:event",
+  BROWSER_WORKBENCH_TAB_COMMAND: "browserWorkbench:tabCommand",
+  BROWSER_WORKBENCH_USER_NAVIGATE: "browserWorkbench:userNavigate",
+  BROWSER_WORKBENCH_NAVIGATION_BLOCKED: "browserWorkbench:navigationBlocked",
+  BROWSER_WORKBENCH_PERMISSION_REQUEST: "browserWorkbench:permissionRequest",
+  BROWSER_WORKBENCH_PERMISSION_RESPOND: "browserWorkbench:permissionRespond",
+  BROWSER_WORKBENCH_PERMISSION_LIST: "browserWorkbench:permissionList",
+  BROWSER_WORKBENCH_SHORTCUT: "browserWorkbench:shortcut",
+  BROWSER_WORKBENCH_CONTEXT_ACTION: "browserWorkbench:contextAction",
+  BROWSER_WORKBENCH_FOCUS: "browserWorkbench:focus",
+  BROWSER_WORKBENCH_DIAGNOSTICS_GET: "browserWorkbench:diagnosticsGet",
+  BROWSER_WORKBENCH_TRACE: "browserWorkbench:trace",
+  BROWSER_WORKBENCH_SNAPSHOT_GET: "browserWorkbench:snapshotGet",
+  BROWSER_WORKBENCH_DRIVING: "browserWorkbench:driving",
+  BROWSER_WORKBENCH_INSPECT_AREA: "browserWorkbench:inspectArea",
+  BROWSER_WORKBENCH_STYLE_PREVIEW: "browserWorkbench:stylePreview",
+  BROWSER_WORKBENCH_SET_PAUSED: "browserWorkbench:setPaused",
+  BROWSER_WORKBENCH_DOWNLOAD_EVENT: "browserWorkbench:downloadEvent",
+  BROWSER_WORKBENCH_DOWNLOAD_ACTION: "browserWorkbench:downloadAction",
+  BROWSER_WORKBENCH_DOWNLOAD_LIST: "browserWorkbench:downloadList",
+  BROWSER_WORKBENCH_SIGN_IN_REQUIRED: "browserWorkbench:signInRequired",
+  BROWSER_WORKBENCH_CLEAR_DATA: "browserWorkbench:clearData",
+  BROWSER_SETTINGS_GET: "browserSettings:get",
+  BROWSER_SETTINGS_SAVE: "browserSettings:save",
+  BROWSER_SITE_PERMISSIONS_LIST: "browserSettings:sitePermissionsList",
+  BROWSER_SITE_PERMISSIONS_RESET: "browserSettings:sitePermissionsReset",
+  BROWSER_SITE_PERMISSIONS_SET: "browserSettings:sitePermissionsSet",
+  BROWSER_HISTORY_SEARCH: "browserHistory:search",
+  BROWSER_HISTORY_LIST: "browserHistory:list",
+  BROWSER_HISTORY_REMOVE: "browserHistory:remove",
+  BROWSER_HISTORY_CLEAR: "browserHistory:clear",
   ANNOTATION_CREATE: "annotation:create",
   ANNOTATION_LIST: "annotation:list",
   ANNOTATION_UPDATE: "annotation:update",
@@ -7875,11 +7904,6 @@ export const IPC_CHANNELS = {
   MC_AUTOMATION_OUTCOME_RETRY: "missionControl:automationOutcomeRetry",
 
   // Eval Suites / Runs (Reliability Flywheel)
-  EVAL_LIST_SUITES: "eval:listSuites",
-  EVAL_RUN_SUITE: "eval:runSuite",
-  EVAL_GET_RUN: "eval:getRun",
-  EVAL_GET_CASE: "eval:getCase",
-  EVAL_CREATE_CASE_FROM_TASK: "eval:createCaseFromTask",
 
   // Mission Control - Agent Teams
   TEAM_LIST: "team:list",
@@ -8616,6 +8640,9 @@ export const IPC_CHANNELS = {
   ANSWER_SURFACE_GET_STATE: "answerSurfaces:getState",
   ANSWER_SURFACE_SAVE_STATE: "answerSurfaces:saveState",
   ANSWER_SURFACE_RESOLVE_IMAGES: "answerSurfaces:resolveImages",
+  ANSWER_SURFACE_REGISTER_HTML: "answerSurfaces:registerHtml",
+  ANSWER_SURFACE_LOGIC_RUNNER: "answerSurfaces:logicRunner",
+  ANSWER_SURFACE_LOAD_DATA: "answerSurfaces:loadData",
 
   // Memory folder: the markdown + git memory repo (docs/memory-repo-phase1-design.md §9)
   MEMORY_REPO_STATUS: "memoryRepo:status",
@@ -8774,9 +8801,6 @@ export const IPC_CHANNELS = {
   WHATSAPP_QR_CODE: "whatsapp:qr-code",
   WHATSAPP_CONNECTED: "whatsapp:connected",
   WHATSAPP_STATUS: "whatsapp:status",
-
-  // Citation Engine
-  CITATION_GET_FOR_TASK: "citation:getForTask",
 
   // Event Triggers
   TRIGGER_LIST: "trigger:list",

@@ -146,6 +146,12 @@ export type SettingsCategory =
   | "subconscious-migration-v1"
   | "webaccess"
   | "browser-use"
+  // In-app browser site permissions (camera, location, ...) the user chose "Always" for.
+  | "browser-site-permissions"
+  // Saved logins for the in-app browser: each password is sealed separately with the OS keychain.
+  | "browser-vault"
+  // Settings > Browser (search engine, downloads, agent permissions, developer mode).
+  | "browser"
   | "adaptive-style-engine"
   | "routine-workflow-secrets"
   | "acp-remote-agent-secrets"

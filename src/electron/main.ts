@@ -55,6 +55,7 @@ import {
   app,
   BrowserWindow,
   clipboard,
+  desktopCapturer,
   ipcMain,
   dialog,
   session,
@@ -64,6 +65,9 @@ import {
   nativeImage,
   screen,
   safeStorage,
+  systemPreferences,
+  webContents,
+  WebContentsView,
   type BrowserWindowConstructorOptions,
 } from "electron";
 import mime from "mime-types";
@@ -189,7 +193,10 @@ import { MemoryWriter } from "./memory/MemoryWriter";
 import { MemoryWriteGate } from "./memory/MemoryWriteGate";
 import { createCommitmentExpiryService } from "./memory/memory-review-wiring";
 import { loadPolicies } from "./admin/policies";
-import { evaluateWorkspaceFilesystemAccess } from "./security/access-profile-paths";
+import {
+  assertWorkspaceFilesystemAccess,
+  evaluateWorkspaceFilesystemAccess,
+} from "./security/access-profile-paths";
 import {
   applyAccessProfileToWorkspace,
   resolveEffectiveAccessProfile,
@@ -243,6 +250,26 @@ import { setupQAHandlers } from "./ipc/qa-handlers";
 import { getBrowserWorkbenchService } from "./browser/browser-workbench-service";
 import { getLocalPreviewProcessService } from "./preview/LocalPreviewProcessService";
 import { getBrowserSessionManager } from "./browser/browser-session-manager";
+import { attachBrowserGuest } from "./browser/browser-guest-attach";
+import { BrowserUnloadGuard } from "./browser/browser-unload-guard";
+import { BrowserScreenShare } from "./browser/browser-screen-share";
+import { BrowserTabViewHost, setBrowserTabViewHost } from "./browser/browser-tab-views";
+import { applyBrowserUserAgent } from "./browser/browser-user-agent";
+import { BrowserDownloadManager } from "./browser/browser-download-manager";
+import {
+  createBrowserHistoryRecorder,
+  registerBrowserPlatformIpc,
+} from "./browser/browser-platform-ipc";
+import {
+  registerBrowserCredentialsIpc,
+  shredFileOnDisk,
+} from "./browser/credentials/browser-credentials-ipc";
+import { defaultExternalBrowserDeps } from "./browser/credentials/external-browsers";
+import { ImportSessions } from "./browser/credentials/import-session";
+import { getBrowserVault } from "./browser/credentials/vault";
+import { BrowserSettingsManager } from "./settings/browser-settings-manager";
+import { browserProfileKeyFromPartition } from "../shared/browser-profile";
+import { matchBrowserShortcut } from "../shared/browser-shortcuts";
 import { isAllowedWebviewUrl } from "./browser/webview-url-policy";
 import { pruneTempWorkspaces } from "./utils/temp-workspace";
 import { getActiveTempWorkspaceLeases } from "./utils/temp-workspace-lease";
@@ -301,6 +328,7 @@ import {
   registerMediaProtocol,
   registerMediaScheme,
   registerWebPreviewProtocol,
+  shouldBlockPreviewFrameNavigation,
   registerWebPreviewScheme,
 } from "./media";
 import { rememberApprovedImportFiles } from "./security/file-import-approvals";
@@ -312,7 +340,12 @@ import {
   getDesktopIconImage,
   getDesktopIconPath,
 } from "./branding";
-import { primeMacSafeStorageContext } from "./utils/mac-safe-storage-bootstrap";
+import {
+  keychainMismatchMessage,
+  MOCK_KEYCHAIN_SWITCH,
+  primeMacSafeStorageContext,
+  shouldAdoptNewKeychainKey,
+} from "./utils/mac-safe-storage-bootstrap";
 import { getSafeStorage } from "./utils/safe-storage";
 import {
   keepDirectRunAliveWithoutWindows,
@@ -614,10 +647,221 @@ async function ensureCoreAutomationProfiles(): Promise<void> {
   });
 }
 
+const BROWSER_WORKBENCH_PARTITION_PREFIX = "persist:cowork-browser-";
+/** Sessions of in-app browser partitions (-> partition), prepared before their first guest attaches. */
+const browserWorkbenchSessions = new WeakMap<object, string>();
+let browserDownloadManager: BrowserDownloadManager | null = null;
+
+function getBrowserDownloadManager(): BrowserDownloadManager {
+  if (!browserDownloadManager) {
+    browserDownloadManager = new BrowserDownloadManager({
+      service: getBrowserWorkbenchService(),
+      manager: getBrowserSessionManager(),
+      loadSettings: () => BrowserSettingsManager.loadSettings(),
+      resolveWorkspace: (taskId) => agentDaemon?.getEffectiveWorkspaceForTask(taskId) || null,
+      assertWorkspaceWrite: (workspace, relativePath) =>
+        assertWorkspaceFilesystemAccess(
+          { path: workspace.path, permissions: workspace.permissions },
+          relativePath,
+          "write",
+          "browser download",
+        ),
+      requestApproval: (taskId, description, details) =>
+        agentDaemon
+          ? agentDaemon.requestApproval(taskId, "browser", description, details, {
+              allowAutoApprove: false,
+            })
+          : Promise.resolve(false),
+      systemDownloadsDir: () => app.getPath("downloads"),
+      openPath: (filePath) => shell.openPath(filePath),
+      showItemInFolder: (filePath) => shell.showItemInFolder(filePath),
+    });
+  }
+  return browserDownloadManager;
+}
+
+/**
+ * Network guards, user agent and site-permission handlers for an in-app browser
+ * partition. Runs in will-attach-webview, before the guest exists, so nothing
+ * on the partition can load or be granted anything first.
+ */
+function prepareBrowserWorkbenchPartition(partition: string): Electron.Session {
+  const browserSession = session.fromPartition(partition);
+  getBrowserSessionManager().prepareSessionNetworkGuards(browserSession);
+  applyBrowserUserAgent(
+    browserSession,
+    BrowserSettingsManager.loadSettings().chromeCompatibleUserAgent,
+  );
+  getBrowserWorkbenchService().getPermissionManager().attach(browserSession, partition);
+  getBrowserScreenShare().attach(browserSession);
+  getBrowserDownloadManager().attach(browserSession);
+  browserWorkbenchSessions.set(browserSession, partition);
+  return browserSession;
+}
+
+/** Guest handling for an in-app browser page: the same for a <webview> tab and a native tab view. */
+function attachBrowserWorkbenchGuest(guest: Electron.WebContents, partition: string): void {
+  const profileKey = browserProfileKeyFromPartition(partition) || "default";
+  attachBrowserGuest(guest, {
+    service: getBrowserWorkbenchService(),
+    manager: getBrowserSessionManager(),
+    BrowserWindow,
+    getParentWindow: () => mainWindow,
+    Menu,
+    writeClipboardText: (text) => {
+      void clipboard.writeText(text);
+    },
+    openExternal: (url) => void openExternalIfSafe(url),
+    recordHistory: createBrowserHistoryRecorder(() => dbManager.getDatabase(), profileKey),
+    isDeveloperMode: () => BrowserSettingsManager.loadSettings().developerMode,
+    unloadGuard: getBrowserUnloadGuard(),
+    focusApp: (contents) => {
+      if (!contents.hostWebContents && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.focus();
+      }
+    },
+    saveToWorkspace: (contents, url) => {
+      getBrowserDownloadManager().requestWorkspaceSave(contents.id, url);
+      contents.downloadURL(url);
+    },
+  });
+}
+
+let browserTabViewHost: BrowserTabViewHost | null = null;
+function getBrowserTabViewHost(): BrowserTabViewHost {
+  browserTabViewHost ??= new BrowserTabViewHost({
+    getWindow: () => mainWindow,
+    WebContentsView,
+    prepareSession: (partition) => prepareBrowserWorkbenchPartition(partition),
+    attachGuest: (contents) =>
+      attachBrowserWorkbenchGuest(contents, browserWorkbenchSessions.get(contents.session) || ""),
+    register: (input) => getBrowserWorkbenchService().registerSession(input),
+    unregister: (input) => {
+      getBrowserWorkbenchService().unregisterSession(input);
+    },
+    updateStatus: (input) => getBrowserWorkbenchService().updateSessionStatus(input),
+    guard: (contents) => getBrowserSessionManager().guardTabContents?.(contents),
+    emit: (event) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC_CHANNELS.BROWSER_TAB_VIEW_EVENT, event);
+      }
+    },
+    isAgentDriving: (taskId, sessionId) =>
+      getBrowserWorkbenchService().isDriving(taskId, sessionId) &&
+      !getBrowserWorkbenchService().isPausedByUser(taskId, sessionId),
+  });
+  setBrowserTabViewHost(browserTabViewHost);
+  getBrowserWorkbenchService().setNativeCursorPainter((session, event) =>
+    browserTabViewHost
+      ? browserTabViewHost.paintCursor(
+          { taskId: session.taskId, sessionId: session.sessionId, tabId: session.tabId || "" },
+          event,
+        )
+      : false,
+  );
+  return browserTabViewHost;
+}
+
+let browserScreenShare: BrowserScreenShare | null = null;
+function getBrowserScreenShare(): BrowserScreenShare {
+  browserScreenShare ??= new BrowserScreenShare({
+    resolveOwner: (webContentsId) => {
+      const owner = getBrowserSessionManager().findTabOwner(webContentsId);
+      return owner && owner.kind === "tab"
+        ? { taskId: owner.taskId, sessionId: owner.sessionId, tabId: owner.tabId }
+        : null;
+    },
+    contentsForFrame: (frame) => webContents.fromFrame(frame) ?? null,
+    listSources: () =>
+      desktopCapturer.getSources({
+        types: ["screen", "window"],
+        thumbnailSize: { width: 320, height: 200 },
+      }),
+    sendPrompt: (prompt) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return false;
+      mainWindow.webContents.send(IPC_CHANNELS.BROWSER_WORKBENCH_SCREEN_SHARE_REQUEST, prompt);
+      return true;
+    },
+    isBlocked: () =>
+      BrowserSettingsManager.loadPolicy().blockedSitePermissions.includes("display-capture"),
+  });
+  return browserScreenShare;
+}
+
+let browserUnloadGuard: BrowserUnloadGuard | null = null;
+function getBrowserUnloadGuard(): BrowserUnloadGuard {
+  browserUnloadGuard ??= new BrowserUnloadGuard({
+    manager: getBrowserSessionManager(),
+    service: getBrowserWorkbenchService(),
+    confirmLeave: (guest, { closingTab }) => {
+      const owner = guest.hostWebContents || guest;
+      const window = BrowserWindow.fromWebContents(owner) || mainWindow;
+      const options = {
+        type: "question" as const,
+        buttons: [closingTab ? "Close Tab" : "Leave", "Stay"],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true,
+        message: "Leave site?",
+        detail: "Changes you made may not be saved.",
+      };
+      const choice =
+        window && !window.isDestroyed()
+          ? dialog.showMessageBoxSync(window, options)
+          : dialog.showMessageBoxSync(options);
+      return choice === 0;
+    },
+  });
+  // Popup windows have no workbench UI: their page dialogs use a native dialog.
+  getBrowserWorkbenchService().setPopupDialogHandler((event) => {
+    const contentsId = getBrowserSessionManager().getTabWebContentsId(
+      event.taskId,
+      event.tabId,
+      event.sessionId,
+    );
+    const popup = typeof contentsId === "number" ? webContents.fromId(contentsId) : undefined;
+    const window = popup ? BrowserWindow.fromWebContents(popup) : null;
+    const options = {
+      type: "none" as const,
+      buttons: event.type === "alert" ? ["OK"] : ["OK", "Cancel"],
+      defaultId: 0,
+      cancelId: event.type === "alert" ? 0 : 1,
+      noLink: true,
+      message: event.origin ? `${new URL(event.origin).host} says` : "This page says",
+      detail: event.message || "",
+    };
+    void (
+      window && !window.isDestroyed()
+        ? dialog.showMessageBox(window, options)
+        : dialog.showMessageBox(options)
+    ).then(({ response }) =>
+      getBrowserWorkbenchService().respondToPageDialog({
+        taskId: event.taskId,
+        sessionId: event.sessionId,
+        tabId: event.tabId,
+        dialogId: event.dialogId,
+        accept: response === 0,
+      }),
+    );
+  });
+  const guard = browserUnloadGuard;
+  getBrowserSessionManager().setBeforeUnloadDialogHandler((contents) =>
+    guard.decideDialog(contents),
+  );
+  return browserUnloadGuard;
+}
+
 app.on("web-contents-created", (_event, contents) => {
-  attachImageContextMenu(contents, clipboard);
+  // Native browser tab views report "window" too; they get the browser's own page menu.
+  if (!browserWorkbenchSessions.has(contents.session)) attachImageContextMenu(contents, clipboard);
   contents.on("did-attach-webview", (_event, guest) => {
     CanvasManager.getInstance().attachWebviewNetworkGuards(guest);
+    const browserPartition = browserWorkbenchSessions.get(guest.session);
+    if (browserPartition) {
+      // Pages may open windows (allowpopups is kept for these partitions), so the
+      // handler must exist before the guest loads anything past about:blank.
+      attachBrowserWorkbenchGuest(guest, browserPartition);
+    }
   });
   contents.on("will-attach-webview", (event, webPreferences, params) => {
     delete (webPreferences as Record<string, unknown>).preload;
@@ -628,18 +872,27 @@ app.on("web-contents-created", (_event, contents) => {
     webPreferences.sandbox = true;
     webPreferences.webSecurity = true;
 
+    const partition = String(params?.partition || webPreferences.partition || "");
+    const isBrowserWorkbench = partition.startsWith(BROWSER_WORKBENCH_PARTITION_PREFIX);
     if (params) {
       delete (params as Record<string, unknown>).preload;
       delete (params as Record<string, unknown>).preloadURL;
-      delete (params as Record<string, unknown>).allowpopups;
+      // In-app browser guests route window.open through attachBrowserGuest; every
+      // other webview keeps popups disabled.
+      if (!isBrowserWorkbench) delete (params as Record<string, unknown>).allowpopups;
     }
 
     const targetUrl = typeof params?.src === "string" ? params.src : "";
-    const partition = String(params?.partition || webPreferences.partition || "");
-    if (partition.startsWith("persist:cowork-browser-")) {
-      getBrowserSessionManager().prepareSessionNetworkGuards(session.fromPartition(partition));
+    if (isBrowserWorkbench) {
+      try {
+        prepareBrowserWorkbenchPartition(partition);
+      } catch (error) {
+        logger.warn("Blocked browser webview: partition guards could not be installed", error);
+        event.preventDefault();
+        return;
+      }
     }
-    if (partition.startsWith("persist:cowork-browser-") && targetUrl !== "about:blank") {
+    if (isBrowserWorkbench && targetUrl !== "about:blank") {
       event.preventDefault();
       return;
     }
@@ -659,6 +912,77 @@ app.on("web-contents-created", (_event, contents) => {
     }
   });
 });
+
+/** True while keyboard focus is inside the browser workbench chrome (reported by the renderer). */
+let browserWorkbenchChromeFocused = false;
+
+/**
+ * App-window input for the browser workbench: while its chrome has focus, the
+ * browser shortcuts (Cmd+R, Cmd+W, Cmd+0 ...) run as browser commands instead of
+ * the app menu's reload/close/zoom. Trackpad swipes and mouse back/forward
+ * buttons go back and forward in the visible tab.
+ */
+function attachBrowserWorkbenchWindowInput(window: BrowserWindow): void {
+  // A reload, crash or app switch must never leave app shortcuts captured.
+  const releaseShortcuts = () => {
+    browserWorkbenchChromeFocused = false;
+  };
+  window.on("blur", releaseShortcuts);
+  window.webContents.on("did-start-navigation", (_event, _url, _inPlace, isMainFrame) => {
+    if (isMainFrame) releaseShortcuts();
+  });
+  window.webContents.on("render-process-gone", releaseShortcuts);
+  window.webContents.on("before-input-event", (event, input) => {
+    if (!browserWorkbenchChromeFocused || input.type !== "keyDown") return;
+    const command = matchBrowserShortcut(
+      {
+        key: input.key,
+        code: input.code,
+        ctrl: input.control,
+        meta: input.meta,
+        shift: input.shift,
+        alt: input.alt,
+      },
+      process.platform,
+    );
+    if (!command) return;
+    event.preventDefault();
+    getBrowserWorkbenchService().sendShortcut(undefined, command);
+  });
+  // The pointer is over a native tab view: the renderer never sees it, so the gesture acts on
+  // that view directly from the cursor position.
+  const navigateNativeUnderPointer = (direction: "back" | "forward"): boolean => {
+    const host = browserTabViewHost;
+    if (!host) return false;
+    const key = host.viewKeyAtScreenPoint(screen.getCursorScreenPoint());
+    return key ? host.command(key, direction === "back" ? "goBack" : "goForward") : false;
+  };
+  window.on("swipe", (_event, direction) => {
+    const back = direction === "left";
+    if ((back || direction === "right") && navigateNativeUnderPointer(back ? "back" : "forward")) {
+      return;
+    }
+    if (direction === "left") getBrowserWorkbenchService().sendShortcut(undefined, "back", true);
+    if (direction === "right")
+      getBrowserWorkbenchService().sendShortcut(undefined, "forward", true);
+  });
+  window.on("app-command", (_event, command) => {
+    if (command === "browser-backward") {
+      if (navigateNativeUnderPointer("back")) return;
+      getBrowserWorkbenchService().sendShortcut(undefined, "back", true);
+    } else if (command === "browser-forward") {
+      if (navigateNativeUnderPointer("forward")) return;
+      getBrowserWorkbenchService().sendShortcut(undefined, "forward", true);
+    }
+  });
+}
+
+/** Tab ids arrive from the renderer: accept short plain tokens only. */
+function readBrowserTabId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._:-]{1,120}$/.test(trimmed) ? trimmed : undefined;
+}
 
 const submitHeartbeatSignalForAll = async (input: {
   text?: string;
@@ -1077,21 +1401,23 @@ function verifySecureSettingsKeychainIdentity(): boolean {
   const status = repository.verifyKeychainIdentity();
   if (status !== "mismatch") return false;
 
-  if (process.env[ACCEPT_NEW_KEYCHAIN_KEY_ENV] === "1") {
+  const mockKeychain = app.commandLine.hasSwitch(MOCK_KEYCHAIN_SWITCH);
+  if (shouldAdoptNewKeychainKey(process.env[ACCEPT_NEW_KEYCHAIN_KEY_ENV], mockKeychain)) {
     const archived = repository.adoptCurrentKeychainIdentity();
     logger.warn("Adopted the current OS keychain key; unreadable settings were archived.", {
       archived,
     });
     return false;
   }
-  logger.error(
-    `The OS keychain key differs from the one that encrypted existing settings. Settings changes will not be saved until the original keychain access is restored, or relaunch with ${ACCEPT_NEW_KEYCHAIN_KEY_ENV}=1 to archive unreadable settings and continue with the current key.`,
-  );
+  logger.error(keychainMismatchMessage(mockKeychain, ACCEPT_NEW_KEYCHAIN_KEY_ENV));
   return true;
 }
 
 async function notifyKeychainIdentityMismatch(): Promise<void> {
   if (!keychainIdentityMismatch) return;
+  // A mock-keychain launch is a test harness, not the user: logging is enough, and its
+  // advice (adopt the current key) does not apply.
+  if (app.commandLine.hasSwitch(MOCK_KEYCHAIN_SWITCH)) return;
   try {
     await getNotificationService()?.add({
       type: "error",
@@ -1640,10 +1966,13 @@ if (isMacSafeStorageMigrationWorker) {
       loadMainWindowContent();
 
       mainWindow.on("closed", () => {
+        // Native tab views live in this window; a new window starts without them.
+        browserTabViewHost?.closeAll();
         getBrowserWorkbenchService().setMainWindow(null);
         mainWindow = null;
       });
       getBrowserWorkbenchService().setMainWindow(mainWindow);
+      attachBrowserWorkbenchWindowInput(mainWindow);
 
       mainWindow.on("unresponsive", () => {
         logger.warn("Main window became unresponsive");
@@ -1701,6 +2030,27 @@ if (isMacSafeStorageMigrationWorker) {
         if (!isAppOwnedUrl(url)) {
           event.preventDefault();
           void openExternalIfSafe(url);
+        }
+      });
+
+      // Preview frames (inline HTML answers, artifact previews) may not navigate themselves
+      // away from their page; see shouldBlockPreviewFrameNavigation.
+      mainWindow.webContents.on("will-frame-navigate", (details) => {
+        const appFrame = mainWindow?.webContents.mainFrame;
+        const blocked = shouldBlockPreviewFrameNavigation({
+          isMainFrame: details.isMainFrame,
+          currentUrl: details.frame?.url,
+          targetUrl: details.url,
+          initiatedByApp: Boolean(
+            appFrame &&
+            details.initiator &&
+            details.initiator.processId === appFrame.processId &&
+            details.initiator.routingId === appFrame.routingId,
+          ),
+        });
+        if (blocked) {
+          details.preventDefault();
+          logger.warn("Blocked a preview frame navigating away from its page.");
         }
       });
     }
@@ -4619,14 +4969,15 @@ if (isMacSafeStorageMigrationWorker) {
       return BrowserWindow.getFocusedWindow()?.isMaximized() ?? false;
     });
 
-    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_REGISTER, async (_event, data: Any) => {
-      if (!data || typeof data.taskId !== "string" || typeof data.webContentsId !== "number") {
-        throw new Error("Invalid browser workbench registration");
-      }
-      if (!agentDaemon) throw new Error("Agent daemon is not ready");
-      const task = await agentDaemon.getTaskById(data.taskId);
+    /** Set a workbench session's access policy from its task's effective access profile. */
+    const applyBrowserWorkbenchAccessPolicy = async (
+      taskId: string,
+      sessionId: string,
+    ): Promise<boolean> => {
+      if (!agentDaemon) return false;
+      const task = await agentDaemon.getTaskById(taskId);
       const workspace = task && agentDaemon.getWorkspaceById(task.workspaceId);
-      if (!task || !workspace) throw new Error("Browser task workspace not found");
+      if (!task || !workspace) return false;
       const effective = applyAccessProfileToWorkspace(
         workspace,
         resolveEffectiveAccessProfile({
@@ -4638,14 +4989,44 @@ if (isMacSafeStorageMigrationWorker) {
       );
       getBrowserWorkbenchService().setAccessPolicy({
         taskId: task.id,
-        sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        sessionId,
         networkEnabled: effective.permissions.network === true,
         accessNetworkMode: effective.permissions.accessNetworkMode,
         profileDomainRules: effective.permissions.accessDomainRules,
       });
+      return true;
+    };
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_REGISTER, async (event, data: Any) => {
+      if (!data || typeof data.taskId !== "string" || typeof data.webContentsId !== "number") {
+        throw new Error("Invalid browser workbench registration");
+      }
+      // Only a browser-partition <webview> hosted by the calling window can be
+      // registered; anything else (the app window itself, another guest) would
+      // hand its debugger to browser tools.
+      const guest = webContents.fromId(data.webContentsId);
+      if (
+        !guest ||
+        guest.isDestroyed() ||
+        guest.getType() !== "webview" ||
+        guest.hostWebContents?.id !== event.sender.id ||
+        !browserWorkbenchSessions.has(guest.session as object)
+      ) {
+        throw new Error("Invalid browser workbench registration");
+      }
+      if (!agentDaemon) throw new Error("Agent daemon is not ready");
+      if (
+        !(await applyBrowserWorkbenchAccessPolicy(
+          data.taskId,
+          typeof data.sessionId === "string" ? data.sessionId : "default",
+        ))
+      ) {
+        throw new Error("Browser task workspace not found");
+      }
       await getBrowserWorkbenchService().registerSession({
         taskId: data.taskId,
         sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        tabId: readBrowserTabId(data.tabId),
+        activate: data.activate === true,
         webContentsId: data.webContentsId,
         url: typeof data.url === "string" ? data.url : undefined,
         title: typeof data.title === "string" ? data.title : undefined,
@@ -4657,6 +5038,7 @@ if (isMacSafeStorageMigrationWorker) {
       getBrowserWorkbenchService().unregisterSession({
         taskId: data.taskId,
         sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        tabId: readBrowserTabId(data.tabId),
         webContentsId: typeof data.webContentsId === "number" ? data.webContentsId : undefined,
       });
       return { success: true };
@@ -4666,11 +5048,391 @@ if (isMacSafeStorageMigrationWorker) {
       getBrowserWorkbenchService().updateSessionStatus({
         taskId: data.taskId,
         sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        tabId: readBrowserTabId(data.tabId),
         webContentsId: typeof data.webContentsId === "number" ? data.webContentsId : undefined,
         url: typeof data.url === "string" ? data.url : undefined,
         title: typeof data.title === "string" ? data.title : undefined,
       });
       return { success: true };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_TAB_ACTIVATE, (_event, data: Any) => {
+      const tabId = readBrowserTabId(data?.tabId);
+      if (!data || typeof data.taskId !== "string" || !tabId) return { success: false };
+      const success = getBrowserWorkbenchService().activateTab({
+        taskId: data.taskId,
+        sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        tabId,
+      });
+      return { success };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_SCREEN_SHARE_RESPOND, (_event, data: Any) => {
+      if (!data || typeof data.requestId !== "string" || data.requestId.length > 100) {
+        return { success: false };
+      }
+      const sourceId =
+        typeof data.sourceId === "string" && data.sourceId.length <= 200 ? data.sourceId : null;
+      return { success: getBrowserScreenShare().respond(data.requestId, sourceId) };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_SCREEN_SHARE_LIST, (_event, data: Any) => {
+      if (!data || typeof data.taskId !== "string") return [];
+      return getBrowserScreenShare().listPending(
+        data.taskId,
+        typeof data.sessionId === "string" ? data.sessionId : "default",
+      );
+    });
+    ipcMain.handle(
+      IPC_CHANNELS.BROWSER_WORKBENCH_PAGE_DIALOG_RESPOND,
+      async (_event, data: Any) => {
+        const tabId = readBrowserTabId(data?.tabId);
+        if (
+          !data ||
+          typeof data.taskId !== "string" ||
+          !tabId ||
+          typeof data.dialogId !== "string" ||
+          !/^dialog-[a-z0-9]+-\d+$/.test(data.dialogId) ||
+          typeof data.accept !== "boolean"
+        ) {
+          return { success: false };
+        }
+        const success = await getBrowserWorkbenchService().respondToPageDialog({
+          taskId: data.taskId,
+          sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+          tabId,
+          dialogId: data.dialogId,
+          accept: data.accept,
+        });
+        return { success };
+      },
+    );
+    // Native tab views: only the app window drives them; ids and URLs are validated here.
+    const readTabViewKey = (event: Electron.IpcMainInvokeEvent, data: Any) => {
+      if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return null;
+      const tabId = readBrowserTabId(data?.tabId);
+      if (!data || typeof data.taskId !== "string" || data.taskId.length > 200 || !tabId) {
+        return null;
+      }
+      return {
+        taskId: data.taskId,
+        sessionId:
+          typeof data.sessionId === "string" && data.sessionId.length <= 200
+            ? data.sessionId
+            : "default",
+        tabId,
+      };
+    };
+    const readBounds = (value: Any) => {
+      if (!value || typeof value !== "object") return null;
+      const numbers = [value.x, value.y, value.width, value.height].map(Number);
+      if (!numbers.every((n) => Number.isFinite(n) && Math.abs(n) < 100_000)) return null;
+      const [x, y, width, height] = numbers;
+      return width > 0 && height > 0 ? { x, y, width, height } : null;
+    };
+    ipcMain.handle(IPC_CHANNELS.BROWSER_TAB_VIEW_OPEN, async (event, data: Any) => {
+      const key = readTabViewKey(event, data);
+      const partition = typeof data?.partition === "string" ? data.partition : "";
+      if (
+        !key ||
+        !partition.startsWith(BROWSER_WORKBENCH_PARTITION_PREFIX) ||
+        !/^[A-Za-z0-9._:-]{1,160}$/.test(partition.slice("persist:".length))
+      ) {
+        throw new Error("Invalid browser tab view request");
+      }
+      if (!(await applyBrowserWorkbenchAccessPolicy(key.taskId, key.sessionId))) {
+        throw new Error("Browser task workspace not found");
+      }
+      return getBrowserTabViewHost().open({ ...key, partition, activate: data.activate === true });
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_TAB_VIEW_LOAD, (event, data: Any) => {
+      const key = readTabViewKey(event, data);
+      const url = typeof data?.url === "string" ? data.url.slice(0, 8192) : "";
+      return { success: Boolean(key && url && getBrowserTabViewHost().load(key, url)) };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_TAB_VIEW_COMMAND, (event, data: Any) => {
+      const key = readTabViewKey(event, data);
+      const command = String(data?.command || "");
+      const allowed = new Set([
+        "goBack",
+        "goForward",
+        "reload",
+        "stop",
+        "hardReload",
+        "setZoomLevel",
+        "setAudioMuted",
+        "find",
+        "stopFind",
+        "focus",
+      ]);
+      if (!key || !allowed.has(command)) return { success: false };
+      const args = data?.args && typeof data.args === "object" ? data.args : {};
+      return {
+        success: getBrowserTabViewHost().command(key, command as Any, {
+          level: Number(args.level),
+          muted: args.muted === true,
+          text: typeof args.text === "string" ? args.text : undefined,
+          forward: args.forward !== false,
+          findNext: args.findNext === true,
+          matchCase: args.matchCase === true,
+        }),
+      };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_TAB_VIEW_LAYOUT, (event, data: Any) => {
+      if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return;
+      if (!data || typeof data.taskId !== "string" || data.taskId.length > 200) return;
+      const tabId = data.tabId === null ? null : readBrowserTabId(data.tabId) || null;
+      getBrowserTabViewHost().layout({
+        taskId: data.taskId,
+        sessionId:
+          typeof data.sessionId === "string" && data.sessionId.length <= 200
+            ? data.sessionId
+            : "default",
+        tabId,
+        bounds: tabId ? readBounds(data.bounds) : null,
+      });
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_TAB_VIEW_CAPTURE, async (event, data: Any) => {
+      const key = readTabViewKey(event, data);
+      return key ? getBrowserTabViewHost().capture(key) : null;
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_TAB_VIEW_CLOSE, (event, data: Any) => {
+      const key = readTabViewKey(event, data);
+      if (key) getBrowserTabViewHost().close(key);
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_TAB_CLOSE_CHECK, async (event, data: Any) => {
+      const tabId = readBrowserTabId(data?.tabId);
+      if (!data || typeof data.taskId !== "string" || !tabId) return { close: true };
+      const contentsId = getBrowserSessionManager().getTabWebContentsId(
+        data.taskId,
+        tabId,
+        typeof data.sessionId === "string" ? data.sessionId : "default",
+      );
+      const guest = typeof contentsId === "number" ? webContents.fromId(contentsId) : undefined;
+      // Only the window hosting the tab may run its unload check (it navigates the page).
+      const hostedBySender =
+        guest?.hostWebContents?.id === event.sender.id ||
+        (event.sender.id === mainWindow?.webContents.id &&
+          typeof contentsId === "number" &&
+          getBrowserTabViewHost().ownsWebContents(contentsId));
+      if (!guest || guest.isDestroyed() || !hostedBySender) {
+        return { close: true };
+      }
+      return { close: await getBrowserUnloadGuard().confirmClose(guest) };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_USER_NAVIGATE, async (_event, data: Any) => {
+      const sessionId = typeof data?.sessionId === "string" ? data.sessionId : "default";
+      const invalid = {
+        allowed: false,
+        url: "",
+        block: { reason: "policy", detail: "invalid_request" },
+      };
+      if (!data || typeof data.taskId !== "string" || typeof data.url !== "string") return invalid;
+      // Allowances are scoped to a real task's session. The first tab may still be
+      // registering when the user types, so the task's access policy is applied here
+      // too (the same derivation registration uses).
+      if (
+        !getBrowserWorkbenchService().getSession(data.taskId, sessionId) &&
+        !(await applyBrowserWorkbenchAccessPolicy(data.taskId, sessionId))
+      ) {
+        return invalid;
+      }
+      return getBrowserWorkbenchService().userNavigate({
+        taskId: data.taskId,
+        sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        url: data.url.slice(0, 8192),
+      });
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_PERMISSION_RESPOND, (_event, data: Any) => {
+      const response = data?.response;
+      if (
+        !data ||
+        typeof data.requestId !== "string" ||
+        (response !== "allow-once" &&
+          response !== "allow-always" &&
+          response !== "block" &&
+          response !== "dismiss")
+      ) {
+        return { success: false };
+      }
+      return {
+        success: getBrowserWorkbenchService().respondToPermission(data.requestId, response),
+      };
+    });
+    registerBrowserPlatformIpc({
+      ipcMain,
+      getDatabase: () => dbManager.getDatabase(),
+      service: getBrowserWorkbenchService(),
+      downloads: getBrowserDownloadManager(),
+      sessionFromPartition: (partition) => session.fromPartition(partition),
+    });
+    registerBrowserCredentialsIpc({
+      ipcMain,
+      // Only the app's own window; never a page inside a browser tab.
+      isMainWindowSender: (event) =>
+        Boolean(
+          mainWindow &&
+          !mainWindow.isDestroyed() &&
+          event?.sender === mainWindow.webContents &&
+          // The app's own top page, not a frame inside it.
+          (!event.senderFrame || event.senderFrame.parent === null),
+        ),
+      vault: getBrowserVault(),
+      external: defaultExternalBrowserDeps(),
+      sessions: new ImportSessions(),
+      cookieJar: (partition) => {
+        const cookies = session.fromPartition(partition).cookies;
+        return { set: (details) => cookies.set(details) };
+      },
+      getTabContents: (taskId, sessionId) =>
+        getBrowserWorkbenchService().getTabContents(taskId, sessionId),
+      pickPasswordFile: async () => {
+        const options = {
+          title: "Choose a password export",
+          properties: ["openFile" as const],
+          filters: [{ name: "CSV", extensions: ["csv"] }],
+        };
+        const result =
+          mainWindow && !mainWindow.isDestroyed()
+            ? await dialog.showOpenDialog(mainWindow, options)
+            : await dialog.showOpenDialog(options);
+        return result.canceled ? null : (result.filePaths[0] ?? null);
+      },
+      confirm: async ({ message, detail, confirmLabel }) => {
+        const options = {
+          type: "question" as const,
+          message,
+          detail,
+          buttons: [confirmLabel, "Cancel"],
+          defaultId: 1,
+          cancelId: 1,
+        };
+        const result =
+          mainWindow && !mainWindow.isDestroyed()
+            ? await dialog.showMessageBox(mainWindow, options)
+            : await dialog.showMessageBox(options);
+        return result.response === 0;
+      },
+      promptBiometric:
+        process.platform === "darwin" && systemPreferences.canPromptTouchID()
+          ? async (reason) => {
+              try {
+                await systemPreferences.promptTouchID(reason);
+                return true;
+              } catch {
+                return false;
+              }
+            }
+          : null,
+      shredFile: shredFileOnDisk,
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_INSPECT_AREA, async (_event, data: Any) => {
+      const rect = data?.rect;
+      if (
+        !data ||
+        typeof data.taskId !== "string" ||
+        !rect ||
+        !["x", "y", "width", "height"].every((key) => Number.isFinite(Number(rect[key])))
+      ) {
+        return { success: false, error: "Invalid area" };
+      }
+      const area = await getBrowserWorkbenchService().inspectArea({
+        taskId: data.taskId,
+        sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        rect,
+      });
+      return area ? { success: true, area } : { success: false, error: "Nothing to inspect" };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_STYLE_PREVIEW, async (_event, data: Any) => {
+      if (
+        !data ||
+        typeof data.taskId !== "string" ||
+        typeof data.selector !== "string" ||
+        (data.action !== "apply" && data.action !== "revert")
+      ) {
+        return { success: false, error: "Invalid style preview" };
+      }
+      const styles =
+        data.styles && typeof data.styles === "object" && !Array.isArray(data.styles)
+          ? (data.styles as Record<string, string>)
+          : undefined;
+      const result = await getBrowserWorkbenchService().previewStyle({
+        taskId: data.taskId,
+        sessionId: typeof data.sessionId === "string" ? data.sessionId : "default",
+        selector: data.selector,
+        action: data.action,
+        styles,
+        text: typeof data.text === "string" ? data.text : undefined,
+      });
+      return result || { success: false, error: "No browser tab" };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_FOCUS, (_event, data: Any) => {
+      browserWorkbenchChromeFocused = data?.focused === true;
+      return { success: true };
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_DIAGNOSTICS_GET, async (_event, data: Any) => {
+      const kind = data?.kind;
+      if (
+        !data ||
+        typeof data.taskId !== "string" ||
+        !["console", "network", "downloads", "storage"].includes(kind)
+      ) {
+        return { success: false, error: "Invalid diagnostics request" };
+      }
+      const sessionId = typeof data.sessionId === "string" ? data.sessionId : "default";
+      const tabId = readBrowserTabId(data.tabId);
+      if (data.clear === true && (kind === "console" || kind === "network")) {
+        getBrowserSessionManager().clearTabDiagnostics({
+          taskId: data.taskId,
+          sessionId,
+          tabId,
+          kind,
+        });
+      }
+      try {
+        const result = await getBrowserSessionManager().getTabDiagnostics({
+          taskId: data.taskId,
+          sessionId,
+          tabId,
+          kind,
+        });
+        return result || { success: false, error: "No browser tab" };
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_TRACE, async (_event, data: Any) => {
+      if (
+        !data ||
+        typeof data.taskId !== "string" ||
+        (data.action !== "start" && data.action !== "stop")
+      ) {
+        return { success: false, error: "Invalid trace request" };
+      }
+      const sessionId = typeof data.sessionId === "string" ? data.sessionId : "default";
+      const tabId = readBrowserTabId(data.tabId);
+      try {
+        const manager = getBrowserSessionManager();
+        const result =
+          data.action === "start"
+            ? await manager.traceStart(data.taskId, sessionId, tabId)
+            : await manager.traceStop(data.taskId, sessionId, tabId);
+        return result || { success: false, error: "No browser tab" };
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_SNAPSHOT_GET, (_event, data: Any) => {
+      if (!data || typeof data.taskId !== "string") return null;
+      return getBrowserSessionManager().getSnapshotOverlay(
+        data.taskId,
+        typeof data.sessionId === "string" ? data.sessionId : "default",
+        readBrowserTabId(data.tabId),
+      );
+    });
+    ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_PERMISSION_LIST, (_event, data: Any) => {
+      if (!data || typeof data.taskId !== "string") return [];
+      return getBrowserWorkbenchService().listPendingPermissions(
+        data.taskId,
+        typeof data.sessionId === "string" ? data.sessionId : "default",
+      );
     });
     ipcMain.handle(IPC_CHANNELS.BROWSER_WORKBENCH_SCREENSHOT, async (_event, data: Any) => {
       if (!data || typeof data.taskId !== "string" || typeof data.workspacePath !== "string") {

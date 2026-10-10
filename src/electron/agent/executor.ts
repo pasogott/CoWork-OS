@@ -76,7 +76,27 @@ import {
 import { parseNaturalLlmWikiPrompt } from "../../shared/llm-wiki-prompt-routing";
 import { parseOnboardingSlashCommand } from "../../shared/onboarding";
 import { RICH_FRAME_DESIGN_LANGUAGE_PROMPT } from "../../shared/rich-frame-design-language";
+import { HTML_SURFACE_RUNTIME_PROMPT } from "../../shared/answer-surfaces/html-bridge";
+import { AnswerToolDataStore } from "../answer-surfaces/AnswerToolDataStore";
+import { extractToolDataTable, toolDataHandle, toolDataNote } from "../answer-surfaces/tool-data";
+import { formatAnswerSurfaceChanges } from "../answer-surfaces/answer-surface-changes";
 import { ANSWER_SURFACE_PROMPT } from "../../shared/answer-surfaces/prompt";
+import { ANSWER_SURFACE_SECTION_TOKENS } from "./content/ContentBuilder";
+import {
+  findAnswerSurfaceProblems,
+  repairAnswerSurfaces,
+} from "../../shared/answer-surfaces/repair";
+import { surfaceOriginNote } from "../../shared/answer-surfaces/actions";
+
+/** The message with its surface-action note (see surfaceOriginNote), if it has one. */
+function withSurfaceOriginNote(
+  text: string,
+  origin: TaskFollowUpInput["surfaceOrigin"] | undefined,
+): string {
+  const note = surfaceOriginNote(origin);
+  return note ? `${text}\n\n${note}` : text;
+}
+import { hasAnswerSurfaceBlock } from "../../shared/answer-surfaces/blocks";
 import { AnswerSurfaceStateStore } from "../answer-surfaces/AnswerSurfaceStateStore";
 import { buildUserMessageAttachmentMetadata } from "../../shared/user-message-attachments";
 import * as fs from "fs";
@@ -107,7 +127,11 @@ import {
 import { ToolRegistry } from "./tools/registry";
 import { ToolBatchExecutor } from "./runtime/tool-batch-executor";
 import { ToolScheduler, type ToolScheduleCallReport } from "./runtime/ToolScheduler";
-import { ToolExecutionCoordinator } from "./runtime/ToolExecutionCoordinator";
+import {
+  ToolExecutionCoordinator,
+  type CoordinatedToolExecutionResult,
+} from "./runtime/ToolExecutionCoordinator";
+import { buildToolResultEnvelope } from "./runtime/tool-result-envelope";
 import { StreamingToolExecutor } from "./runtime/StreamingToolExecutor";
 import { DeferredToolCatalog } from "./runtime/DeferredToolCatalog";
 import { ToolSearchService } from "./runtime/ToolSearchService";
@@ -340,6 +364,7 @@ import {
   ToolFailureTracker,
   FileOperationTracker,
   collectMutationTargetPaths as collectMutationTargetPathsUtil,
+  collectReportedOutputPaths as collectReportedOutputPathsUtil,
   hashToolInput as hashToolInputUtil,
   toolMayChangeFilesImplicitly as toolMayChangeFilesImplicitlyUtil,
   withTimeout,
@@ -347,6 +372,13 @@ import {
   sleep,
 } from "./executor-helpers";
 import { FileMutationVerifier } from "./file-mutation-verifier";
+import { resolveDocumentOutputs } from "./skills/document";
+import {
+  MATCHING_DOCUMENT_FORMATS_PLAN_HINT,
+  MatchingDocumentFormatsGuard,
+  requestsMatchingDocumentFormats,
+  type MatchingDocumentDecision,
+} from "./executor-matching-documents-guard";
 import { CsvArithmeticVerifier } from "./csv-arithmetic-verifier";
 import { CsvReportEvidenceVerifier } from "./data-evidence-verifier";
 import { ExecutorEventEmitter } from "./executor-event-emitter";
@@ -394,6 +426,7 @@ type TaskExecutorFollowUpOptions = Pick<
   | "senderLabel"
   | "inReplyToMessageId"
   | "inReplyToTaskId"
+  | "surfaceOrigin"
 > & {
   /** Called after transcript and queue state are durably persisted. */
   onAccepted?: () => void | Promise<void>;
@@ -477,6 +510,7 @@ import {
   promptRequestsPresentationArtifactOutput as promptRequestsPresentationArtifactOutputUtil,
   responseDirectlyAddressesPrompt as responseDirectlyAddressesPromptUtil,
   responseHasDecisionSignal as responseHasDecisionSignalUtil,
+  responseIsStructuredRecommendation as responseIsStructuredRecommendationUtil,
   responseHasReasonedConclusionSignal as responseHasReasonedConclusionSignalUtil,
   responseHasReviewReportEvidenceSignal as responseHasReviewReportEvidenceSignalUtil,
   responseHasVerificationSignal as responseHasVerificationSignalUtil,
@@ -490,6 +524,32 @@ import {
   hasUnrecoveredBlockingPlanFailureForAssistantOutput as hasUnrecoveredBlockingPlanFailureForAssistantOutputUtil,
   hasUnrecoveredToolFailureForAssistantOutput as hasUnrecoveredToolFailureForAssistantOutputUtil,
 } from "./executor-completion-utils";
+import {
+  MAX_VERIFICATION_REPAIR_PASSES,
+  MIN_TURNS_FOR_VERIFICATION_REPAIR,
+  SOURCED_ANSWER_VERIFICATION_STEP_DESCRIPTION,
+  MATCHING_OUTPUTS_VERIFICATION_STEP_DESCRIPTION,
+  isLocalizedCheckStepDescription,
+  requestsFinalOutputsCheck,
+  VERIFICATION_RECHECK_STEP_DESCRIPTION,
+  VERIFICATION_REPAIR_STEP_DESCRIPTION,
+  answerLinksOutput,
+  buildOfficeArtifactVerificationGuidance,
+  buildUnlinkedSourceCellsFinding,
+  buildVerificationRecheckStepContext,
+  buildVerificationRepairStepContext,
+  buildVerificationSeverityGuidance,
+  decideVerificationRepair,
+  extractVerificationFindings,
+  findUnlinkedSourcedTableCells,
+  isBlockingVerificationVerdict,
+  isVerificationRecheckStepDescription,
+  isVerificationRepairStepDescription,
+  mentionsOfficeArtifact,
+  requestsFileLinks,
+  requestsSourceLinks,
+  requestsSourcedResearchAnswer,
+} from "./executor-verification-repair-utils";
 import {
   CANONICAL_ARTIFACT_EXTENSION_REGEX,
   deriveStepContractMode,
@@ -544,6 +604,7 @@ import {
   detectTestRequirement as detectTestRequirementUtil,
   extractNamedTestCommands as extractNamedTestCommandsUtil,
   isBuildCheckCommand as isBuildCheckCommandUtil,
+  isLatexPdfRequest as isLatexPdfRequestUtil,
   isTestCommand as isTestCommandUtil,
   promptIsWatchSkipRecommendationTask as promptIsWatchSkipRecommendationTaskUtil,
   promptRequestsDecision as promptRequestsDecisionUtil,
@@ -1006,6 +1067,10 @@ const SAFE_INTEGRATION_MENTION_TOOL_ALLOWLIST = new Set<string>([
   "browser_evaluate",
   "browser_wait",
   "browser_scroll",
+  "browser_tabs",
+  "browser_new_tab",
+  "browser_switch_tab",
+  "browser_close_tab",
 ]);
 
 const isLLMImageContent = (block: LLMContent): block is LLMImageContent => {
@@ -1042,6 +1107,9 @@ export class TaskExecutor {
   private fileMutationVerifier: FileMutationVerifier;
   private csvArithmeticVerifier?: CsvArithmeticVerifier;
   private csvReportEvidenceVerifier?: CsvReportEvidenceVerifier;
+  /** Keeps matching DOCX/PDF outputs on one create_document call; lazily created. */
+  private matchingDocumentGuard?: MatchingDocumentFormatsGuard;
+  private matchingDocumentDecisions?: WeakMap<object, MatchingDocumentDecision>;
   private activeBasePromptRoutingBlocks?: Set<BasePromptRoutingBlock>;
   private workspaceGitInfo?: { isRepo: boolean; branch?: string; detachedHead?: boolean };
   private lastWebFetchFailure: {
@@ -1841,6 +1909,17 @@ export class TaskExecutor {
       return;
     }
 
+    // A user update queued while this turn ran supersedes its answer; the
+    // daemon keeps the task executing and runs the update next.
+    const pendingUserUpdate = (this.daemon as Any).reconcilePendingUserUpdateBeforeCompletion?.(
+      this.task.id,
+    ) as { deferred: boolean } | undefined;
+    if (pendingUserUpdate?.deferred) {
+      this.task.status = "executing";
+      this.task.completedAt = undefined;
+      return;
+    }
+
     // A follow-up on a collaborative root while its team is still working is
     // an update for the team, not the end of the task: the team's synthesis
     // completes the root when it lands.
@@ -1926,7 +2005,7 @@ export class TaskExecutor {
       if (!this.isUsefulResultSummaryCandidate(trimmed)) continue;
       // This value is persisted and rendered as the final answer. Keep it
       // lossless; only prompt-context copies are bounded below.
-      return trimmed;
+      return this.reconcileAnswerCitations(trimmed);
     }
 
     return "";
@@ -2232,7 +2311,43 @@ export class TaskExecutor {
       normalizedToolResult.toolResult.is_error ? "failed" : "completed",
     );
 
-    return normalizedToolResult.toolResult;
+    return this.keepToolResultAsAnswerData(params, normalizedToolResult.toolResult);
+  }
+
+  /**
+   * When a tool returned table-like data and answer components are offered, keep the full
+   * table under a short handle and add one line telling the model it can compute an
+   * answer from it ({"tool": handle}) rather than retyping the numbers. The note is added
+   * after truncation, so the context budget never cuts it off.
+   */
+  private keepToolResultAsAnswerData(
+    params: { toolName: string; toolUseId: string; result: Any },
+    toolResult: LLMToolResult,
+  ): LLMToolResult {
+    if (toolResult.is_error || typeof toolResult.content !== "string") return toolResult;
+    if (!params.toolUseId || !this.shouldOfferAnswerSurfaces()) return toolResult;
+    try {
+      const handle = toolDataHandle(this.task.id, params.toolUseId);
+      const extracted = extractToolDataTable(
+        params.toolName,
+        params.result,
+        `${params.toolName} output ${handle}`,
+      );
+      if (!extracted) return toolResult;
+      const { table, json } = extracted;
+      void AnswerToolDataStore.put(
+        this.task.id,
+        handle,
+        params.toolUseId,
+        params.toolName,
+        json,
+      ).catch(() => {
+        // Not kept: an answer that names this handle says the result is unavailable.
+      });
+      return { ...toolResult, content: `${toolResult.content}\n${toolDataNote(handle, table)}` };
+    } catch {
+      return toolResult;
+    }
   }
 
   private shouldCompactToolResultsForLocalModel(): boolean {
@@ -3096,7 +3211,9 @@ export class TaskExecutor {
         return null;
       }
 
-      const fileOpCheck = this.checkFileOperation(content.name, content.input, batchCreatedPaths);
+      const fileOpCheck = this.checkFileOperation(content.name, content.input, batchCreatedPaths, {
+        preview: true,
+      });
       if (fileOpCheck.blocked) {
         return null;
       }
@@ -3535,6 +3652,14 @@ export class TaskExecutor {
       String(payloadObj.message || payloadObj.content || "").trim().length > 0
     ) {
       this.sessionKickoffSummarySettled = true;
+    }
+    if (
+      type === "assistant_message" &&
+      payloadObj.internal !== true &&
+      typeof payloadObj.message === "string"
+    ) {
+      const reconciled = this.reconcileAnswerCitations(payloadObj.message, { log: true });
+      if (reconciled !== payloadObj.message) payloadObj = { ...payloadObj, message: reconciled };
     }
 
     // Some tests instantiate TaskExecutor-like objects without running the constructor.
@@ -4218,6 +4343,25 @@ export class TaskExecutor {
       return !hasMutationVerb;
     }
     return desc.includes("verify:") || desc.includes("verification") || desc.includes("verify ");
+  }
+
+  /**
+   * Whether a plan step is a verification checkpoint. English descriptions
+   * follow descriptionIndicatesVerification at any position. A check written
+   * in another language ("Verificar que ambos os ficheiros existem...") counts
+   * when it is the plan's final step, or when it was already classified as
+   * verification, so steps appended after it later do not demote it.
+   */
+  private planStepIndicatesVerification(
+    description: string,
+    opts: { isFinalStep: boolean; kind?: PlanStep["kind"] | string },
+  ): boolean {
+    if (this.descriptionIndicatesVerification(description)) return true;
+    if (opts.kind === "recovery") return false;
+    return (
+      (opts.isFinalStep || opts.kind === "verification") &&
+      isLocalizedCheckStepDescription(description)
+    );
   }
 
   private normalizeScaffoldRootPath(rawPath: string): string {
@@ -5175,7 +5319,10 @@ export class TaskExecutor {
           "Confirm concrete output constraints (format, exact limits, filename) and execute the required tool actions.";
       }
 
-      const normalizedKind: PlanStep["kind"] = this.descriptionIndicatesVerification(description)
+      const normalizedKind: PlanStep["kind"] = this.planStepIndicatesVerification(description, {
+        isFinalStep: index === steps.length - 1,
+        kind: step?.kind,
+      })
         ? "verification"
         : step?.kind === "recovery" || step?.kind === "primary"
           ? step.kind
@@ -6708,6 +6855,9 @@ ${transcript}
   private planRevisionLimitLogged = false;
   private readonly maxPlanRevisions: number = 5;
   private planScaffoldRoot: string | null = null;
+  // Verification repair pass (one per task): findings by repair/re-check step id.
+  private verificationRepairPassesUsed = 0;
+  private verificationRepairFindingsByStepId: Map<string, string> = new Map();
 
   // Failed approach tracking to prevent retrying the same failed strategies
   private failedApproaches: Set<string> = new Set();
@@ -9157,6 +9307,75 @@ ${transcript}
     );
   }
 
+  /**
+   * The answer-block repair loop: a ```cowork-ui block that would not render (bad JSON,
+   * schema errors, a cut-off fence) or whose formulas are blank at the defaults goes back
+   * to the model once, with the exact problem; the fix replaces it only when it checks
+   * out, so a failed repair never makes the answer worse. Runs before the answer is shown
+   * and never streams.
+   */
+  private async repairAnswerSurfaceText(text: string): Promise<string> {
+    if (!text || !hasAnswerSurfaceBlock(text)) return text;
+    if (
+      !this.shouldOfferAnswerSurfaces() ||
+      !isFeatureEnabled("COWORK_ANSWER_SURFACE_REPAIR", true)
+    ) {
+      return text;
+    }
+    if (!findAnswerSurfaceProblems(text).length) return text;
+    const outcome = await repairAnswerSurfaces(text, async (prompt) => {
+      const response = await this.createMessageWithTimeout(
+        {
+          model: this.modelId,
+          maxTokens: 6000,
+          system: ANSWER_SURFACE_PROMPT,
+          messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+        },
+        45_000,
+        "Answer block repair",
+        undefined,
+        { suppressStreaming: true },
+      );
+      if (response?.usage) {
+        this.updateTracking(
+          response.usage.inputTokens,
+          response.usage.outputTokens,
+          response.usage.cachedTokens,
+        );
+      }
+      return this.extractTextFromLLMContent(response?.content || []);
+    });
+    if (outcome.repaired > 0) {
+      this.emitEvent("log", {
+        message: `Repaired ${outcome.repaired} interactive answer block(s)`,
+      });
+    }
+    for (const reason of outcome.kept) {
+      this.emitEvent("log", {
+        message: `Kept an interactive answer block unrepaired: ${reason.slice(0, 160)}`,
+      });
+    }
+    return outcome.text;
+  }
+
+  /** The repair loop over a model response's text parts (tool calls are left as they are). */
+  private async repairAnswerSurfaceResponse<T extends { content?: Any[] }>(
+    response: T,
+  ): Promise<T> {
+    if (!Array.isArray(response?.content)) return response;
+    let changed = false;
+    const content = await Promise.all(
+      response.content.map(async (item: Any) => {
+        if (item?.type !== "text" || typeof item.text !== "string") return item;
+        const text = await this.repairAnswerSurfaceText(item.text);
+        if (text === item.text) return item;
+        changed = true;
+        return { ...item, text };
+      }),
+    );
+    return changed ? { ...response, content } : response;
+  }
+
   private buildChatOrThinkSystemPrompt(
     isThinkMode: boolean,
     ctx: {
@@ -9329,7 +9548,7 @@ ${transcript}
       const hasUnexecutedToolCall = this.responseLooksLikeUnexecutedToolCall(rawAssistantText);
       const assistantText = hasUnexecutedToolCall
         ? this.buildUnexecutedToolCallChatFallback()
-        : rawAssistantText;
+        : await this.repairAnswerSurfaceText(rawAssistantText);
       this.emitEvent("assistant_message", { message: assistantText });
       this.lastAssistantOutput = assistantText;
       this.lastNonVerificationOutput = assistantText;
@@ -9760,6 +9979,8 @@ ${transcript}
     streamOptions?: {
       suppressUnexecutedToolCallText?: boolean;
       fallbackText?: string;
+      /** Internal calls (e.g. repairing an answer block) never stream to the screen. */
+      suppressStreaming?: boolean;
     },
   ): Promise<Any> {
     // Pace model calls while timeline projections in the database worker catch up.
@@ -9777,7 +9998,7 @@ ${transcript}
 
     const effectiveProvider = phaseRouting?.provider ?? this.provider;
     const effectiveModelId = phaseRouting?.modelId ?? this.modelId;
-    const shouldStream = effectiveProvider.type === "azure";
+    const shouldStream = effectiveProvider.type === "azure" && !streamOptions?.suppressStreaming;
     const onStreamProgress: StreamProgressCallback | undefined = shouldStream
       ? this.createLlmStreamingProgressHandler(streamOptions)
       : undefined;
@@ -11410,6 +11631,16 @@ ${transcript}
     input: unknown,
     toolTimeoutMs: number,
   ): Promise<Awaited<ReturnType<ToolExecutionCoordinator["executeTool"]>>> {
+    return this.applyMatchingDocumentDecision(toolName, input, () =>
+      this.runToolWithHeartbeat(toolName, input, toolTimeoutMs),
+    );
+  }
+
+  private async runToolWithHeartbeat(
+    toolName: string,
+    input: unknown,
+    toolTimeoutMs: number,
+  ): Promise<Awaited<ReturnType<ToolExecutionCoordinator["executeTool"]>>> {
     const schedulerSpec = this.getSchedulerSpecForTool(toolName, input as Any);
     if (
       this.streamingToolExecutor &&
@@ -11493,11 +11724,27 @@ ${transcript}
     toolName: string,
     input: Any,
     batchCreatedPaths?: Set<string>,
+    options?: { preview?: boolean },
   ): { blocked: boolean; reason?: string; suggestion?: string; cachedResult?: string } {
     // Calls are prepared before any of them runs, so a mutation scheduled earlier in this
     // batch must drop cached reads of its targets now; a later read of the same file then
     // runs for real after the mutation instead of being answered with pre-mutation content.
     this.invalidateReadCacheForTool(toolName, input);
+
+    // Matching DOCX/PDF files must come from one create_document call with formats.
+    if (toolName === "create_document") {
+      const preview = options?.preview === true;
+      const decision = this.evaluateMatchingDocumentFormats(input, preview);
+      if (decision.action === "block") {
+        return { blocked: true, reason: decision.reason, suggestion: decision.suggestion };
+      }
+      if (preview && (decision.action !== "allow" || decision.warning)) {
+        // A previewed batch runs one call at a time instead, where the decision is applied.
+        return { blocked: true, reason: "create_document needs the matching-files check." };
+      }
+      // Nothing is written for a file already written by the earlier formats call.
+      if (decision.action === "already_written") return { blocked: false };
+    }
 
     // Check for redundant file reads
     if (toolName === "read_file" && input?.path) {
@@ -11541,17 +11788,18 @@ ${transcript}
     const fileCreationTools = new Set(["write_file", "copy_file", "generate_video"]);
     if (fileCreationTools.has(toolName) || isArtifactGenerationToolNameUtil(toolName)) {
       const filename = input?.filename || input?.path || input?.destPath || input?.destination;
-      if (filename) {
-        const normalizedFilename = String(filename).toLowerCase().replace(/\\/g, "/");
-        if (batchCreatedPaths?.has(normalizedFilename)) {
+      const reservations = this.getBatchCreatedPathReservations(toolName, input);
+      if (filename && reservations.length > 0) {
+        const reserved = reservations.find((reservation) => batchCreatedPaths?.has(reservation));
+        if (reserved) {
           return {
             blocked: true,
-            reason: `File "${filename}" is already scheduled for creation in this tool batch`,
+            reason: `File "${reservations.length > 1 ? reserved : filename}" is already scheduled for creation in this tool batch`,
             suggestion:
               "Create the file once and then edit or refine that file in the same response instead of emitting a second creation call.",
           };
         }
-        batchCreatedPaths?.add(normalizedFilename);
+        for (const reservation of reservations) batchCreatedPaths?.add(reservation);
 
         // Guard: don't write tiny HTML placeholders right after a failed fetch
         if (
@@ -11612,14 +11860,134 @@ ${transcript}
     }
   }
 
-  private getBatchCreatedPathReservation(toolName: string, input: Any): string | null {
+  private getMatchingDocumentGuard(): MatchingDocumentFormatsGuard {
+    this.matchingDocumentGuard ??= new MatchingDocumentFormatsGuard(this.workspace?.path);
+    return this.matchingDocumentGuard;
+  }
+
+  /** Decisions for create_document calls about to run, keyed by the call's input. */
+  private getMatchingDocumentDecisions(): WeakMap<object, MatchingDocumentDecision> {
+    this.matchingDocumentDecisions ??= new WeakMap();
+    return this.matchingDocumentDecisions;
+  }
+
+  /**
+   * Whether a create_document call that writes one format may run when the
+   * request asks for matching files (see MatchingDocumentFormatsGuard).
+   */
+  private evaluateMatchingDocumentFormats(input: Any, preview: boolean): MatchingDocumentDecision {
+    const workspacePath = this.workspace?.path;
+    if (!workspacePath || !input || typeof input !== "object") return { action: "allow" };
+    const createdFiles = new Set(
+      (this.fileOperationTracker?.getCreatedFiles?.() || []).map((file) =>
+        path.resolve(workspacePath, file),
+      ),
+    );
+    const decision = this.getMatchingDocumentGuard().evaluate({
+      input,
+      prompt: this.getContractPrompt(),
+      fileExists: (filename) => fs.existsSync(path.resolve(workspacePath, filename)),
+      createdEarlierInTask: (filename) => createdFiles.has(path.resolve(workspacePath, filename)),
+      preview,
+    });
+    if (preview) return decision;
+    const decisions = this.getMatchingDocumentDecisions();
+    if (decision.action === "allow" && !decision.warning) {
+      decisions.delete(input);
+      return decision;
+    }
+    decisions.set(input, decision);
+    if (decision.action === "block") {
+      logger.info(`${this.logTag} Redirecting single-format create_document to formats`);
+    } else if (decision.action === "allow" && decision.warning) {
+      logger.warn(`${this.logTag} Allowing single-format create_document after repeated blocks`);
+      this.emitEvent("tool_warning", { tool: "create_document", warning: decision.warning });
+    }
+    return decision;
+  }
+
+  /**
+   * Apply a pre-execution create_document decision: a file already written by
+   * the earlier formats call is reported without being rewritten, and a call let
+   * through after repeated blocks carries its warning in the result.
+   */
+  private applyMatchingDocumentDecision(
+    toolName: string,
+    input: unknown,
+    execute: () => Promise<CoordinatedToolExecutionResult>,
+  ): Promise<CoordinatedToolExecutionResult> {
+    const decision =
+      toolName === "create_document" && input && typeof input === "object"
+        ? this.matchingDocumentDecisions?.get(input)
+        : undefined;
+    if (!decision || decision.action === "block") return execute();
+    this.matchingDocumentDecisions?.delete(input as object);
+    const withResult = (
+      result: Record<string, unknown>,
+      base?: CoordinatedToolExecutionResult,
+    ): CoordinatedToolExecutionResult => {
+      const envelope = buildToolResultEnvelope({
+        toolUseId: base?.envelope?.toolUseId || `${toolName}:${Date.now()}`,
+        toolName,
+        status: "success",
+        result,
+        ...(base?.policyTrace ? { policyTrace: base.policyTrace } : {}),
+      });
+      return {
+        result,
+        durationMs: base?.durationMs ?? 0,
+        resultJson: envelope.modelPayload,
+        envelope,
+        ...(base?.policyTrace ? { policyTrace: base.policyTrace } : {}),
+      };
+    };
+    if (decision.action === "already_written") {
+      return Promise.resolve(withResult(decision.result));
+    }
+    const warning = decision.warning;
+    return execute().then((coordinated) => {
+      const result = coordinated.result;
+      if (
+        !warning ||
+        coordinated.error ||
+        !result ||
+        typeof result !== "object" ||
+        Array.isArray(result) ||
+        result.success === false
+      ) {
+        return coordinated;
+      }
+      const warnings = Array.isArray(result.warnings) ? [...result.warnings, warning] : [warning];
+      return withResult({ ...result, warnings }, coordinated);
+    });
+  }
+
+  /** The files a creation call will write, normalized for the per-batch duplicate guard. */
+  private getBatchCreatedPathReservations(toolName: string, input: Any): string[] {
     const fileCreationTools = new Set(["write_file", "copy_file", "generate_video"]);
     if (!(fileCreationTools.has(toolName) || isArtifactGenerationToolNameUtil(toolName))) {
-      return null;
+      return [];
     }
     const filename = input?.filename || input?.path || input?.destPath || input?.destination;
-    if (!filename) return null;
-    return String(filename).toLowerCase().replace(/\\/g, "/");
+    if (!filename) return [];
+    const normalize = (value: string) => value.toLowerCase().replace(/\\/g, "/");
+    // One create_document call with formats writes one file per format.
+    if (toolName === "create_document" && Array.isArray(input?.formats)) {
+      try {
+        return resolveDocumentOutputs(input).map((output) => normalize(output.filename));
+      } catch {
+        // The tool reports the invalid input; reserve the name as given.
+        return [normalize(String(filename))];
+      }
+    }
+    let reservation = normalize(String(filename));
+    // create_document appends the format extension when the filename has none, so a
+    // DOCX/PDF pair sharing one base name are two distinct files.
+    const format = typeof input?.format === "string" ? input.format.trim().toLowerCase() : "";
+    if (toolName === "create_document" && format && !reservation.endsWith(`.${format}`)) {
+      reservation = `${reservation}.${format}`;
+    }
+    return [reservation];
   }
 
   private releaseBatchCreatedPathReservation(
@@ -11627,9 +11995,9 @@ ${transcript}
     toolName: string,
     input: Any,
   ): void {
-    const reservation = this.getBatchCreatedPathReservation(toolName, input);
-    if (!reservation) return;
-    batchCreatedPaths?.delete(reservation);
+    for (const reservation of this.getBatchCreatedPathReservations(toolName, input)) {
+      batchCreatedPaths?.delete(reservation);
+    }
   }
 
   /**
@@ -11670,6 +12038,26 @@ ${transcript}
     // A mutation attempt (even a failed one) or a command makes cached reads unreliable.
     this.invalidateReadCacheForTool(toolName, input, result);
 
+    // Remember which files one create_document call wrote from the same content; a file
+    // changed any other way (or by a failed attempt) no longer counts as written with them.
+    if (toolName === "create_document" && toolSucceeded) {
+      this.getMatchingDocumentGuard().recordCreateDocument(input, result);
+    } else if (
+      this.matchingDocumentGuard &&
+      (isFileMutationToolNameUtil(canonicalizeToolNameUtil(toolName)) ||
+        this.isFileMutationTool(canonicalizeToolNameUtil(toolName)))
+    ) {
+      const targets = collectMutationTargetPathsUtil(input, result);
+      if (toolName === "create_document") {
+        try {
+          targets.push(...resolveDocumentOutputs(input).map((output) => output.filename));
+        } catch {
+          // Invalid input wrote nothing beyond the names already collected.
+        }
+      }
+      this.matchingDocumentGuard.forget(targets);
+    }
+
     // Record directory listings
     if (toolName === "list_directory" && input?.path) {
       // Extract file names from the result
@@ -11707,6 +12095,10 @@ ${transcript}
         input?.file_path;
       if (filename) {
         this.fileOperationTracker.recordFileCreation(filename);
+      }
+      // A call that writes several files (create_document with formats) lists them all.
+      for (const outputPath of collectReportedOutputPathsUtil(result)) {
+        if (outputPath !== filename) this.fileOperationTracker.recordFileCreation(outputPath);
       }
     }
 
@@ -12928,6 +13320,44 @@ ${transcript}
       });
     }
 
+    // A research answer the user asked to be linked or sourced ends with a
+    // check of its links, so the verification repair pass can fix unlinked
+    // facts. Plans that already end with a check keep it.
+    const lastPlanStep = nextPlan.steps[nextPlan.steps.length - 1];
+    if (
+      this.task &&
+      nextPlan.steps.length > 0 &&
+      lastPlanStep &&
+      !this.isVerificationStep(lastPlanStep) &&
+      requestsSourcedResearchAnswer(`${this.task.title || ""}\n${this.getContractPrompt() || ""}`)
+    ) {
+      nextPlan.steps.push({
+        id: this.nextPlanStepId(nextPlan.steps),
+        description: SOURCED_ANSWER_VERIFICATION_STEP_DESCRIPTION,
+        kind: "verification",
+        status: "pending",
+      });
+    }
+
+    // Files that must match each other (a DOCX and its PDF), or several
+    // named files the user wants linked, end with a check of those files so
+    // the matching-output severity rules and the repair pass apply. A plan
+    // whose final step is already a check, in any language, keeps it.
+    const finalPlanStep = nextPlan.steps[nextPlan.steps.length - 1];
+    if (
+      this.task &&
+      finalPlanStep &&
+      !this.isVerificationStep(finalPlanStep) &&
+      requestsFinalOutputsCheck(`${this.task.title || ""}\n${this.getContractPrompt() || ""}`)
+    ) {
+      nextPlan.steps.push({
+        id: this.nextPlanStepId(nextPlan.steps),
+        description: MATCHING_OUTPUTS_VERIFICATION_STEP_DESCRIPTION,
+        kind: "verification",
+        status: "pending",
+      });
+    }
+
     return nextPlan;
   }
 
@@ -13982,7 +14412,9 @@ ${transcript}
         }
       }
 
-      if (toolName === "create_document" && !input.format) {
+      // A formats list names every format to write; a single default would conflict with it.
+      const hasFormatsList = Array.isArray(input.formats) && input.formats.length > 0;
+      if (toolName === "create_document" && !input.format && !hasFormatsList) {
         const ext = input.filename ? path.extname(String(input.filename)).toLowerCase() : "";
         if (ext === ".pdf") {
           input.format = "pdf";
@@ -14357,9 +14789,10 @@ ${transcript}
     if (!workspaceRoot) return summary;
     const inability =
       /\b(?:can['’]?t|cannot|could\s*n['’]?t|could\s+not|unable\s+to|not\s+able\s+to)\b/i;
-    const promptAsksForLink = /\b(?:link|download(?:able)?|attach(?:ment)?)\b/i.test(
-      `${this.task?.title || ""}\n${this.getContractPrompt() || ""}`,
-    );
+    const requestText = `${this.task?.title || ""}\n${this.getContractPrompt() || ""}`;
+    const promptAsksForLink =
+      /\b(?:link|download(?:able)?|attach(?:ment)?)\b/i.test(requestText) ||
+      requestsFileLinks(requestText);
     if (!inability.test(summary) && !promptAsksForLink) return summary;
     let outputSummary: TaskOutputSummary | undefined;
     try {
@@ -14403,7 +14836,15 @@ ${transcript}
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 
-    const missingLinks = outputs.filter((relative) => !reconciled.includes(`](${relative})`));
+    // When the request names its files, those are the deliverables to link;
+    // other outputs (drafts, intermediate files) are left out.
+    const requestLower = requestText.toLowerCase();
+    const namedOutputs = outputs.filter((relative) =>
+      requestLower.includes(path.posix.basename(relative).toLowerCase()),
+    );
+    const missingLinks = (namedOutputs.length > 0 ? namedOutputs : outputs).filter(
+      (relative) => !answerLinksOutput(reconciled, relative),
+    );
     if ((!removedDenial && !promptAsksForLink) || missingLinks.length === 0) return reconciled;
     const links = missingLinks
       .map((relative) => `[${path.posix.basename(relative)}](${relative})`)
@@ -14792,6 +15233,20 @@ ${transcript}
     if (userPrompt) return userPrompt;
 
     return String(task.prompt || "");
+  }
+
+  /**
+   * A user update injected into a running step reaches only that step's
+   * message list. Later plan steps rebuild their context from the task prompt
+   * and the original plan, so without this note they finalize with the values
+   * the update replaced. Keep the update in the task context that every later
+   * step, and the final answer assembly, receive.
+   */
+  private recordAcceptedRunUserUpdate(message: string): void {
+    this.appendTaskContextNote(
+      "USER UPDATE (accepted while this task was running; it supersedes any conflicting value in the original request, the plan step descriptions, and earlier step outputs):",
+      String(message || ""),
+    );
   }
 
   private appendTaskContextNote(label: string, content: string): void {
@@ -15373,6 +15828,30 @@ ${transcript}
     });
   }
 
+  /**
+   * How a final-answer rewrite treats answer blocks. The rewrite is the answer the user
+   * sees, so for answer-style tasks it gets the component reference and room for a
+   * block; without them a block from the steps was dropped and none was written here.
+   */
+  private finalAnswerSurfaceOptions(): {
+    instruction: string;
+    systemSuffix: string;
+    candidateChars: number;
+    maxTokens: number;
+  } {
+    const offer =
+      this.shouldOfferAnswerSurfaces() &&
+      this.getActiveBasePromptRoutingBlocks().has("rich_surfaces");
+    if (!offer) return { instruction: "", systemSuffix: "", candidateChars: 4000, maxTokens: 1200 };
+    return {
+      instruction:
+        "If the previous response candidate has a ```cowork-ui block, keep it (fix it only if it is broken). Otherwise, when the answer is a calculation, comparison, plan, schedule or set of metrics, give it as one cowork-ui block after a short lead-in.",
+      systemSuffix: `\n\n${ANSWER_SURFACE_PROMPT}`,
+      candidateChars: 12_000,
+      maxTokens: 4000,
+    };
+  }
+
   private async ensureDirectFinalAnswerForCompletion(): Promise<void> {
     const contract = this.buildCompletionContract();
     if (!contract.requiresDirectAnswer) return;
@@ -15405,6 +15884,7 @@ ${transcript}
       .map((entry) => `- ${entry.tool}: ${String(entry.summary || "").slice(0, 2500)}`)
       .join("\n");
     const resultSummary = String(this.buildResultSummary() || "").trim();
+    const surfaces = this.finalAnswerSurfaceOptions();
     const synthesisPrompt = [
       "Produce the final user-facing answer to the original task now.",
       "Answer the requested question or report the requested result directly, using only the evidence below.",
@@ -15414,8 +15894,9 @@ ${transcript}
       "Keep the answer concise and omit internal planning or tool commentary.",
       "",
       `Original request:\n${this.getContractPrompt()}`,
+      surfaces.instruction,
       existingCandidate
-        ? `\nPrevious response candidate:\n${existingCandidate.slice(0, 4000)}`
+        ? `\nPrevious response candidate:\n${existingCandidate.slice(0, surfaces.candidateChars)}`
         : "",
       resultSummary ? `\nTask result summary:\n${resultSummary.slice(0, 4000)}` : "",
       completedSteps ? `\nCompleted steps:\n${completedSteps}` : "",
@@ -15428,8 +15909,8 @@ ${transcript}
       const response = await this.createMessageWithTimeout(
         {
           model: this.modelId,
-          maxTokens: 1200,
-          system: "Return a concise, direct, evidence-grounded final answer.",
+          maxTokens: surfaces.maxTokens,
+          system: `Return a concise, direct, evidence-grounded final answer.${surfaces.systemSuffix}`,
           messages: [{ role: "user", content: [{ type: "text", text: synthesisPrompt }] }],
         },
         35_000,
@@ -15443,9 +15924,9 @@ ${transcript}
         );
       }
 
-      const finalAnswer = String(
-        this.extractTextFromLLMContent(response?.content || []) || "",
-      ).trim();
+      const finalAnswer = await this.repairAnswerSurfaceText(
+        String(this.extractTextFromLLMContent(response?.content || []) || "").trim(),
+      );
       if (!finalAnswer || !this.responseDirectlyAddressesPrompt(finalAnswer, contract)) {
         this.emitEvent("log", {
           message:
@@ -15484,6 +15965,7 @@ ${transcript}
       .slice(-10)
       .map((entry) => `- ${entry.tool}: ${String(entry.summary || "").slice(0, 2500)}`)
       .join("\n");
+    const surfaces = this.finalAnswerSurfaceOptions();
     const synthesisPrompt = [
       "Restate the final user-facing answer to the original task, grounded in the evidence below.",
       "Say what the answer rests on (for example: according to the fetched page, the file read, or the command output).",
@@ -15493,8 +15975,9 @@ ${transcript}
       "Keep the answer concise and omit internal planning or tool commentary.",
       "",
       `Original request:\n${this.getContractPrompt()}`,
+      surfaces.instruction,
       existingCandidate
-        ? `\nPrevious response candidate:\n${existingCandidate.slice(0, 4000)}`
+        ? `\nPrevious response candidate:\n${existingCandidate.slice(0, surfaces.candidateChars)}`
         : "",
       toolEvidence ? `\nTool evidence (reference data):\n${toolEvidence}` : "",
     ]
@@ -15505,8 +15988,8 @@ ${transcript}
       const response = await this.createMessageWithTimeout(
         {
           model: this.modelId,
-          maxTokens: 1200,
-          system: "Return a concise final answer grounded in the supplied evidence.",
+          maxTokens: surfaces.maxTokens,
+          system: `Return a concise final answer grounded in the supplied evidence.${surfaces.systemSuffix}`,
           messages: [{ role: "user", content: [{ type: "text", text: synthesisPrompt }] }],
         },
         35_000,
@@ -15520,9 +16003,9 @@ ${transcript}
         );
       }
 
-      const finalAnswer = String(
-        this.extractTextFromLLMContent(response?.content || []) || "",
-      ).trim();
+      const finalAnswer = await this.repairAnswerSurfaceText(
+        String(this.extractTextFromLLMContent(response?.content || []) || "").trim(),
+      );
       if (
         !finalAnswer ||
         !this.hasVerificationEvidence(finalAnswer) ||
@@ -15712,6 +16195,180 @@ ${transcript}
     });
   }
 
+  private getVerificationRepairFindingsByStepId(): Map<string, string> {
+    if (!(this.verificationRepairFindingsByStepId instanceof Map)) {
+      this.verificationRepairFindingsByStepId = new Map();
+    }
+    return this.verificationRepairFindingsByStepId;
+  }
+
+  /**
+   * Findings a repair or re-check step works from. A resumed task no longer has
+   * the in-memory map, so fall back to the blocking verdict recorded on the
+   * failed verification step before it.
+   */
+  private getVerificationRepairFindingsForStep(step: PlanStep): string | undefined {
+    const recorded = this.getVerificationRepairFindingsByStepId().get(step.id);
+    if (recorded) return recorded;
+    if (
+      !isVerificationRepairStepDescription(step.description) &&
+      !isVerificationRecheckStepDescription(step.description)
+    ) {
+      return undefined;
+    }
+    const steps = this.plan?.steps || [];
+    const stepIndex = steps.findIndex((candidate) => candidate.id === step.id);
+    for (let index = stepIndex - 1; index >= 0; index -= 1) {
+      const candidate = steps[index];
+      if (candidate.status === "failed" && isBlockingVerificationVerdict(candidate.error)) {
+        return extractVerificationFindings(candidate.error) || undefined;
+      }
+    }
+    return undefined;
+  }
+
+  /** Whether the task can still afford a repair step plus a re-check. */
+  private hasBudgetForVerificationRepair(stepLoopBudgetStopped: boolean): boolean {
+    if (stepLoopBudgetStopped) return false;
+    if (this.cancelled || this.wrapUpRequested || this.softDeadlineTriggered) return false;
+    const revisionsUsed = Number.isFinite(this.planRevisionCount) ? this.planRevisionCount : 0;
+    const maxRevisions = Number.isFinite(this.maxPlanRevisions) ? this.maxPlanRevisions : 5;
+    if (revisionsUsed >= maxRevisions) return false;
+    if (
+      this.budgetContractsEnabled &&
+      (Number(this.autoRecoveryStepsPlanned) || 0) >= this.budgetContract.maxAutoRecoverySteps
+    ) {
+      return false;
+    }
+    const remainingTurns = this.getRemainingTurnBudget();
+    return !(Number.isFinite(remainingTurns) && remainingTurns < MIN_TURNS_FOR_VERIFICATION_REPAIR);
+  }
+
+  /**
+   * A gap in the delivered answer that a deterministic check can see: a table
+   * in a sourced answer whose factual cells carry no link or citation. Empty
+   * unless the repair pass could still run for this final verification step.
+   */
+  private findDeterministicVerificationGap(step: PlanStep, stepLoopBudgetStopped: boolean): string {
+    if (!this.isVerificationStepForCompletion(step)) return "";
+    if (isVerificationRecheckStepDescription(step.description)) return "";
+    if ((Number(this.verificationRepairPassesUsed) || 0) >= MAX_VERIFICATION_REPAIR_PASSES) {
+      return "";
+    }
+    if (!requestsSourceLinks(`${this.task?.title || ""}\n${this.getContractPrompt() || ""}`)) {
+      return "";
+    }
+    const deliverable = String(this.lastNonVerificationOutput || this.lastAssistantOutput || "");
+    const unlinkedCells = findUnlinkedSourcedTableCells(deliverable);
+    if (unlinkedCells.length === 0) return "";
+    if (!this.hasBudgetForVerificationRepair(stepLoopBudgetStopped)) return "";
+    return buildUnlinkedSourceCellsFinding(unlinkedCells);
+  }
+
+  /**
+   * When the final verification step answers FAIL_BLOCKING with fixable
+   * findings, append one repair step and one re-check step through the plan
+   * revision path. The failed verification counts as recovered only once the
+   * repair step completes; the re-check then decides the outcome. At most one
+   * repair pass runs per task, and none runs for failures that need the user
+   * or outside access, or when the task is out of budget.
+   */
+  private maybeScheduleVerificationRepair(opts: {
+    step: PlanStep;
+    verdictText: string;
+    failureReason: string;
+    isFinalVerification: boolean;
+    stepLoopBudgetStopped: boolean;
+    inPlaceRetryCouldEdit: boolean;
+  }): boolean {
+    if (!this.plan) return false;
+    const { step } = opts;
+    const isFinalVerification =
+      opts.isFinalVerification && this.isVerificationStepForCompletion(step);
+    const decision = decideVerificationRepair({
+      verdictText: opts.verdictText,
+      failureReason: opts.failureReason,
+      isFinalVerification,
+      isRecheckStep: isVerificationRecheckStepDescription(step.description),
+      repairPassesUsed: Number(this.verificationRepairPassesUsed) || 0,
+      priorRepairAttemptInStep: opts.inPlaceRetryCouldEdit,
+      budgetAvailable: this.hasBudgetForVerificationRepair(opts.stepLoopBudgetStopped),
+    });
+    if (!decision.repair) {
+      if (
+        decision.reason !== "not_final_verification" &&
+        decision.reason !== "not_blocking_verdict"
+      ) {
+        this.emitEvent("log", {
+          metric: "verification_repair_skipped",
+          stepId: step.id,
+          reason: decision.reason,
+        });
+      }
+      return false;
+    }
+
+    const applied = this.requestPlanRevision(
+      [
+        { description: VERIFICATION_REPAIR_STEP_DESCRIPTION, kind: "recovery" },
+        { description: VERIFICATION_RECHECK_STEP_DESCRIPTION, kind: "verification" },
+      ],
+      `Recovery attempt: final verification reported blocking issues - ${decision.findings.slice(0, 280)}`,
+      false,
+    );
+    if (!applied) return false;
+
+    this.verificationRepairPassesUsed = (Number(this.verificationRepairPassesUsed) || 0) + 1;
+    this.autoRecoveryStepsPlanned = (Number(this.autoRecoveryStepsPlanned) || 0) + 1;
+    const findingsByStepId = this.getVerificationRepairFindingsByStepId();
+    for (const candidate of this.plan.steps) {
+      if (candidate.status !== "pending") continue;
+      if (
+        isVerificationRepairStepDescription(candidate.description) ||
+        isVerificationRecheckStepDescription(candidate.description)
+      ) {
+        findingsByStepId.set(candidate.id, decision.findings);
+      }
+    }
+    this.getSessionRuntime().markRecoveredFailureStep(step.id);
+    this.emitEvent("step_recovery_planned", {
+      stepId: step.id,
+      stepDescription: step.description,
+      reason: opts.failureReason,
+      recoveryClass: "verification_repair",
+      recovery_template_id: "verification_repair",
+    });
+    this.emitEvent("log", {
+      metric: "verification_repair_scheduled",
+      stepId: step.id,
+      findings: decision.findings,
+    });
+    return true;
+  }
+
+  /**
+   * Findings of failed final verification steps that answered FAIL_BLOCKING and
+   * were not recovered, by step id. These are requirements the delivered work
+   * still does not meet.
+   */
+  private getUnmetVerificationRequirements(): Array<{ stepId: string; finding: string }> {
+    const steps = this.plan?.steps || [];
+    const recovered = new Set(this.getResolvedRecoveredFailureStepIds());
+    return steps
+      .filter(
+        (step) =>
+          step.status === "failed" &&
+          !recovered.has(String(step.id || "").trim()) &&
+          this.isVerificationStepForCompletion(step) &&
+          isBlockingVerificationVerdict(step.error),
+      )
+      .map((step) => ({
+        stepId: String(step.id || "").trim(),
+        finding: extractVerificationFindings(step.error),
+      }))
+      .filter((entry) => entry.finding.length > 0);
+  }
+
   /**
    * Returns failed step IDs that can be safely waived at completion.
    * We only waive explicit verification failures (or heuristic fallback when kind is absent)
@@ -15868,6 +16525,7 @@ ${transcript}
       fallbackContainsDirectAnswer: (completionContract) =>
         this.fallbackContainsDirectAnswer(completionContract),
       hasVerificationEvidence: (candidate) => this.hasVerificationEvidence(candidate),
+      minResultSummaryLength: TaskExecutor.MIN_RESULT_SUMMARY_LENGTH,
     });
     if (baseGuardError) {
       if (/Task missing artifact evidence/i.test(baseGuardError)) {
@@ -15908,6 +16566,7 @@ ${transcript}
             fallbackPasses: fallbackHasDirectAnswer,
             looksOperationalOnly: this.responseLooksOperationalOnly(bestCandidate),
             hasDecisionSignal: this.responseHasDecisionSignal(bestCandidate),
+            isStructuredRecommendation: responseIsStructuredRecommendationUtil(bestCandidate),
           },
           verification: {
             bestCandidatePasses: this.hasVerificationEvidence(bestCandidate),
@@ -15959,6 +16618,31 @@ ${transcript}
     return this.getFinalOutcomeGuardError();
   }
 
+  /**
+   * Inline [N] markers and a numbered source list written by the model can use
+   * different numberings. Put both on the task's source registry so a number
+   * names the same source in the answer, its source list, and the sources panel.
+   */
+  private reconcileAnswerCitations(text: string, opts?: { log?: boolean }): string {
+    const tracker = this.citationTracker;
+    if (!tracker || typeof text !== "string" || !text) return text;
+    try {
+      const result = tracker.reconcileAnswer(text);
+      if (result.changed && opts?.log) {
+        this.emitEvent("log", {
+          metric: "answer_citations_reconciled",
+          renumberedMarkers: result.renumberedMarkers,
+          bibliographyRewritten: result.bibliographyRewritten,
+          dropped: result.dropped,
+        });
+      }
+      return result.text;
+    } catch (error) {
+      logger.warn(`${this.logTag} Citation reconciliation failed:`, error);
+      return text;
+    }
+  }
+
   private selectFinalTaskSummary(requestedSummary?: string): string {
     const validatedCandidate = this.getBestFinalResponseCandidate().trim();
     const completionContract = this.buildCompletionContract();
@@ -16000,6 +16684,13 @@ ${transcript}
       return text.length > maxLength ? `${text.slice(0, maxLength - 1).trimEnd()}…` : text;
     };
     const lines: string[] = [];
+    // A requirement the final check found unmet leads the notes, ahead of the
+    // generic stop reason, so the result does not read as a full success.
+    const unmetRequirements = this.getUnmetVerificationRequirements();
+    for (const unmet of unmetRequirements.slice(0, maxListedSteps)) {
+      lines.push(`- Unmet requirement: ${compact(unmet.finding, 400)}`);
+    }
+    const reportedUnmetStepIds = new Set(unmetRequirements.map((unmet) => unmet.stepId));
     const reason = compact(params.reason, 240);
     if (reason) lines.push(`- ${reason}`);
     const cause = compact(params.cause, 240);
@@ -16009,7 +16700,10 @@ ${transcript}
     const waived = new Set(params.waivedStepIds.map((stepId) => String(stepId || "").trim()));
     const recovered = new Set(this.getResolvedRecoveredFailureStepIds());
     const failedSteps = steps.filter(
-      (step) => step.status === "failed" && !recovered.has(String(step.id || "").trim()),
+      (step) =>
+        step.status === "failed" &&
+        !recovered.has(String(step.id || "").trim()) &&
+        !reportedUnmetStepIds.has(String(step.id || "").trim()),
     );
     for (const step of failedSteps.slice(0, maxListedSteps)) {
       const outcome = waived.has(String(step.id || "").trim()) ? "failed (waived)" : "failed";
@@ -16040,11 +16734,17 @@ ${transcript}
     return lines.length > 0 ? ["Completion notes:", ...lines].join("\n") : "";
   }
 
-  /** The summary the user sees, with completion notes and the file-mutation footer. */
+  /**
+   * The summary the user sees, with completion notes and the file-mutation footer.
+   * When the final check found a requirement unmet, the notes come first so the
+   * result does not open with the model's claim that the work is complete.
+   */
   private appendCompletionFooters(summary: string, completionNotes: string): string {
+    const notesFirst =
+      Boolean(completionNotes.trim()) && this.getUnmetVerificationRequirements().length > 0;
     return [
-      summary,
-      completionNotes,
+      notesFirst ? completionNotes : summary,
+      notesFirst ? summary : completionNotes,
       this.buildUnresolvedTestCommandNote(),
       this.fileMutationVerifier?.buildAdvisoryFooter(),
     ]
@@ -16096,7 +16796,9 @@ ${transcript}
         failureClass = "required_verification";
       }
     }
-    const summaryCandidate = this.selectFinalTaskSummary(resultSummary);
+    const summaryCandidate = this.reconcileAnswerCitations(
+      this.selectFinalTaskSummary(resultSummary),
+    );
     const summary = this.reconcileSummaryWithWorkspaceOutputs(summaryCandidate);
     const runtimeProjection = this.applyRuntimeTaskProjectionToTask();
     this.task.status = "completed";
@@ -16196,7 +16898,9 @@ ${transcript}
     const nonBlockingFailedStepIds = this.getNonBlockingFailedStepIdsAtCompletion();
     const failedMutationRequiredStepIds = this.getFailedMutationRequiredStepIdsAtCompletion();
     const waivedVerificationStepIds = this.getVerificationStepIds(waivableFailedStepIds);
-    const summaryCandidate = this.selectFinalTaskSummary(resultSummary);
+    const summaryCandidate = this.reconcileAnswerCitations(
+      this.selectFinalTaskSummary(resultSummary),
+    );
     const summary = this.reconcileSummaryWithWorkspaceOutputs(summaryCandidate);
     this.task.status = "completed";
     this.task.completedAt = Date.now();
@@ -16778,7 +17482,8 @@ ${transcript}
       normalizedExtension === ".pdf" ||
       normalizedExtension === ".docx" ||
       normalizedFormat === "pdf" ||
-      normalizedFormat === "docx";
+      normalizedFormat === "docx" ||
+      (Array.isArray(input?.formats) && input.formats.length > 0);
     const shellDisallowed = this.taskExplicitlyDisallowsShellCommands();
 
     switch (canonicalToolName) {
@@ -17858,6 +18563,33 @@ ${transcript}
     return active;
   }
 
+  /**
+   * The inline-surface guidance and the component reference. Its own prompt section (see
+   * ContentBuilder `answer_surfaces`): inside the capped base instruction it was cut
+   * mid-way, so in task mode the model saw only the pointer line, never the components.
+   */
+  private buildExecutionRichSurfacesPrompt(): string {
+    if (!this.getActiveBasePromptRoutingBlocks().has("rich_surfaces")) return "";
+    return [
+      "RICH INLINE SURFACES:",
+      ...(this.shouldOfferAnswerSurfaces()
+        ? [
+            "- For adjustable plans, calculators, comparisons, checklists, metric summaries, timelines and photo-led answers, use cowork-ui components in your final answer (see INTERACTIVE ANSWER COMPONENTS below).",
+            "- When a compact custom visual is needed that the components cannot express, such as a bespoke diagram, heatmap, debug trace, or data preview, create a small self-contained HTML artifact for that surface; the app can render suitable HTML artifacts inline automatically.",
+          ]
+        : [
+            "- When the best answer is a compact visual surface such as a chart card, metric summary, progress/status panel, comparison, calculator, timeline, heatmap, debug trace, or data preview, create a small self-contained HTML artifact for that surface; the app can render suitable HTML artifacts inline automatically.",
+          ]),
+      "- Do not print custom frame markup in your message. Mention the result in normal prose and let the artifact/preview system display it.",
+      "- For full web pages, landing pages, websites, app designs, or standalone HTML files the user asks to have as a file, keep the normal web artifact flow: create the HTML output and summarize it; do not try to force an inline frame. A small tool to use right away (a calculator, converter, splitter) is not that: answer it inline.",
+      "- Inline surfaces may be static or animated. Use animation only when it clarifies state or progress.",
+      RICH_FRAME_DESIGN_LANGUAGE_PROMPT,
+      HTML_SURFACE_RUNTIME_PROMPT,
+      "",
+      ...(this.shouldOfferAnswerSurfaces() ? [ANSWER_SURFACE_PROMPT, ""] : []),
+    ].join("\n");
+  }
+
   private buildExecutionBaseInstructionPrompt(): string {
     const novelistConstraintPrompt = this.buildNovelistConstraintPrompt();
     const routing = this.getActiveBasePromptRoutingBlocks();
@@ -17923,25 +18655,6 @@ ${transcript}
       TASK_KICKOFF_PROMPT_RULES,
       "- Do not append trailing offer questions by default.",
       "",
-      ...(routing.has("rich_surfaces")
-        ? [
-            "RICH INLINE SURFACES:",
-            ...(this.shouldOfferAnswerSurfaces()
-              ? [
-                  "- For adjustable plans, calculators, comparisons, checklists, metric summaries, timelines and photo-led answers, use cowork-ui components in your final answer (see INTERACTIVE ANSWER COMPONENTS below).",
-                  "- When a compact custom visual is needed that the components cannot express, such as a bespoke diagram, heatmap, debug trace, or data preview, create a small self-contained HTML artifact for that surface; the app can render suitable HTML artifacts inline automatically.",
-                ]
-              : [
-                  "- When the best answer is a compact visual surface such as a chart card, metric summary, progress/status panel, comparison, calculator, timeline, heatmap, debug trace, or data preview, create a small self-contained HTML artifact for that surface; the app can render suitable HTML artifacts inline automatically.",
-                ]),
-            "- Do not print custom frame markup in your message. Mention the result in normal prose and let the artifact/preview system display it.",
-            "- For full web pages, landing pages, websites, app designs, or user-requested standalone HTML files, keep the normal web artifact flow: create the HTML output and summarize it; do not try to force an inline frame.",
-            "- Inline surfaces may be static or animated. Use animation only when it clarifies state or progress.",
-            RICH_FRAME_DESIGN_LANGUAGE_PROMPT,
-            "",
-            ...(this.shouldOfferAnswerSurfaces() ? [ANSWER_SURFACE_PROMPT, ""] : []),
-          ]
-        : []),
       "HONESTY & UNCERTAINTY:",
       "- State uncertainty explicitly when it matters.",
       "- Never fabricate tool outputs or claim a tool succeeded when it did not.",
@@ -18310,10 +19023,7 @@ ${transcript}
         this.task.id,
         changes.map((change) => change.key),
       );
-      return [
-        "INTERACTIVE ANSWER STATE (values the user set in the controls of your earlier answers; build on them):",
-        ...changes.flatMap((change) => change.summary.split("\n").map((line) => `- ${line}`)),
-      ].join("\n");
+      return formatAnswerSurfaceChanges(changes);
     } catch {
       return "";
     }
@@ -18748,6 +19458,7 @@ ${transcript}
       await this.bootstrapDebugRuntimeIfNeeded();
     }
 
+    const richSurfacesPrompt = this.buildExecutionRichSurfacesPrompt();
     return queryOrchestrator.buildExecutionPrompt({
       workspaceId: this.workspace.id,
       workspacePath: this.workspace.path,
@@ -18755,6 +19466,7 @@ ${transcript}
       identityPrompt: params.identityPrompt,
       safetyCorePrompt: SHARED_PROMPT_POLICY_CORE,
       baseInstructionPrompt: this.buildExecutionBaseInstructionPrompt(),
+      answerSurfacePrompt: richSurfacesPrompt,
       inputPolicyPrompt: this.buildExecutionInputPolicyPrompt(),
       workspaceContextPrompt: this.buildExecutionWorkspaceContextPrompt(),
       currentTimePrompt: `Current time: ${getCurrentDateTimeContext()}`,
@@ -18782,7 +19494,10 @@ ${transcript}
       taskDomain: params.taskDomain,
       webSearchModeContract: this.buildWebSearchModeContract(),
       worktreeBranch: this.task.worktreeBranch,
-      totalBudgetTokens: EXECUTION_SYSTEM_PROMPT_TOTAL_BUDGET,
+      // The surface reference adds its own share instead of crowding out other sections.
+      totalBudgetTokens:
+        EXECUTION_SYSTEM_PROMPT_TOTAL_BUDGET +
+        (richSurfacesPrompt ? ANSWER_SURFACE_SECTION_TOKENS : 0),
       transcriptContext,
       sectionCache: this.promptSectionCache,
     });
@@ -19546,8 +20261,14 @@ ${transcript}
       );
     }
 
+    // A verification repair step revises whatever the deliverable is, so it gets
+    // the write tools without a contract that demands one particular write.
+    const verificationRepairCanWrite =
+      isVerificationRepairStepDescription(step.description) &&
+      stepContract.contractReason !== "readonly_constraint_detected" &&
+      stepContract.contractReason !== "mutation_tools_restricted_by_role";
     const stepKind: "analysis" | "mutation_required" | "verification" =
-      stepContract.requiresMutation
+      stepContract.requiresMutation || verificationRepairCanWrite
         ? "mutation_required"
         : this.isVerificationStepForCompletion(step)
           ? "verification"
@@ -22096,12 +22817,7 @@ You are continuing a previous conversation. The context from the previous conver
     this.emitEvent("log", { message: "Analyzing task requirements..." });
 
     const prompt = this.getContractPrompt().toLowerCase();
-    const isLatexPdfTask =
-      /\b(latex|tex|tikz)\b/.test(prompt) ||
-      /\.tex\b/.test(prompt) ||
-      (/\b(write|create|generate|produce|draft|prepare)\b/.test(prompt) &&
-        /\b(paper|article|report|document)\b/.test(prompt) &&
-        /\bcompile(?:d)?\s+(?:pdf|document)|pdf\b/.test(prompt));
+    const isLatexPdfTask = isLatexPdfRequestUtil(prompt);
 
     // Exclusion patterns: code/development tasks should NOT trigger document hints
     const isCodeTask =
@@ -22194,6 +22910,11 @@ You are continuing a previous conversation. The context from the previous conver
 3. create_document parameters: filename, format ('docx' or 'pdf'), content (array of blocks)
    generate_document parameters: filename plus markdown or sections
 4. Content blocks: { type: 'heading'|'paragraph'|'code', text: '...', level?: 1-6 }, { type: 'list', items: ['...'] }, { type: 'table', rows: [['Header', ...], ['Cell', ...]] }`;
+      }
+
+      // Plans otherwise split matching files into "create the DOCX" and "export the PDF".
+      if (!isLatexPdfTask && requestsMatchingDocumentFormats(this.getContractPrompt())) {
+        additionalContext += `${additionalContext ? "\n\n" : ""}${MATCHING_DOCUMENT_FORMATS_PLAN_HINT}`;
       }
 
       // Log the analysis result
@@ -25091,6 +25812,13 @@ You are continuing a previous conversation. The context from the previous conver
       tokens.add(normalizedAbsolute);
     }
 
+    // Parsers report symlink-resolved provenance (for example /private/var on
+    // macOS for a /var workspace). The resolved form identifies the same file.
+    const resolvedAbsolute = this.normalizeArtifactReadPathForComparison(trimmed);
+    if (resolvedAbsolute) {
+      tokens.add(resolvedAbsolute);
+    }
+
     return tokens;
   }
 
@@ -25297,8 +26025,22 @@ You are continuing a previous conversation. The context from the previous conver
     artifactTargetTokens: Set<string>,
     artifactTargetUniqueBasenames: Set<string>,
   ): { matched: boolean; matchedExtensions: string[] } {
-    if (!["read_file", "get_file_info", "read_files"].includes(toolName)) {
-      return { matched: false, matchedExtensions: [] };
+    const noEvidence = { matched: false, matchedExtensions: [] as string[] };
+    const canonicalToolName = canonicalizeToolNameUtil(String(toolName || ""));
+    if (canonicalToolName === "run_command") {
+      return this.getShellArtifactInspectionEvidence(
+        input,
+        result,
+        requiredExtensions,
+        artifactTargetTokens,
+      );
+    }
+    if (
+      !["read_file", "get_file_info", "read_files", "parse_document", "glob"].includes(
+        canonicalToolName,
+      )
+    ) {
+      return noEvidence;
     }
 
     const candidates = new Set<string>();
@@ -25309,22 +26051,46 @@ You are continuing a previous conversation. The context from the previous conver
       candidates.add(trimmed);
     };
 
-    addCandidate(input?.path);
-    addCandidate(input?.filename);
-    addCandidate(result?.path);
-    addCandidate(result?.filename);
-
-    if (Array.isArray(input?.paths)) {
-      for (const pathValue of input.paths) {
-        addCandidate(pathValue);
+    // Format-checked parser evidence: parse_document reports errors in the
+    // result body rather than with success=false, and its detected type is
+    // the parser it actually ran. Only a clean parse of a file whose
+    // extension matches that parser counts.
+    let parsedType = "";
+    if (canonicalToolName === "parse_document") {
+      if (result?.success === false || result?.error) return noEvidence;
+      parsedType = String(result?.detected_type || "")
+        .trim()
+        .toLowerCase();
+      if (!parsedType || parsedType === "unknown") return noEvidence;
+      addCandidate(input?.path);
+      addCandidate(result?.provenance?.path);
+    } else if (canonicalToolName === "glob") {
+      // A glob listing only establishes presence of the exact paths it
+      // returned; the search pattern itself is never evidence.
+      if (result?.success === false || result?.error) return noEvidence;
+      if (Array.isArray(result?.matches)) {
+        for (const match of result.matches) {
+          addCandidate(typeof match === "string" ? match : match?.path);
+        }
       }
-    }
+    } else {
+      addCandidate(input?.path);
+      addCandidate(input?.filename);
+      addCandidate(result?.path);
+      addCandidate(result?.filename);
 
-    if (Array.isArray(result?.files)) {
-      for (const fileEntry of result.files) {
-        addCandidate(fileEntry?.path);
-        addCandidate(fileEntry?.filename);
-        addCandidate(fileEntry?.name);
+      if (Array.isArray(input?.paths)) {
+        for (const pathValue of input.paths) {
+          addCandidate(pathValue);
+        }
+      }
+
+      if (Array.isArray(result?.files)) {
+        for (const fileEntry of result.files) {
+          addCandidate(fileEntry?.path);
+          addCandidate(fileEntry?.filename);
+          addCandidate(fileEntry?.name);
+        }
       }
     }
 
@@ -25332,6 +26098,7 @@ You are continuing a previous conversation. The context from the previous conver
     let matched = false;
     for (const candidate of candidates) {
       if (!this.matchesArtifactExtension(candidate, requiredExtensions)) continue;
+      if (parsedType && path.extname(candidate).toLowerCase() !== `.${parsedType}`) continue;
 
       const candidateTokens = this.buildArtifactPathTokens(candidate);
       const fullTokenMatch =
@@ -25351,6 +26118,107 @@ You are continuing a previous conversation. The context from the previous conver
     }
 
     return { matched, matchedExtensions: Array.from(matchedExtensions) };
+  }
+
+  /**
+   * A shell inspection (pdfinfo, a Python open of the workbook, unzip -t, ...)
+   * is artifact evidence only for the exact artifact path its command text
+   * names. The command must have exited 0 with non-empty, non-error output,
+   * and the referenced file must exist. A successful command that does not
+   * name the artifact proves nothing about it.
+   */
+  private getShellArtifactInspectionEvidence(
+    input: Any,
+    result: Any,
+    requiredExtensions: string[],
+    artifactTargetTokens: Set<string>,
+  ): { matched: boolean; matchedExtensions: string[] } {
+    const noEvidence = { matched: false, matchedExtensions: [] as string[] };
+    const command = typeof input?.command === "string" ? input.command : "";
+    if (!command.trim() || artifactTargetTokens.size === 0) return noEvidence;
+    if (!result || typeof result !== "object") return noEvidence;
+    if (result.success === false || result.error) return noEvidence;
+    if (result.exitCode !== 0) return noEvidence;
+    if (result.terminationReason && result.terminationReason !== "normal") return noEvidence;
+    const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+    if (!stdout) return noEvidence;
+    if (
+      /no such file|cannot (?:open|find|access|stat|read)|not found|permission denied|traceback \(most recent call last\)|badzipfile|is not a (?:valid|zip|pdf)|^\s*(?:error|exception)\b/im.test(
+        stdout,
+      )
+    ) {
+      return noEvidence;
+    }
+
+    const rawCwd =
+      typeof input?.cwd === "string" && input.cwd.trim() ? input.cwd.trim() : this.workspace.path;
+    const commandCwd = path.isAbsolute(rawCwd) ? rawCwd : path.resolve(this.workspace.path, rawCwd);
+    const cwdTokens = new Set<string>();
+    for (const token of [
+      this.normalizeArtifactPathForComparison(commandCwd),
+      this.normalizeArtifactReadPathForComparison(commandCwd),
+    ]) {
+      if (token) cwdTokens.add(token);
+    }
+
+    const haystack = command.replace(/\\/g, "/");
+    const lowerHaystack = haystack.toLowerCase();
+    const isPathChar = (char: string): boolean => /[a-z0-9_\-/~$]/i.test(char);
+    const findReferences = (reference: string): string[] => {
+      const found: string[] = [];
+      let index = lowerHaystack.indexOf(reference);
+      while (index >= 0) {
+        const before = index > 0 ? lowerHaystack[index - 1] : "";
+        const end = index + reference.length;
+        const after = end < lowerHaystack.length ? lowerHaystack[end] : "";
+        const afterNext = end + 1 < lowerHaystack.length ? lowerHaystack[end + 1] : "";
+        const boundedBefore = !before || (!isPathChar(before) && before !== ".");
+        const boundedAfter =
+          !after || (!isPathChar(after) && !(after === "." && /[a-z0-9_]/i.test(afterNext)));
+        if (boundedBefore && boundedAfter) {
+          found.push(
+            lowerHaystack.length === haystack.length ? haystack.slice(index, end) : reference,
+          );
+        }
+        index = lowerHaystack.indexOf(reference, index + 1);
+      }
+      return found;
+    };
+
+    const matchedExtensions = new Set<string>();
+    for (const token of artifactTargetTokens) {
+      const isAbsoluteToken = path.isAbsolute(token) || /^[a-z]:\//.test(token);
+      if (!isAbsoluteToken) continue;
+      if (!this.matchesArtifactExtension(token, requiredExtensions)) continue;
+
+      const references = new Set<string>([token]);
+      for (const cwdToken of cwdTokens) {
+        const relative = path.posix.relative(cwdToken, token);
+        if (!relative || relative.startsWith("..") || path.posix.isAbsolute(relative)) continue;
+        references.add(relative);
+        references.add(`./${relative}`);
+      }
+
+      let referenced = false;
+      for (const reference of references) {
+        for (const literal of findReferences(reference)) {
+          const resolved = path.isAbsolute(literal) ? literal : path.resolve(commandCwd, literal);
+          if (fs.existsSync(resolved) || fs.existsSync(token)) {
+            referenced = true;
+            break;
+          }
+        }
+        if (referenced) break;
+      }
+      if (!referenced) continue;
+
+      const extension = path.extname(token).toLowerCase();
+      if (extension) matchedExtensions.add(extension);
+    }
+
+    return matchedExtensions.size > 0
+      ? { matched: true, matchedExtensions: Array.from(matchedExtensions) }
+      : noEvidence;
   }
 
   private getKnownTaskPathForBasename(candidate: string): string | null {
@@ -29159,7 +30027,7 @@ You are continuing a previous conversation. The context from the previous conver
       const hasUnexecutedToolCall = this.responseLooksLikeUnexecutedToolCall(rawAssistantText);
       const assistantText = hasUnexecutedToolCall
         ? this.buildUnexecutedToolCallChatFallback()
-        : rawAssistantText;
+        : await this.repairAnswerSurfaceText(rawAssistantText);
 
       this.emitEvent("assistant_message", { message: assistantText });
       this.lastAssistantOutput = assistantText;
@@ -31643,8 +32511,9 @@ Return ONLY a JSON object:
     let repeatedArtifactContractFailureStreak = 0;
     while (index < this.plan.steps.length) {
       const step = this.plan.steps[index];
-      const normalizedKind: PlanStep["kind"] = this.descriptionIndicatesVerification(
+      const normalizedKind: PlanStep["kind"] = this.planStepIndicatesVerification(
         step.description,
+        { isFinalStep: index === this.plan.steps.length - 1, kind: step.kind },
       )
         ? "verification"
         : step.kind === "recovery"
@@ -32812,6 +33681,24 @@ Return ONLY a JSON object:
               `- Then add a short checklist of missing evidence/actions using bullets.\n`
             : `- If everything checks out, respond with exactly: OK\n` +
               `- If something is wrong or missing, clearly state the problem and what needs to change.\n`);
+        const createdFilesForVerification = (
+          this.fileOperationTracker?.getCreatedFiles?.() || []
+        ).map((file) => String(file));
+        if (
+          mentionsOfficeArtifact([
+            step.description,
+            this.getExecutionTaskPrompt(),
+            ...createdFilesForVerification,
+          ])
+        ) {
+          stepContext += buildOfficeArtifactVerificationGuidance();
+        }
+        if (!this.isReadOnlyFactFindingVerificationStep(step)) {
+          stepContext += buildVerificationSeverityGuidance({
+            prompt: this.getExecutionTaskPrompt(),
+            createdFiles: createdFilesForVerification,
+          });
+        }
         if (inlineVerificationTargets.length > 0) {
           stepContext += `- Return checklist/report output inline in your response; do not require creating a new checklist file.\n`;
         } else if (existingOnlyWriteTargets.length > 0) {
@@ -32907,6 +33794,12 @@ Return ONLY a JSON object:
         stepContext += `\n\nVERIFICATION REWIND:\n${verificationRewindInstruction}`;
       }
       delete (step as Any).__verificationRewindInstruction;
+      const verificationRepairFindings = this.getVerificationRepairFindingsForStep(step);
+      if (verificationRepairFindings) {
+        stepContext += isVerificationRepairStepDescription(step.description)
+          ? buildVerificationRepairStepContext(verificationRepairFindings)
+          : buildVerificationRecheckStepContext(verificationRepairFindings);
+      }
       if (isVerifyStep) {
         stepContext += this.isReadOnlyFactFindingVerificationStep(step)
           ? "\n\nREAD-ONLY FACT-FINDING RESPONSE (REQUIRED): Perform the requested check and return a concise finding with the supporting evidence. A verified negative finding still completes the check; do not answer with only `OK`."
@@ -33392,7 +34285,10 @@ Return ONLY a JSON object:
                       inReplyToTaskId: pendingMsg.inReplyToTaskId,
                     },
                   )
-                : `USER UPDATE: ${pendingMsg.message}`;
+                : withSurfaceOriginNote(
+                    `USER UPDATE: ${pendingMsg.message}`,
+                    pendingMsg.surfaceOrigin,
+                  );
               const content = await this.buildUserContent(
                 this.buildQuotedAssistantContextMessage(
                   userUpdate,
@@ -33406,6 +34302,9 @@ Return ONLY a JSON object:
               } catch (error) {
                 messages.pop();
                 throw error;
+              }
+              if (!isPendingBotHandoff && pendingMsg.deliveryMode === "follow_up") {
+                this.recordAcceptedRunUserUpdate(pendingMsg.message);
               }
               if (hasDurableFollowUpReceipt) {
                 await this.acceptQueuedFollowUpAfterSnapshot(pendingMsg, messages);
@@ -33793,6 +34692,10 @@ Return ONLY a JSON object:
             contextLabel: `step:${step.id} ${step.description}`,
             userIntent: `Task: ${this.task.title}\nStep: ${step.description}\n\nUser request/context:\n${this.getExecutionTaskPrompt()}`,
           });
+          // A final answer's interactive blocks are checked and, if broken, repaired once.
+          if (!isVerifyStep && !isPlanVerifyStep && (isLastStep || isSummaryStep)) {
+            response = await this.repairAnswerSurfaceResponse(response);
+          }
 
           // Process response - only stop if we have actual content AND it's end_turn
           // Empty responses should not terminate the loop
@@ -38540,6 +39443,26 @@ Return ONLY a JSON object:
       if (textChecklistEvaluation.applied) {
         this.emitVerificationTextChecklistEvaluated(step, textChecklistEvaluation);
       }
+      // A passing or warning final check can still miss a gap the answer shows
+      // on its face. Turn such a gap into a blocking finding only when the
+      // repair pass can still act on it.
+      const deterministicVerificationFinding =
+        !stepFailed &&
+        enforceVerificationOk &&
+        isLastStep &&
+        (this.isVerificationPassing(finalAssistantText) ||
+          parseVerificationProtocolOutcomeUtil(finalAssistantText) === "warn_non_blocking")
+          ? this.findDeterministicVerificationGap(step, Boolean(stepLoopBudgetStopReason))
+          : "";
+      if (deterministicVerificationFinding) {
+        stepFailed = true;
+        lastFailureReason = `Verification failed: FAIL_BLOCKING — ${deterministicVerificationFinding}`;
+        this.emitEvent("log", {
+          metric: "verification_deterministic_finding",
+          stepId: step.id,
+          finding: deterministicVerificationFinding,
+        });
+      }
       if (
         !stepFailed &&
         enforceVerificationOk &&
@@ -38587,6 +39510,7 @@ Return ONLY a JSON object:
         | null = null;
       if (
         stepFailed &&
+        !deterministicVerificationFinding &&
         this.verificationOutcomeV2Enabled &&
         this.isVerificationStepForCompletion(step)
       ) {
@@ -38764,6 +39688,17 @@ Return ONLY a JSON object:
         }
         const isNonBlockingVerificationFailure =
           this.getVerificationState().nonBlockingVerificationFailedStepIds.has(step.id);
+        const verificationRepairScheduled =
+          !isNonBlockingVerificationFailure &&
+          this.maybeScheduleVerificationRepair({
+            step,
+            verdictText: finalAssistantText,
+            failureReason: String(lastFailureReason || ""),
+            isFinalVerification: enforceVerificationOk && isLastStep,
+            stepLoopBudgetStopped: Boolean(stepLoopBudgetStopReason),
+            inPlaceRetryCouldEdit:
+              verificationRewindAlreadyAttempted && this.getEffectiveTaskDomain() === "code",
+          });
 
         const isRecoveryStep = this.isRecoveryPlanStep(step);
         const capabilityRecoveryRequested =
@@ -38803,6 +39738,7 @@ Return ONLY a JSON object:
         const recoveryState = runtime.getRecoveryState();
         const shouldHandleRecovery =
           !isNonBlockingVerificationFailure &&
+          !verificationRepairScheduled &&
           (!stepLoopBudgetStopReason || budgetStopWithProgress) &&
           (userRequestedRecovery || autoRecoveryRequested) &&
           recoveryClass !== "user_blocker" &&
@@ -40389,6 +41325,7 @@ Return ONLY a JSON object:
     deliveryMode?: TaskFollowUpInput["deliveryMode"],
     inReplyToMessageId?: TaskFollowUpInput["inReplyToMessageId"],
     inReplyToTaskId?: TaskFollowUpInput["inReplyToTaskId"],
+    surfaceOrigin?: TaskFollowUpInput["surfaceOrigin"],
   ): void {
     if (this.shutdownRequested) {
       throw new Error("Task executor is shutting down; follow-up was not queued.");
@@ -40407,6 +41344,7 @@ Return ONLY a JSON object:
       deliveryMode,
       inReplyToMessageId,
       inReplyToTaskId,
+      surfaceOrigin,
     );
     logger.info(
       `${this.logTag} Follow-up queued for injection into running execution (queue size: ${this.pendingFollowUps.length})`,
@@ -40503,9 +41441,11 @@ Return ONLY a JSON object:
       | "senderLabel"
       | "inReplyToMessageId"
       | "inReplyToTaskId"
+      | "surfaceOrigin"
     >,
   ): Record<string, string> {
     return {
+      ...(context?.surfaceOrigin ? { surfaceOrigin: context.surfaceOrigin } : {}),
       ...(context?.messageSource ? { messageSource: context.messageSource } : {}),
       ...(context?.messageId ? { messageId: context.messageId } : {}),
       ...(context?.senderTaskId ? { senderTaskId: context.senderTaskId } : {}),
@@ -41115,6 +42055,7 @@ Return ONLY a JSON object:
         | "senderLabel"
         | "inReplyToMessageId"
         | "inReplyToTaskId"
+        | "surfaceOrigin"
       >;
       onAccepted?: () => void | Promise<void>;
       onExecutionAccepted?: () => void | Promise<void>;
@@ -41272,8 +42213,10 @@ Return ONLY a JSON object:
     }
     // Both the chat path and the task path below add this to the message the model sees.
     const answerSurfaceNote = await this.takeAnswerSurfaceChanges();
-    const withAnswerState = (text: string) =>
-      answerSurfaceNote ? `${text}\n\n${answerSurfaceNote}` : text;
+    const withAnswerState = (text: string) => {
+      const noted = withSurfaceOriginNote(text, opts?.messageContext?.surfaceOrigin);
+      return answerSurfaceNote ? `${noted}\n\n${answerSurfaceNote}` : noted;
+    };
     const followUpConversationMessage = this.buildQuotedAssistantContextMessage(
       withAnswerState(executionMessage),
       quotedAssistantMessage,
@@ -41821,7 +42764,10 @@ Return ONLY a JSON object:
                       inReplyToTaskId: pendingMsg.inReplyToTaskId,
                     },
                   )
-                : `USER UPDATE: ${pendingMsg.message}`;
+                : withSurfaceOriginNote(
+                    `USER UPDATE: ${pendingMsg.message}`,
+                    pendingMsg.surfaceOrigin,
+                  );
               const content = await this.buildUserContent(
                 this.buildQuotedAssistantContextMessage(
                   userUpdate,
@@ -41831,6 +42777,9 @@ Return ONLY a JSON object:
               );
               // messages === this.conversationHistory here, so push persists automatically
               messages.push({ role: "user" as const, content });
+              if (!isPendingBotHandoff && pendingMsg.deliveryMode === "follow_up") {
+                this.recordAcceptedRunUserUpdate(pendingMsg.message);
+              }
               if (hasDurableFollowUpReceipt) {
                 await this.acceptQueuedFollowUpAfterSnapshot(pendingMsg, messages);
                 if (isQueuedHumanFollowUp) {
@@ -42139,6 +43088,9 @@ Return ONLY a JSON object:
             contextLabel: `follow-up ${iterationCount}`,
             userIntent: `User message:\n${messageWithContext}`,
           });
+          if (response.stopReason === "end_turn" && !responseHasToolUse) {
+            response = await this.repairAnswerSurfaceResponse(response);
+          }
 
           // Process response - don't immediately stop, check for text response first
           let wantsToEnd = response.stopReason === "end_turn";

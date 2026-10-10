@@ -17,6 +17,17 @@ import {
   MAX_ANSWER_SURFACE_SUMMARY_CHARS,
   type AnswerSurfaceStateRow,
 } from "./answer-surface-state-sql";
+import {
+  HtmlSurfaceStateSchema,
+  summarizeHtmlSurfaceState,
+} from "../../shared/answer-surfaces/html-bridge";
+import {
+  AnswerSurfaceDataSchema,
+  isToolDataSource,
+  MAX_ANSWER_DATA_CELLS,
+  type AnswerDataResult,
+  type AnswerDataTable,
+} from "../../shared/answer-surfaces/data";
 import { rateLimiter } from "../utils/rate-limiter";
 import { validateInput } from "../utils/validation";
 
@@ -29,7 +40,8 @@ const SurfaceKeySchema = z
   .string()
   .min(1)
   .max(80)
-  .regex(/^s1-[a-z0-9]+-\d{1,3}$/);
+  // s1: native component surfaces; h1: inline HTML surfaces (see html-bridge.ts).
+  .regex(/^(?:s1|h1)-[a-z0-9]+-\d{1,3}$/);
 const StateValueSchema = z.union([
   z.number().finite(),
   z.string().max(200),
@@ -78,6 +90,10 @@ export const AnswerSurfaceResolveImagesSchema = z
   })
   .strict();
 
+export const AnswerSurfaceLoadDataSchema = z
+  .object({ taskId: TaskIdSchema, sources: AnswerSurfaceDataSchema })
+  .strict();
+
 export interface AnswerSurfaceIpcDeps {
   taskExists: (taskId: string) => Promise<boolean>;
   /** The network policy inputs for lookups made on a task's behalf. */
@@ -92,6 +108,21 @@ export interface AnswerSurfaceIpcDeps {
     get(taskId: string, keys: string[]): Promise<AnswerSurfaceStateRow[]>;
     save(taskId: string, key: string, state: unknown, summary: string): Promise<void>;
   };
+  /**
+   * Reads a workspace file of the task as a table. It must resolve the path inside that
+   * task's workspace; hosts without workspace file access leave it out.
+   */
+  loadDataSource?: (
+    taskId: string,
+    filePath: string,
+    options: { maxCells: number },
+  ) => Promise<AnswerDataTable>;
+  /** A table this task's tool call produced, by its handle (see tool-data.ts). */
+  loadToolData?: (
+    taskId: string,
+    handle: string,
+    options: { maxCells: number },
+  ) => Promise<AnswerDataTable>;
   /** Throws when the channel is over its rate limit. */
   checkRateLimit?: (channel: string) => void;
 }
@@ -125,8 +156,47 @@ export function createAnswerSurfaceIpcHandlers(
       limit(IPC_CHANNELS.ANSWER_SURFACE_SAVE_STATE);
       const value = validateInput(AnswerSurfaceSaveStateSchema, raw, "answer surface state");
       await requireTask(value.taskId);
+      if (value.key.startsWith("h1-")) {
+        // An HTML surface's state is written by the page, not by our components: hold it
+        // to the stricter bridge schema and build its summary here, from the state alone.
+        const state = validateInput(HtmlSurfaceStateSchema, value.state, "HTML surface state");
+        await deps.store.save(value.taskId, value.key, state, summarizeHtmlSurfaceState(state));
+        return { ok: true };
+      }
       await deps.store.save(value.taskId, value.key, value.state, value.summary);
       return { ok: true };
+    },
+    [IPC_CHANNELS.ANSWER_SURFACE_LOAD_DATA]: async (raw) => {
+      limit(IPC_CHANNELS.ANSWER_SURFACE_LOAD_DATA);
+      const value = validateInput(AnswerSurfaceLoadDataSchema, raw, "answer data request");
+      await requireTask(value.taskId);
+      const results: Record<string, AnswerDataResult> = {};
+      const entries = Object.entries(value.sources);
+      // One cell budget shared by the block's files.
+      const maxCells = Math.floor(MAX_ANSWER_DATA_CELLS / entries.length);
+      for (const [id, source] of entries) {
+        const tool = isToolDataSource(source);
+        const label = tool ? `tool output ${source.tool}` : source;
+        const load = tool
+          ? deps.loadToolData && (() => deps.loadToolData!(value.taskId, source.tool, { maxCells }))
+          : deps.loadDataSource && (() => deps.loadDataSource!(value.taskId, source, { maxCells }));
+        if (!load) {
+          results[id] = { file: label, error: "Data is read in the desktop app" };
+          continue;
+        }
+        try {
+          results[id] = await load();
+        } catch (error) {
+          // Only messages written for the user are shown; raw errors can carry absolute
+          // paths or file contents (parser messages), so they become a generic message.
+          const safe = error instanceof Error && error.name === "AnswerDataError";
+          results[id] = {
+            file: label,
+            error: safe ? error.message.slice(0, 200) : "The data could not be read",
+          };
+        }
+      }
+      return results;
     },
     [IPC_CHANNELS.ANSWER_SURFACE_RESOLVE_IMAGES]: async (raw) => {
       limit(IPC_CHANNELS.ANSWER_SURFACE_RESOLVE_IMAGES);
