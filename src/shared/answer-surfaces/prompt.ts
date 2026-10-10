@@ -315,7 +315,7 @@ export const ANSWER_SURFACE_PROMPT = [
   "  metrics {style?: cards|colorful|plain, items: [{label, value, icon?, tone?, delta?, direction?: up|down|flat, good?: up|down, caption?, spark?: [numbers]}]}",
   "  progress {style?: bar|ring, title?, items: [{label, value, max? (default 100), caption?, tone?}]}",
   "  timeline {title?, items: [{title, time?, text?, icon?, status?: done|current|upcoming, tone?}]}",
-  "  tags {items: [label | {label, tone?, icon?}]} · heading {text} · text {text, tone?: muted} · callout {tone: info|tip|warning|success, title?, text} · divider",
+  "  list {title?, style?: bullet|number, items: [text | {text, icon?, tone?}]} (plain bullets or steps) · tags {items: [label | {label, tone?, icon?}]} · heading {text} · text {text, tone?: muted} · callout {tone: info|tip|warning|success, title?, text} · divider",
   "  image {image, caption?, aspect?: wide|square|portrait} · gallery {layout: collage|grid|row, images[1-8]} · media_list {items: [{title, text?, meta?, badge?, image?}]}",
   "  tiles {items: [{title, subtitle?, icon? or emoji?, tone?}], selectable?, id?, caption?} · values {title?, items: [{label, value, note?}]} · table {columns[], rows[][], caption?}",
   "  chart {kind: bar|line|area|pie, labels[], series: [{name, values[], style?: solid|muted|dashed, tone?}], title?, prefix?, unit?, format?: number|compact|percent, stacked?, horizontal?, height?: sm|md|lg}",

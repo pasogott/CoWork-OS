@@ -176,6 +176,12 @@ function plainLines(
     }
     case "tags":
       return [node.items.map((item) => item.label).join(" · ")];
+    case "list": {
+      const lines = node.items.map(
+        (item, index) => `${node.style === "number" ? `${index + 1}.` : "-"} ${text(item.text)}`,
+      );
+      return node.title ? [`**${text(node.title)}**`, ...lines] : lines;
+    }
     case "heading":
       return [`**${text(node.text)}**`];
     case "text":
