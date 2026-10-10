@@ -1,6 +1,6 @@
 import { isAnswerSurfaceFenceEnd, isAnswerSurfaceFenceStart } from "./blocks";
 import { lintAnswerSurface } from "./runtime";
-import { parseAnswerSurfaceSource } from "./schema";
+import { parseAnswerSurfaceSource, walkSurface, type AnswerSurfaceSpec } from "./schema";
 
 /**
  * The answer-block repair loop: before an answer is shown, every ```cowork-ui block is
@@ -43,7 +43,31 @@ export function answerSurfaceProblem(source: string, closed = true): string | nu
   if (empty.length > 0) {
     return `These formulas have no value with the default inputs: ${empty.slice(0, 5).join("; ")}.`;
   }
+  const placeholders = placeholderResults(parsed.spec);
+  if (placeholders.length > 0) {
+    return `These results are placeholders, not values: ${placeholders.slice(0, 5).join("; ")}. Pick a typical default for what is unknown, make it a control labeled as an assumption, and compute the result from it.`;
+  }
   return null;
+}
+
+const PLACEHOLDER_VALUE =
+  /^\s*(?:undetermined|unknown|not determined|to be determined|n\/?a|tbd|tbc|\?+|-|–|—|…|\.\.\.)\s*$/i;
+
+/** Headline numbers a model left as "Undetermined", "N/A" or a dash instead of computing. */
+function placeholderResults(spec: AnswerSurfaceSpec): string[] {
+  const found: string[] = [];
+  const check = (label: string | undefined, value: unknown) => {
+    if (typeof value === "string" && PLACEHOLDER_VALUE.test(value)) {
+      found.push(`${label || "a result"} = "${value.trim()}"`);
+    }
+  };
+  walkSurface(spec.root, (node) => {
+    if (node.type === "hero") check(node.title, node.value);
+    else if (node.type === "metrics" || node.type === "values") {
+      for (const item of node.items) check(item.label, item.value);
+    }
+  });
+  return found;
 }
 
 /** Every block of the message that needs repair, in order. */

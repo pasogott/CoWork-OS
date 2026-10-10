@@ -21,6 +21,8 @@ type AssistantMessageContentProps = {
   taskId?: string;
   /** The message is a draft still being generated. */
   streaming?: boolean;
+  /** A later message in this turn repeats its interactive answer; show a note instead. */
+  surfacesSuperseded?: boolean;
 };
 
 type VideoDirective = {
@@ -589,6 +591,7 @@ export function AssistantMessageContent({
   onOpenViewer,
   taskId,
   streaming = false,
+  surfacesSuperseded = false,
 }: AssistantMessageContentProps) {
   const segments = parseAssistantMessageSegments(message);
 
@@ -606,6 +609,13 @@ export function AssistantMessageContent({
         }
 
         if (segment.type === "answer_surface") {
+          if (surfacesSuperseded) {
+            return (
+              <p key={`surface-${segment.key}`} className="as-superseded-note">
+                Interactive answer updated below.
+              </p>
+            );
+          }
           return (
             <AnswerSurfaceBlock
               key={`surface-${segment.key}`}

@@ -2397,3 +2397,11 @@
     animation: none;
   }
 }
+
+/* A step's copy of an interactive answer that a later message in the turn replaces. */
+.as-superseded-note {
+  margin: 4px 0;
+  color: var(--color-text-muted);
+  font-size: 0.86em;
+  font-style: italic;
+}

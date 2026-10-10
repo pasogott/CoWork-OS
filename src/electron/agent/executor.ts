@@ -18581,7 +18581,7 @@ ${transcript}
             "- When the best answer is a compact visual surface such as a chart card, metric summary, progress/status panel, comparison, calculator, timeline, heatmap, debug trace, or data preview, create a small self-contained HTML artifact for that surface; the app can render suitable HTML artifacts inline automatically.",
           ]),
       "- Do not print custom frame markup in your message. Mention the result in normal prose and let the artifact/preview system display it.",
-      "- For full web pages, landing pages, websites, app designs, or user-requested standalone HTML files, keep the normal web artifact flow: create the HTML output and summarize it; do not try to force an inline frame.",
+      "- For full web pages, landing pages, websites, app designs, or standalone HTML files the user asks to have as a file, keep the normal web artifact flow: create the HTML output and summarize it; do not try to force an inline frame. A small tool to use right away (a calculator, converter, splitter) is not that: answer it inline.",
       "- Inline surfaces may be static or animated. Use animation only when it clarifies state or progress.",
       RICH_FRAME_DESIGN_LANGUAGE_PROMPT,
       HTML_SURFACE_RUNTIME_PROMPT,
