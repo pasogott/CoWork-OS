@@ -25,6 +25,7 @@ import { BotGlyph } from "../BotGlyph";
 import { BotMascot } from "../bot-mascot/BotMascot";
 import { mascotExpressionForBotConversation } from "../bot-mascot/mascot-expressions";
 import { withoutAnswerSurfaceBlocks } from "../../../shared/answer-surfaces/blocks";
+import { supersededAnswerSurfaceEvents } from "../../utils/superseded-answer-surfaces";
 import { resolveBotMascot } from "../../../shared/bot-mascots";
 import {
   BOT_CONVERSATION_HISTORY_OPEN_EVENT,
@@ -1565,6 +1566,7 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
   const currentStep = props.currentStep as { description: string } | null;
   const eventTitleMarkdownComponents = props.eventTitleMarkdownComponents as any;
   const events = props.events as TaskEvent[];
+  const supersededSurfaceEventIds = useMemo(() => supersededAnswerSurfaceEvents(events), [events]);
   const activityGroupsById = props.activityGroupsById as Map<
     string,
     SharedTaskEventUiState["activityGroups"][number]
@@ -3199,6 +3201,9 @@ const TaskConversationFlow = memo(function TaskConversationFlow(props: any) {
                                 workspacePath={workspace?.path}
                                 onOpenViewer={setViewerFilePath}
                                 taskId={event.taskId}
+                                surfacesSuperseded={
+                                  Boolean(event.id) && supersededSurfaceEventIds.has(event.id)
+                                }
                               />
                             </div>
                           </div>

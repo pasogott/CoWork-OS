@@ -102,3 +102,25 @@ describe("repairAnswerSurfaces", () => {
     expect(healthy).not.toHaveBeenCalled();
   });
 });
+
+describe("placeholder results", () => {
+  const card = (value: string) =>
+    JSON.stringify({
+      type: "card",
+      children: [{ type: "metrics", items: [{ label: "Buying net cost", value }] }],
+    });
+
+  it("sends Undetermined, N/A and dashes back for editable defaults", () => {
+    for (const value of ["Undetermined", "N/A", "TBD", "—", "unknown"]) {
+      expect(answerSurfaceProblem(card(value)), value).toContain("placeholders");
+    }
+    expect(answerSurfaceProblem(card("Undetermined"))).toContain(
+      "control labeled as an assumption",
+    );
+  });
+
+  it("accepts real values and descriptive text", () => {
+    expect(answerSurfaceProblem(card("$4,200"))).toBeNull();
+    expect(answerSurfaceProblem(card("Depends on mileage"))).toBeNull();
+  });
+});

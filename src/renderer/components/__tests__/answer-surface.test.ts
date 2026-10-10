@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { ANSWER_SURFACE_EXAMPLES } from "../../../shared/answer-surfaces/prompt";
 import { AnswerSurfaceBlock } from "../AnswerSurface/AnswerSurface";
 import { SurfaceActionProvider } from "../AnswerSurface/SurfaceActions";
-import { parseAssistantMessageSegments } from "../AssistantMessageContent";
+import { AssistantMessageContent, parseAssistantMessageSegments } from "../AssistantMessageContent";
 import { cleanAssistantMessageForDisplay } from "../MainContent/markdown-normalization";
 
 const ROAST = JSON.stringify({
@@ -168,6 +168,20 @@ describe("AnswerSurfaceBlock", () => {
     expect(html).toContain("Book early");
     expect(html).toContain("<ol");
     expect(html).toContain(">2</span>");
+  });
+
+  it("shows a note instead of a block a later message replaces", () => {
+    const message =
+      'Step\n```cowork-ui\n{"type":"card","children":[{"type":"text","text":"Live"}]}\n```';
+    const superseded = renderToStaticMarkup(
+      React.createElement(AssistantMessageContent, {
+        message,
+        markdownComponents: {},
+        surfacesSuperseded: true,
+      }),
+    );
+    expect(superseded).toContain("Interactive answer updated below.");
+    expect(superseded).not.toContain("answer-surface");
   });
 
   it("does not render invalid blocks", () => {
