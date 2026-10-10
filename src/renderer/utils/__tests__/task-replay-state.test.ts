@@ -42,6 +42,21 @@ function makeEvent(
 }
 
 describe("deriveReplayTaskSnapshot", () => {
+  it("keeps a persisted approval pause paused when replaying its final progress event", () => {
+    const replayTask = deriveReplayTaskSnapshot(makeTask(), [
+      makeEvent("task_created", 110),
+      makeEvent("input_request_dismissed", 200),
+      makeEvent("task_paused", 210),
+      makeEvent("timeline_step_updated", 220, {
+        legacyType: "progress_update",
+        phase: "execution",
+        message: "Paused - awaiting user input",
+      }),
+    ]);
+    expect(replayTask?.status).toBe("paused");
+    expect(replayTask?.completedAt).toBeUndefined();
+  });
+
   it("hides final task state until the terminal event is replayed", () => {
     const task = makeTask();
     const replayTask = deriveReplayTaskSnapshot(task, [

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TASK_EVENT_STATUS_MAP } from "../../shared/task-event-status-map";
+import { getTaskEventStatus, TASK_EVENT_STATUS_MAP } from "../../shared/task-event-status-map";
 
 describe("TASK_EVENT_STATUS_MAP", () => {
   it("maps the core lifecycle events used by renderer task status tracking", () => {
@@ -33,5 +33,30 @@ describe("TASK_EVENT_STATUS_MAP", () => {
     expect(TASK_EVENT_STATUS_MAP.step_failed).toBeUndefined();
     expect(TASK_EVENT_STATUS_MAP.verification_failed).toBeUndefined();
     expect(TASK_EVENT_STATUS_MAP.timeline_error).toBeUndefined();
+  });
+});
+
+describe("getTaskEventStatus", () => {
+  it("keeps an approval dismissal paused through its final progress update", () => {
+    const sequence = [
+      { type: "input_request_dismissed", payload: {} },
+      { type: "tool_error", payload: { error: "User denied command execution" } },
+      { type: "task_paused", payload: {} },
+      {
+        type: "progress_update",
+        payload: { phase: "execution", message: "Paused - awaiting user input" },
+      },
+    ];
+    expect(sequence.map((event) => getTaskEventStatus(event.type, event.payload)).at(-1)).toBe(
+      "paused",
+    );
+  });
+
+  it("keeps ordinary progress active and allows explicit resumption", () => {
+    expect(getTaskEventStatus("progress_update", { message: "Running a command" })).toBe(
+      "executing",
+    );
+    expect(getTaskEventStatus("task_resumed", {})).toBe("executing");
+    expect(getTaskEventStatus("task_status", { status: "cancelled" })).toBe("cancelled");
   });
 });

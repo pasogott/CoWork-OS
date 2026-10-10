@@ -12822,7 +12822,7 @@ function MainContentComponent({
                   />
                 )}
               </button>
-              {isTaskWorking && onStopTask ? (
+              {(isTaskWorking || hasActiveStructuredInputRequest) && onStopTask ? (
                 <div className="task-control-buttons">
                   <button
                     className="stop-btn-simple"

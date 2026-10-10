@@ -300,6 +300,15 @@ durable approval wait. `data_export` remains an explicit approval class even in
 high-autonomy profiles, and location access always uses a separate
 operating-system consent flow.
 
+For `on-request` networking, every shell invocation requires explicit network
+consent, including local-looking or encoded commands and background launches.
+Approval applies only to that invocation; a previous approval does not authorize
+the next command. The runtime rechecks the policy before launching the process,
+and administrator policy can still prohibit networking. Code execution remains
+network-disabled in this mode; use the built-in web/HTTP tools for its network
+requests. Unrestricted code subprocess networking requires an `enabled` network
+profile and administrator policy that permits it.
+
 Arbitrary subprocess and code-execution networking is stricter. The native
 macOS and Docker sandbox boundaries provide coarse network isolation, not a
 domain-aware proxy. Therefore a profile with domain-scoped network rules cannot
