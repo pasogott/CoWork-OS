@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -272,35 +273,40 @@ export function TaskPauseBanner({
         )}
       </div>
 
-      {showDetails && preview.showDetails && (
-        <div className="modal-overlay" onClick={() => setShowDetails(false)}>
-          <div
-            className="modal task-pause-details-modal"
-            onClick={(event) => event.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby={detailsTitleId}
-          >
-            <div className="modal-header">
-              <h2 id={detailsTitleId}>Pause details</h2>
-              <button
-                type="button"
-                className="modal-close"
-                onClick={() => setShowDetails(false)}
-                aria-label="Close details"
-              >
-                ×
-              </button>
+      {/* Portaled: inside the composer's stacking context the timeline's bottom fade
+          painted over the overlay and the dialog text. */}
+      {showDetails &&
+        preview.showDetails &&
+        createPortal(
+          <div className="modal-overlay" onClick={() => setShowDetails(false)}>
+            <div
+              className="modal task-pause-details-modal"
+              onClick={(event) => event.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby={detailsTitleId}
+            >
+              <div className="modal-header">
+                <h2 id={detailsTitleId}>Pause details</h2>
+                <button
+                  type="button"
+                  className="modal-close"
+                  onClick={() => setShowDetails(false)}
+                  aria-label="Close details"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="modal-body">
+                <TaskPauseBannerDetailsContent
+                  message={preview.fullText}
+                  markdownComponents={markdownComponents}
+                />
+              </div>
             </div>
-            <div className="modal-body">
-              <TaskPauseBannerDetailsContent
-                message={preview.fullText}
-                markdownComponents={markdownComponents}
-              />
-            </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body,
+        )}
     </>
   );
 }
