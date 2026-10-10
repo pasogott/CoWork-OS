@@ -388,6 +388,28 @@ function SurfaceNode({
           ))}
         </ul>
       );
+    case "list": {
+      const ListTag = node.style === "number" ? "ol" : "ul";
+      return (
+        <div className="as-bullets">
+          {node.title && <div className="as-block-title">{text(node.title)}</div>}
+          <ListTag className={`as-list as-bullet-list as-bullet-${node.style ?? "bullet"}`}>
+            {node.items.map((item, index) => (
+              <li key={index} className={`as-bullet ${toneClass(item.tone)}`}>
+                <span className="as-bullet-marker" aria-hidden>
+                  {item.icon ? (
+                    <SurfaceIcon name={item.icon} className="as-icon" />
+                  ) : node.style === "number" ? (
+                    index + 1
+                  ) : null}
+                </span>
+                <span>{text(item.text)}</span>
+              </li>
+            ))}
+          </ListTag>
+        </div>
+      );
+    }
     case "values":
       return (
         <div className="as-values">

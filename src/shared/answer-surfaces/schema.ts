@@ -201,6 +201,12 @@ export type AnswerSurfaceNode =
       items: Array<{ label: string; tone?: AnswerSurfaceTone; icon?: string }>;
     }
   | {
+      type: "list";
+      title?: string;
+      style?: "bullet" | "number";
+      items: Array<{ text: string; icon?: string; tone?: AnswerSurfaceTone }>;
+    }
+  | {
       type: "values";
       title?: string;
       items: Array<{ label: string; value: AnswerSurfaceValue; note?: string }>;
@@ -305,8 +311,14 @@ export type AnswerSurfaceSpec = {
 export type AnswerSurfaceStateValue = number | string | boolean | string[];
 export type AnswerSurfaceState = Record<string, AnswerSurfaceStateValue>;
 
-const label = (max = 300) => z.string().trim().min(1).max(max);
-const optionalLabel = (max = 600) => z.string().trim().max(max).optional();
+/**
+ * Display text past its limit is shortened, not rejected: one long label from a model
+ * should not cost the whole block (the repair loop would otherwise spend a call on it).
+ */
+const fitText = (max: number) => (value: string) =>
+  value.length > max ? `${value.slice(0, max - 1).trimEnd()}…` : value;
+const label = (max = 300) => z.string().trim().min(1).transform(fitText(max));
+const optionalLabel = (max = 600) => z.string().trim().transform(fitText(max)).optional();
 const controlId = z.string().trim().refine(isValidIdentifier, "must be a simple identifier");
 const finite = z.number().finite();
 /*
@@ -538,6 +550,18 @@ const nodeSchema: z.ZodType<AnswerSurfaceNode> = z.lazy(() =>
         ),
     }),
     z.object({
+      type: z.literal("list"),
+      title: optionalLabel(200),
+      style: lenient(z.enum(["bullet", "number"])),
+      items: z
+        .array(z.union([z.string().trim().min(1), z.object({ text: label(400), icon, tone })]))
+        .min(1)
+        .max(30)
+        .transform((items) =>
+          items.map((item) => (typeof item === "string" ? { text: fitText(400)(item) } : item)),
+        ),
+    }),
+    z.object({
       type: z.literal("values"),
       title: optionalLabel(200),
       items: z
@@ -733,11 +757,47 @@ function stripJsonNoise(source: string): string {
   return output;
 }
 
+/**
+ * The first JSON value in `source` when only stray closers (`}`, `]`) follow it, as models
+ * sometimes write; anything else after the value means the block is not recoverable.
+ */
+function leadingJsonValue(source: string): string | null {
+  if (source[0] !== "{" && source[0] !== "[") return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{" || char === "[") depth += 1;
+    else if (char === "}" || char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return /^[\s}\]]*$/.test(source.slice(index + 1)) ? source.slice(0, index + 1) : null;
+      }
+    }
+  }
+  return null;
+}
+
 function parseJsonLenient(source: string): unknown {
   try {
     return JSON.parse(source);
   } catch {
-    return JSON.parse(stripJsonNoise(source));
+    const cleaned = stripJsonNoise(source);
+    try {
+      return JSON.parse(cleaned);
+    } catch (error) {
+      const leading = leadingJsonValue(cleaned.trim());
+      if (leading === null) throw error;
+      return JSON.parse(leading);
+    }
   }
 }
 
@@ -801,6 +861,9 @@ function validateSemantics(
       case "timeline":
         collectText(node.title);
         for (const item of node.items) collectText(item.title, item.text, item.time);
+        break;
+      case "list":
+        collectText(node.title, ...node.items.map((item) => item.text));
         break;
       case "heading":
       case "text":

@@ -129,3 +129,52 @@ describe("mergeSurfaceState", () => {
     expect(mergeSurfaceState(spec, { people: 99 })).toEqual({ people: 5, steps: [] });
   });
 });
+
+describe("near-miss blocks from real models", () => {
+  const block = (label: string) => ({
+    type: "card",
+    children: [{ type: "metrics", items: [{ label, value: "€60–200" }] }],
+  });
+
+  it("uses the block when only stray closing brackets follow it", () => {
+    const parsed = parseAnswerSurfaceSource(`${JSON.stringify(block("Fado night"))}}]}`);
+    expect(parsed.ok).toBe(true);
+  });
+
+  it("still rejects other text after the block", () => {
+    expect(parseAnswerSurfaceSource(`${JSON.stringify(block("Fado"))} and more`).ok).toBe(false);
+    expect(parseAnswerSurfaceSource(`${JSON.stringify(block("Fado"))}{"type":"divider"}`).ok).toBe(
+      false,
+    );
+  });
+
+  it("shortens an overlong label instead of rejecting the block", () => {
+    const long = "Pastéis de nata at Manteigaria, then a ginjinha by Rossio square, ".repeat(3);
+    const parsed = parseAnswerSurfaceSource(JSON.stringify(block(long)));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const metrics = (parsed.spec.root as { children: Array<{ items: Array<{ label: string }> }> })
+      .children[0];
+    expect(metrics.items[0].label.length).toBeLessThanOrEqual(120);
+    expect(metrics.items[0].label.endsWith("…")).toBe(true);
+  });
+});
+
+describe("list component", () => {
+  it("accepts plain strings and rich items, numbered or bulleted", () => {
+    const parsed = parseAnswerSurfaceSource(
+      JSON.stringify({
+        type: "list",
+        title: "Book ahead",
+        style: "number",
+        items: ["O Velho Eurico", { text: "Fado dinner", icon: "music", tone: "purple" }],
+      }),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.spec.root).toMatchObject({
+      type: "list",
+      items: [{ text: "O Velho Eurico" }, { text: "Fado dinner", icon: "music" }],
+    });
+  });
+});

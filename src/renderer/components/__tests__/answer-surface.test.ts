@@ -154,6 +154,22 @@ describe("AnswerSurfaceBlock", () => {
     expect(offered).not.toContain("Book a table for 4");
   });
 
+  it("renders bullet and numbered lists", () => {
+    const html = render({
+      source: JSON.stringify({
+        type: "stack",
+        children: [
+          { type: "list", title: "Tips", items: ["Book early", { text: "Walk", icon: "map" }] },
+          { type: "list", style: "number", items: ["Arrive", "Eat"] },
+        ],
+      }),
+    });
+    expect(html).toContain("as-bullet-bullet");
+    expect(html).toContain("Book early");
+    expect(html).toContain("<ol");
+    expect(html).toContain(">2</span>");
+  });
+
   it("does not render invalid blocks", () => {
     const html = render({ source: '{"type":"script","code":"alert(1)"}' });
     expect(html).toContain("could not be shown");

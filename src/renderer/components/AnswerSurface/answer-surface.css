@@ -1328,6 +1328,49 @@
   font-weight: 560;
 }
 
+/* Lists */
+.answer-surface .as-bullet-list {
+  display: grid;
+  gap: 8px;
+}
+
+.answer-surface.answer-surface .as-list > li.as-bullet {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  line-height: 1.5;
+}
+
+.answer-surface .as-bullet-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.5em;
+  color: var(--as-tone-ink);
+  font-size: 0.86em;
+  font-weight: 650;
+}
+
+.answer-surface .as-bullet-bullet .as-bullet-marker:empty::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--as-tone, var(--as-accent));
+}
+
+.answer-surface .as-bullet-number .as-bullet-marker {
+  width: 22px;
+  border-radius: 999px;
+  background: var(--as-tone-soft);
+}
+
+.answer-surface .as-bullet-marker .as-icon {
+  width: 16px;
+  height: 16px;
+}
+
 /* Values */
 .answer-surface .as-values-list {
   margin: 0;
