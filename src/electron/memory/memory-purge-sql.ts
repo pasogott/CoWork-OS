@@ -366,15 +366,17 @@ export function purgeWorkspaceMemoryRows(
 }
 
 /**
- * Run `purgeWorkspaceMemoryRows` on the profile database the memory services use (the
- * host connection). Returns null when memory is not initialized.
+ * Run `purgeWorkspaceMemoryRows` as the memory domain's `memoryPurge_workspace` unit.
+ * Returns null when memory is not initialized.
  */
 export async function purgeWorkspaceMemoryRowsOnHost(
   workspaceId: string,
 ): Promise<WorkspaceMemoryRowPurgeCounts | null> {
   const { MemoryService } = await import("./MemoryService");
-  const db = MemoryService.getDatabase();
-  return db ? purgeWorkspaceMemoryRows(db, workspaceId) : null;
+  // Through the memory statement port (memory-purge-units.ts): on the database worker's
+  // write connection when memory is routed there, so it does not race the worker's writes.
+  const sql = MemoryService.getStatements();
+  return sql ? sql.unit("memoryPurge_workspace", { workspaceId }) : null;
 }
 
 /** The workspace's folder from the profile database, or null when unknown. */

@@ -1,0 +1,53 @@
+{
+  "id": "shell-approval-recovery-2026-10-10",
+  "title": "Shell approval denial, explicit retry, and paused-session recovery",
+  "source": {
+    "incident": "packaged-shell-approval-acceptance",
+    "pullRequest": 446
+  },
+  "categories": [
+    {
+      "id": "ended-approval-does-not-replay-original-plan",
+      "prompt": "Deny or time out a shell invocation, then explicitly request one new invocation and approve it once.",
+      "assertions": {
+        "newInvocationCount": 1,
+        "originalPausedPlanReplayed": false,
+        "followUpCompletes": true,
+        "executableTest": "src/electron/agent/__tests__/executor-step-failures.test.ts",
+        "executableTestNames": [
+          "does not replay the paused plan after a successful explicit retry: User denied command execution",
+          "does not replay the paused plan after a successful explicit retry: Approval request timed out"
+        ]
+      }
+    },
+    {
+      "id": "report-captured-output-without-rerunning",
+      "prompt": "Report captured command output and exit status in a final response. A separate explicit rerun instruction still requires command evidence.",
+      "assertions": {
+        "reportingStepCommandInvocations": 0,
+        "explicitRerunRequiresCommandEvidence": true,
+        "executableTest": "src/electron/agent/__tests__/executor-step-failures.test.ts",
+        "executableTestNamePattern": "reports captured command output without a second invocation"
+      }
+    },
+    {
+      "id": "dismissal-stays-paused-in-live-status-and-replay",
+      "prompt": "Dismiss an inline approval, then consume task_paused followed by progress_update with Paused - awaiting user input, including canonical persisted timeline events.",
+      "assertions": {
+        "expectedTaskStatus": "paused",
+        "ordinaryProgressStillExecutes": true,
+        "explicitResumeStillExecutes": true,
+        "executableCoverage": [
+          "src/renderer/__tests__/task-event-status-map.test.ts",
+          "src/renderer/utils/__tests__/task-replay-state.test.ts"
+        ],
+        "executableTestNames": [
+          "keeps an approval dismissal paused through its final progress update",
+          "keeps ordinary progress active and allows explicit resumption",
+          "keeps a persisted approval pause paused when replaying its final progress event"
+        ]
+      }
+    }
+  ],
+  "notes": "Scenario specification linked to executable Vitest regressions; this JSON is not itself loaded or graded by run_eval_suite.cjs. Packaged GUI acceptance separately verified Stop while approval is pending, no execution after cancellation, background process termination, and fresh one-time approval after cancellation. No secrets or profile data are required for the automated tests."
+}

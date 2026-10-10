@@ -35,7 +35,7 @@ import type {
   Task,
   Workspace,
 } from "../../../shared/types";
-import { TASK_EVENT_STATUS_MAP } from "../../../shared/task-event-status-map";
+import { getTaskEventStatus } from "../../../shared/task-event-status-map";
 import { useAgentContext } from "../../hooks/useAgentContext";
 import { getEffectiveTaskEventType } from "../../utils/task-event-compat";
 import { createRendererLogger } from "../../utils/logger";
@@ -1033,10 +1033,7 @@ export function useMissionControlData(
         }
         return;
       }
-      const newStatus =
-        effectiveType === "task_status"
-          ? event.payload?.status
-          : TASK_EVENT_STATUS_MAP[effectiveType as keyof typeof TASK_EVENT_STATUS_MAP];
+      const newStatus = getTaskEventStatus(effectiveType, event.payload);
       if (newStatus && !isAutoApproval) {
         setTasks((prev) =>
           prev.map((t) => {

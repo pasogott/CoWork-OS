@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createMemoryStatementPort } from "../memory-statement-port";
 
 const nativeSqliteAvailable = await import("better-sqlite3")
   .then((module) => {
@@ -275,6 +276,8 @@ describeWithSqlite("memory purge (SEC-15, LIFE-4)", () => {
     fs.symlinkSync(outside, path.join(workspace.path, ".cowork/memory/topics/linked.md"));
 
     vi.spyOn(MemoryService, "getDatabase").mockReturnValue(db);
+    // The row purge runs as the memory domain's unit, through its statement port.
+    vi.spyOn(MemoryService, "getStatements").mockReturnValue(createMemoryStatementPort(db));
     vi.spyOn(MemoryService, "getStats").mockResolvedValue({
       count: 2,
       totalTokens: 0,

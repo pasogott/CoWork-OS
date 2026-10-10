@@ -1,4 +1,4 @@
-import type { Task } from "./types";
+import type { Task, TaskEvent } from "./types";
 
 export const TASK_EVENT_STATUS_MAP: Readonly<Partial<Record<string, Task["status"]>>> = {
   task_created: "pending",
@@ -62,3 +62,14 @@ export const TASK_EVENT_STATUS_MAP: Readonly<Partial<Record<string, Task["status
   task_cancelled: "cancelled",
   task_interrupted: "interrupted",
 };
+
+/** Resolve payload-sensitive progress without reactivating a paused session. */
+export function getTaskEventStatus(
+  type: string,
+  payload?: TaskEvent["payload"],
+): Task["status"] | undefined {
+  if (type === "progress_update" && payload?.message === "Paused - awaiting user input") {
+    return "paused";
+  }
+  return type === "task_status" ? payload?.status : TASK_EVENT_STATUS_MAP[type];
+}

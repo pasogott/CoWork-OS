@@ -1,5 +1,5 @@
 import type { Task, TaskEvent, TaskStatus, TaskTerminalStatus } from "../../shared/types";
-import { TASK_EVENT_STATUS_MAP } from "../../shared/task-event-status-map";
+import { getTaskEventStatus } from "../../shared/task-event-status-map";
 import { getEffectiveTaskEventType } from "./task-event-compat";
 
 const TERMINAL_REPLAY_STATUSES = new Set<TaskStatus>([
@@ -94,7 +94,7 @@ export function deriveReplayTaskSnapshot(
   for (const event of replayEvents) {
     updatedAt = event.timestamp || updatedAt;
     const effectiveType = getEffectiveTaskEventType(event);
-    const eventStatus = TASK_EVENT_STATUS_MAP[effectiveType];
+    const eventStatus = getTaskEventStatus(effectiveType, event.payload);
     if (!eventStatus) continue;
 
     status = eventStatus;
