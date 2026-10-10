@@ -9,6 +9,7 @@ import { MEMORY_OBSERVATION_UNITS } from "./memory-observation-units";
 import { DURABLE_CONTEXT_UNITS } from "./durable-context-units";
 import { MARKDOWN_INDEX_UNITS } from "./markdown-index-units";
 import { MEMORY_CLEANUP_UNITS } from "./memory-cleanup-units";
+import { MEMORY_PURGE_UNITS } from "./memory-purge-units";
 import { TRANSCRIPT_UNITS } from "./transcript-units";
 import { MEMORY_ITEMS_UNITS } from "./memory-items-units";
 import { MEMORY_RECALL_UNITS } from "./memory-recall-units";
@@ -73,6 +74,7 @@ export const MEMORY_UNITS = {
   ...DURABLE_CONTEXT_UNITS,
   ...MARKDOWN_INDEX_UNITS,
   ...MEMORY_CLEANUP_UNITS,
+  ...MEMORY_PURGE_UNITS,
   ...TRANSCRIPT_UNITS,
   ...MEMORY_ITEMS_UNITS,
   ...MEMORY_RECALL_UNITS,
