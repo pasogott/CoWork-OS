@@ -7,7 +7,7 @@
   ],
   "totals": {
     "prepare": 1782,
-    "getDatabase": 129,
+    "getDatabase": 128,
     "runtimeImport": 49
   },
   "files": {
@@ -343,7 +343,7 @@
     },
     "src/electron/memory/memory-purge-sql.ts": {
       "prepare": 3,
-      "getDatabase": 2
+      "getDatabase": 1
     },
     "src/electron/memory/memory-recall-sql.ts": {
       "prepare": 4
