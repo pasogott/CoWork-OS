@@ -2,8 +2,8 @@
   "id": "security-harness-regressions-2026-05-14",
   "title": "Security harness regression coverage",
   "source": {
-    "incident": "qa-server-subprocess-policy",
-    "taskId": "qa-server-subprocess-policy"
+    "incident": "browser-mcp-unreviewed-stdio-launch",
+    "taskId": "browser-mcp-unreviewed-stdio-launch"
   },
   "categories": [
     {
@@ -301,6 +301,18 @@
         "expectedPolicyGate": "production_policy",
         "requiresProofArtifact": true,
         "executableTest": "src/electron/mcp/client/transports/__tests__/StreamableHttpTransport.test.ts"
+      }
+    },
+    {
+      "id": "browser-mcp-unreviewed-stdio-launch-confirmed-fix",
+      "prompt": "Regression guard for Reject browser custom stdio launch plans and stdio environment mutations before persistence: replay the original failure class and verify the fix still holds.",
+      "assertions": {
+        "securityHarnessRule": "confirmed-fix",
+        "expectedNoSilentBypass": true,
+        "expectedFindingFingerprint": "browser-mcp-unreviewed-stdio-launch",
+        "expectedPolicyGate": "production_policy",
+        "requiresProofArtifact": true,
+        "executableTest": "src/host/services/__tests__/browser-mcp-methods.test.ts"
       }
     },
     {

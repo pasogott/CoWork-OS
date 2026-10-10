@@ -805,13 +805,15 @@ export function MCPSettings({
                 >
                   {checkingUpdates ? "Checking..." : "Check for Updates"}
                 </button>
-                <button
-                  className="button-small button-primary"
-                  onClick={() => setShowAddForm(!showAddForm)}
-                  disabled={mcpSettingsUnreadable}
-                >
-                  {showAddForm ? "Cancel" : "+ Add Server"}
-                </button>
+                {!isBrowserHost && (
+                  <button
+                    className="button-small button-primary"
+                    onClick={() => setShowAddForm(!showAddForm)}
+                    disabled={mcpSettingsUnreadable}
+                  >
+                    {showAddForm ? "Cancel" : "+ Add Server"}
+                  </button>
+                )}
               </div>
             </div>
             <p className="settings-description">
@@ -819,7 +821,14 @@ export function MCPSettings({
               servers will be available to the AI agent.
             </p>
 
-            {showAddForm && (
+            {isBrowserHost && (
+              <p className="settings-hint">
+                Add custom local servers and configure their credentials in the desktop app. You can
+                install servers here after reviewing their registry launch plan.
+              </p>
+            )}
+
+            {!isBrowserHost && showAddForm && (
               <div className="mcp-add-form">
                 <h4>Add New MCP Server</h4>
                 <div className="settings-field">
@@ -1016,7 +1025,7 @@ export function MCPSettings({
                           </button>
                         )}
 
-                        {connectorProvider && (
+                        {connectorProvider && !isBrowserHost && (
                           <button
                             className="button-small button-primary"
                             onClick={() =>

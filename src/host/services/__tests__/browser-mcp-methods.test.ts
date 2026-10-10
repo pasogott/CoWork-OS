@@ -354,27 +354,82 @@ describe("browser MCP methods", () => {
     expect(registry.uninstallServer).toHaveBeenCalledWith(SERVER_ID);
   });
 
-  it("merges browser-entered environment values without revealing or erasing saved credentials", async () => {
-    const { call, getStoredSettings } = setup();
-    const updated = await call("updateMCPServer", {
-      workspaceId: WORKSPACE_ID,
-      serverId: SERVER_ID,
-      updates: { env: { NEW_FIXTURE_TOKEN: "browser-entered-secret" } },
-    });
-    expect(getStoredSettings().servers[0].env).toEqual({
-      FIXTURE_API_KEY: "fixture-secret-value",
-      NEW_FIXTURE_TOKEN: "browser-entered-secret",
-    });
-    expect(JSON.stringify(updated)).not.toContain("browser-entered-secret");
-    await call("updateMCPServer", {
-      workspaceId: WORKSPACE_ID,
-      serverId: SERVER_ID,
-      updates: { removeEnvKeys: ["FIXTURE_API_KEY"] },
-    });
-    expect(getStoredSettings().servers[0].env).toEqual({
-      NEW_FIXTURE_TOKEN: "browser-entered-secret",
-    });
+  it("rejects custom stdio launch plans before persistence, including disabled and registry-labelled plans", async () => {
+    const { call, settings, client, getStoredSettings } = setup();
+    for (const extra of [{}, { enabled: false }, { registryId: ENTRY_ID }]) {
+      await expect(
+        call("addMCPServer", {
+          workspaceId: WORKSPACE_ID,
+          config: {
+            name: "Custom process",
+            transport: "stdio",
+            command: "node",
+            args: ["-e", "process.exit(0)"],
+            env: { NODE_OPTIONS: "--require=/tmp/payload.cjs" },
+            cwd: "/tmp",
+            ...extra,
+          },
+        }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
+    expect(settings.addServer).not.toHaveBeenCalled();
+    expect(getStoredSettings().servers).toHaveLength(1);
+    expect(client.connectServer).not.toHaveBeenCalled();
+    expect(client.testServer).not.toHaveBeenCalled();
   });
+
+  it("rejects stdio environment mutations before persistence or later connect/test", async () => {
+    const { call, settings, client, getStoredSettings } = setup();
+    const original = structuredClone(getStoredSettings());
+    for (const updates of [
+      { env: { NODE_OPTIONS: "--require=/tmp/payload.cjs" } },
+      { env: { PATH: "/tmp" } },
+      { env: { FIXTURE_API_KEY: "replacement-argument" } },
+      { env: {} },
+      { removeEnvKeys: ["FIXTURE_API_KEY"] },
+      { enabled: true, env: { NODE_OPTIONS: "--require=/tmp/payload.cjs" } },
+    ]) {
+      await expect(
+        call("updateMCPServer", { workspaceId: WORKSPACE_ID, serverId: SERVER_ID, updates }),
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
+    expect(settings.updateServer).not.toHaveBeenCalled();
+    expect(getStoredSettings()).toEqual(original);
+    await call("connectMCPServer", { workspaceId: WORKSPACE_ID, serverId: SERVER_ID });
+    await call("testMCPServer", { workspaceId: WORKSPACE_ID, serverId: SERVER_ID });
+    expect(settings.getServer(SERVER_ID)?.env).toEqual(original.servers[0].env);
+    expect(client.connectServer).toHaveBeenCalledWith(SERVER_ID);
+    expect(client.testServer).toHaveBeenCalledWith(SERVER_ID);
+  });
+
+  it.each(["sse", "websocket", "streamable-http"] as const)(
+    "preserves custom %s creation, authentication updates, connect and test",
+    async (transport) => {
+      const { call, settings, client } = setup();
+      settings.removeServer(SERVER_ID);
+      await expect(
+        call("addMCPServer", {
+          workspaceId: WORKSPACE_ID,
+          config: {
+            name: "Remote server",
+            transport,
+            url: transport === "websocket" ? "wss://mcp.example.test" : "https://mcp.example.test",
+            auth: { type: "bearer", token: "remote-token" },
+          },
+        }),
+      ).resolves.toMatchObject({ transport, hasAuthentication: true });
+      await call("updateMCPServer", {
+        workspaceId: WORKSPACE_ID,
+        serverId: SERVER_ID,
+        updates: { auth: { type: "bearer", token: "replacement-token" } },
+      });
+      await call("connectMCPServer", { workspaceId: WORKSPACE_ID, serverId: SERVER_ID });
+      await call("testMCPServer", { workspaceId: WORKSPACE_ID, serverId: SERVER_ID });
+      expect(settings.getServer(SERVER_ID)?.auth?.token).toBe("replacement-token");
+      expect(client.connectServer).toHaveBeenCalledWith(SERVER_ID);
+      expect(client.testServer).toHaveBeenCalledWith(SERVER_ID);
+    },
+  );
 
   it("requires a reviewed registry plan or remove-and-add for launch changes", async () => {
     const { call, settings } = setup();
