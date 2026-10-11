@@ -49,6 +49,7 @@ import {
 } from "./transactional-review-sql";
 import { updateTaskTitleIfUnchanged } from "./task-title-sql";
 import { BUILD_PROMPT_MARKER } from "../../shared/build-task";
+import { isTerminalTaskStatus } from "../../shared/task-status";
 import { purgeTaskDerivedRows } from "../memory/memory-purge-sql";
 import { removeWorkspaceWithHistory } from "./workspace-removal-sql";
 import { deleteWorkspaceMemoriesOlderThan } from "../memory/memory-retention-sql";
@@ -1487,6 +1488,11 @@ export class TaskStore {
         END AS agent_config_multitask_mode,
         CASE
           WHEN agent_config IS NOT NULL AND json_valid(agent_config)
+          THEN json_extract(agent_config, '$.teamWorkItemLane')
+          ELSE NULL
+        END AS agent_config_team_work_item_lane,
+        CASE
+          WHEN agent_config IS NOT NULL AND json_valid(agent_config)
           THEN json_extract(agent_config, '$.collaborativeMode')
           ELSE NULL
         END AS agent_config_collaborative_mode,
@@ -1594,21 +1600,21 @@ export class TaskStore {
       const rows = this.db
         .prepare(`
         SELECT * FROM tasks
-        WHERE session_id = ?
+        WHERE session_id = ? OR (id = ? AND (session_id IS NULL OR session_id = ''))
         ORDER BY created_at ASC
         LIMIT ? OFFSET ?
       `)
-        .all(normalizedSessionId, safeLimit, safeOffset) as Any[];
+        .all(normalizedSessionId, normalizedSessionId, safeLimit, safeOffset) as Any[];
       return rows.map((row) => this.mapRowToTask(row));
     }
 
     const rows = this.db
       .prepare(`
       SELECT * FROM tasks
-      WHERE session_id = ?
+      WHERE session_id = ? OR (id = ? AND (session_id IS NULL OR session_id = ''))
       ORDER BY created_at ASC
     `)
-      .all(normalizedSessionId) as Any[];
+      .all(normalizedSessionId, normalizedSessionId) as Any[];
     return rows.map((row) => this.mapRowToTask(row));
   }
 
@@ -1710,6 +1716,25 @@ export class TaskStore {
        LIMIT ?`,
       [...hits.params, workspaceId, minMatched, limit],
     );
+  }
+
+  /** Guard retention deletion and lineage state under the same SQLite write lock. */
+  deleteIfSessionPrunable(
+    id: string,
+    sessionId: string,
+  ): "deleted" | "missing" | "active" | "pinned" {
+    return this.db
+      .transaction(() => {
+        const task = this.findById(id);
+        if (!task || (task.sessionId || task.id) !== sessionId) return "missing" as const;
+        const lineage = this.findBySessionId(sessionId);
+        const rows = lineage.length > 0 ? lineage : [task];
+        if (rows.some((row) => !isTerminalTaskStatus(row.status))) return "active" as const;
+        if (rows.some((row) => row.pinned === true)) return "pinned" as const;
+        this.delete(id);
+        return "deleted" as const;
+      })
+      .immediate();
   }
 
   /**
@@ -2086,7 +2111,12 @@ export class TaskStore {
       agentConfig.taskOrigin = "build";
     }
     const setBooleanAgentConfig = (
-      key: "videoGenerationMode" | "multitaskMode" | "collaborativeMode" | "autonomousMode",
+      key:
+        | "videoGenerationMode"
+        | "multitaskMode"
+        | "collaborativeMode"
+        | "autonomousMode"
+        | "teamWorkItemLane",
       value: unknown,
     ): void => {
       if (value === null || value === undefined) return;
@@ -2095,6 +2125,7 @@ export class TaskStore {
 
     setBooleanAgentConfig("videoGenerationMode", row.agent_config_video_generation_mode);
     setBooleanAgentConfig("multitaskMode", row.agent_config_multitask_mode);
+    setBooleanAgentConfig("teamWorkItemLane", row.agent_config_team_work_item_lane);
     setBooleanAgentConfig("collaborativeMode", row.agent_config_collaborative_mode);
     setBooleanAgentConfig("autonomousMode", row.agent_config_autonomous_mode);
 
@@ -4818,7 +4849,14 @@ export class WorkspacePermissionRuleStore {
         : "domain" in rule.scope
           ? rule.scope.domain || null
           : null,
-      JSON.stringify(rule.metadata ?? {}),
+      JSON.stringify({
+        ...rule.metadata,
+        permissionScopeConstraints: {
+          effectClass: rule.scope.effectClass,
+          http: rule.scope.http,
+          ...("toolPrefix" in rule.scope ? { toolPrefix: rule.scope.toolPrefix } : {}),
+        },
+      }),
       now,
       now,
     );
@@ -4895,13 +4933,31 @@ export class WorkspacePermissionRuleStore {
         break;
     }
 
+    const metadata = safeJsonParse<Record<string, Any>>(
+      row.metadata_json,
+      {},
+      "workspacePermissionRule.metadata",
+    );
+    const constraints = metadata.permissionScopeConstraints;
+    // Internal scope storage must not alter the caller-visible rule metadata.
+    delete metadata.permissionScopeConstraints;
+    if (constraints && typeof constraints === "object") {
+      scope = {
+        ...scope,
+        ...(constraints.effectClass !== undefined ? { effectClass: constraints.effectClass } : {}),
+        ...(constraints.http !== undefined ? { http: constraints.http } : {}),
+        ...(scope.kind === "domain" && constraints.toolPrefix
+          ? { toolPrefix: constraints.toolPrefix }
+          : {}),
+      };
+    }
     return {
       id: row.id,
       workspaceId: row.workspace_id,
       source: "workspace_db",
       effect: row.effect,
       scope,
-      metadata: safeJsonParse(row.metadata_json, {}, "workspacePermissionRule.metadata"),
+      metadata,
       createdAt: row.created_at,
     };
   }
@@ -5407,7 +5463,11 @@ export interface ChannelUser {
   channelUserId: string;
   displayName: string;
   username?: string;
+  /** Display aggregate only; authorization must use the context-specific grants. */
   allowed: boolean;
+  allowedDm?: boolean;
+  allowedGroup?: boolean;
+  pairingContext?: "dm" | "group";
   pairingCode?: string;
   pairingAttempts: number;
   pairingExpiresAt?: number;
@@ -5723,8 +5783,8 @@ export class ChannelUserStore {
     };
 
     const stmt = this.db.prepare(`
-      INSERT INTO channel_users (id, channel_id, channel_user_id, display_name, username, allowed, pairing_code, pairing_attempts, pairing_expires_at, created_at, last_seen_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO channel_users (id, channel_id, channel_user_id, display_name, username, allowed, allowed_dm, allowed_group, pairing_context, pairing_code, pairing_attempts, pairing_expires_at, created_at, last_seen_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -5733,7 +5793,10 @@ export class ChannelUserStore {
       newUser.channelUserId,
       newUser.displayName,
       newUser.username || null,
-      newUser.allowed ? 1 : 0,
+      newUser.allowedDm || newUser.allowedGroup ? 1 : 0,
+      newUser.allowedDm ? 1 : 0,
+      newUser.allowedGroup ? 1 : 0,
+      newUser.pairingContext || null,
       newUser.pairingCode || null,
       newUser.pairingAttempts,
       newUser.pairingExpiresAt || null,
@@ -5741,7 +5804,7 @@ export class ChannelUserStore {
       newUser.lastSeenAt,
     );
 
-    return newUser;
+    return { ...newUser, allowed: !!(newUser.allowedDm || newUser.allowedGroup) };
   }
 
   update(id: string, updates: Partial<ChannelUser>): void {
@@ -5760,21 +5823,41 @@ export class ChannelUserStore {
       fields.push("allowed = ?");
       values.push(updates.allowed ? 1 : 0);
     }
-    if (updates.pairingCode !== undefined) {
+    if (updates.allowedDm !== undefined || updates.allowedGroup !== undefined) {
+      fields.push(
+        "allowed_dm = COALESCE(?, allowed_dm)",
+        "allowed_group = COALESCE(?, allowed_group)",
+      );
+      values.push(
+        updates.allowedDm === undefined ? null : Number(updates.allowedDm),
+        updates.allowedGroup === undefined ? null : Number(updates.allowedGroup),
+      );
+      // Evaluate against the old row and supplied changes in the same statement.
+      fields.push("allowed = (COALESCE(?, allowed_dm) = 1 OR COALESCE(?, allowed_group) = 1)");
+      values.push(
+        updates.allowedDm === undefined ? null : Number(updates.allowedDm),
+        updates.allowedGroup === undefined ? null : Number(updates.allowedGroup),
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, "pairingContext")) {
+      fields.push("pairing_context = ?");
+      values.push(updates.pairingContext ?? null);
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, "pairingCode")) {
       fields.push("pairing_code = ?");
-      values.push(updates.pairingCode);
+      values.push(updates.pairingCode ?? null);
     }
     if (updates.pairingAttempts !== undefined) {
       fields.push("pairing_attempts = ?");
       values.push(updates.pairingAttempts);
     }
-    if (updates.pairingExpiresAt !== undefined) {
+    if (Object.prototype.hasOwnProperty.call(updates, "pairingExpiresAt")) {
       fields.push("pairing_expires_at = ?");
-      values.push(updates.pairingExpiresAt);
+      values.push(updates.pairingExpiresAt ?? null);
     }
-    if (updates.lockoutUntil !== undefined) {
+    if (Object.prototype.hasOwnProperty.call(updates, "lockoutUntil")) {
       fields.push("lockout_until = ?");
-      values.push(updates.lockoutUntil);
+      values.push(updates.lockoutUntil ?? null);
     }
     if (updates.lastSeenAt !== undefined) {
       fields.push("last_seen_at = ?");
@@ -5853,14 +5936,15 @@ export class ChannelUserStore {
   /**
    * Delete all pending pairing entries for a channel (valid or expired).
    */
-  deletePendingByChannel(channelId: string): number {
+  deletePendingByChannel(channelId: string, contextType?: "dm" | "group"): number {
     const stmt = this.db.prepare(`
       DELETE FROM channel_users
       WHERE channel_id = ?
         AND allowed = 0
         AND channel_user_id LIKE 'pending_%'
+        AND (? IS NULL OR pairing_context = ?)
     `);
-    const result = stmt.run(channelId);
+    const result = stmt.run(channelId, contextType ?? null, contextType ?? null);
     return result.changes;
   }
 
@@ -5883,11 +5967,17 @@ export class ChannelUserStore {
     return result.changes;
   }
 
-  findByPairingCode(channelId: string, pairingCode: string): ChannelUser | undefined {
+  findByPairingCode(
+    channelId: string,
+    pairingCode: string,
+    contextType: "dm" | "group" = "dm",
+  ): ChannelUser | undefined {
     const stmt = this.db.prepare(
-      "SELECT * FROM channel_users WHERE channel_id = ? AND UPPER(pairing_code) = UPPER(?)",
+      "SELECT * FROM channel_users WHERE channel_id = ? AND UPPER(pairing_code) = UPPER(?) AND pairing_context = ?",
     );
-    const row = stmt.get(channelId, pairingCode) as Record<string, unknown> | undefined;
+    const row = stmt.get(channelId, pairingCode, contextType) as
+      | Record<string, unknown>
+      | undefined;
     return row ? this.mapRowToUser(row) : undefined;
   }
 
@@ -5898,7 +5988,13 @@ export class ChannelUserStore {
       channelUserId: row.channel_user_id as string,
       displayName: row.display_name as string,
       username: (row.username as string) || undefined,
-      allowed: row.allowed === 1,
+      allowed: row.allowed_dm === 1 || row.allowed_group === 1,
+      allowedDm: row.allowed_dm === 1,
+      allowedGroup: row.allowed_group === 1,
+      pairingContext:
+        row.pairing_context === "dm" || row.pairing_context === "group"
+          ? row.pairing_context
+          : undefined,
       pairingCode: (row.pairing_code as string) || undefined,
       pairingAttempts: row.pairing_attempts as number,
       pairingExpiresAt: (row.pairing_expires_at as number) || undefined,

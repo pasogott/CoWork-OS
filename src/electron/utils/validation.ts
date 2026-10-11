@@ -226,6 +226,8 @@ export const AgentConfigSchema = z
     chronicleMode: z.enum(["inherit", "enabled", "disabled"]).optional(),
     shellAccess: z.boolean().optional(),
     requireWorktree: z.boolean().optional(),
+    worktreeMode: z.enum(["local", "worktree"]).optional(),
+    worktreeBaseBranch: z.string().trim().min(1).max(250).optional(),
     autoApproveTypes: z.array(z.string().min(1).max(200)).max(50).optional(),
     allowSharedContextMemory: z.boolean().optional(),
     conversationMode: z.enum(["task", "chat", "hybrid"]).optional(),
@@ -1999,17 +2001,20 @@ export const GrantAccessSchema = z.object({
   channelId: z.string().uuid(),
   userId: z.string().min(1).max(100),
   displayName: z.string().max(MAX_TITLE_LENGTH).optional(),
+  contextType: z.enum(["dm", "group", "both"]).default("dm"),
 });
 
 export const RevokeAccessSchema = z.object({
   channelId: z.string().uuid(),
   userId: z.string().min(1).max(100),
+  contextType: z.enum(["dm", "group", "both"]).default("both"),
 });
 
 export const GeneratePairingSchema = z.object({
   channelId: z.string().uuid(),
   userId: z.string().max(100).optional(),
   displayName: z.string().max(MAX_TITLE_LENGTH).optional(),
+  contextType: z.enum(["dm", "group"]).default("dm"),
 });
 
 // ============ ID Schemas (for simple string ID params) ============

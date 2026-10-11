@@ -1,3 +1,7 @@
+import {
+  collaborativeExecutionLanes,
+  isCollaborativeExecutionTask,
+} from "../agents/collaborative-execution";
 import { approvalRequestRevisionHash, presentApprovalRevision } from "./approval-revision";
 import type { ChannelDecisionResolutionGuard } from "../gateway/ChannelDecisionStore";
 import { approvalRevisionMatches } from "./approval-revision";
@@ -1319,23 +1323,32 @@ export class AgentDaemon extends EventEmitter {
       new TaskSessionMetadataStore(db),
       new WorkspaceStore(db),
     );
+    const worktreesForCleanup = new Map<
+      string,
+      Awaited<ReturnType<WorktreeManager["getWorktreeInfo"]>>
+    >();
     const result = await sessionRetention.pruneSessions(
       {
         olderThanMs,
         includeArchived: autoPrune.includeArchived === true,
       },
       {
-        deleteTask: async (task) => {
+        prepareTaskDeletion: async (task) => {
           if (!task.worktreePath && !task.worktreeBranch) return;
-          try {
-            await this.worktreeManager.cleanup(task.id, true);
-          } catch (error) {
-            log.warn(`Session auto-prune worktree cleanup failed for ${task.id}:`, error);
-          }
+          worktreesForCleanup.set(task.id, await this.worktreeManager.getWorktreeInfo(task.id));
         },
         // Transcript files and Chronicle captures go with the task (SEC-15). Learned
         // memory is left to memory retention.
         onTaskDeleted: async (task) => {
+          const worktree = worktreesForCleanup.get(task.id);
+          if (worktree) {
+            try {
+              await this.worktreeManager.cleanupDeletedWorktree(worktree, true);
+            } catch (error) {
+              log.warn(`Session auto-prune worktree cleanup failed for ${task.id}:`, error);
+            }
+          }
+          worktreesForCleanup.delete(task.id);
           await MemoryWorkspacePurgeService.purgeTaskFiles({
             taskId: task.id,
             workspacePath: this.workspaceRepo.findById(task.workspaceId)?.path,
@@ -1428,6 +1441,22 @@ export class AgentDaemon extends EventEmitter {
         allowedPaths: filteredLegacyRoots,
       },
     };
+  }
+
+  private resolveRequiredWorktreeWorkspace(task: Task, workspace: Workspace): Workspace {
+    const requiresWorktree =
+      task.agentConfig?.requireWorktree === true || task.agentConfig?.worktreeMode === "worktree";
+    const hasActiveWorktree = task.worktreeStatus === "active" && Boolean(task.worktreePath);
+    if (requiresWorktree || hasActiveWorktree) {
+      const worktreePath = task.worktreePath?.trim();
+      if (!worktreePath || !fs.existsSync(worktreePath)) {
+        throw new Error(
+          `Task ${task.id} requires its isolated worktree, but the checkout is missing. Recreate the worktree before continuing.`,
+        );
+      }
+      return this.applyTaskWorkspaceOverridesForPath(task, workspace, worktreePath);
+    }
+    return this.applyTaskWorkspaceOverrides(task, workspace);
   }
 
   /** Return the live task workspace, resolving profile rules against its checkout. */
@@ -2979,11 +3008,15 @@ export class AgentDaemon extends EventEmitter {
         this.finishQueueSlot(executionTask.id);
         return;
       }
-      const requiresWorktree = executionTask.agentConfig?.requireWorktree === true;
+      const requiresWorktree =
+        executionTask.agentConfig?.requireWorktree === true ||
+        executionTask.agentConfig?.worktreeMode === "worktree" ||
+        Boolean(executionTask.worktreePath && executionTask.worktreeStatus === "active");
       const canUseWorktree = await this.worktreeManager.shouldUseWorktree(
         workspace.path,
         workspace.isTemp,
         requiresWorktree,
+        executionTask.agentConfig?.worktreeMode,
       );
       if (this.shutdownRequested) {
         this.finishQueueSlot(executionTask.id);
@@ -3025,6 +3058,7 @@ export class AgentDaemon extends EventEmitter {
             executionTask.title,
             workspace.id,
             workspace.path,
+            executionTask.agentConfig?.worktreeBaseBranch,
           );
 
           // Create a virtual workspace pointing to the worktree
@@ -3390,20 +3424,7 @@ export class AgentDaemon extends EventEmitter {
     if (this.shutdownRequested) return;
 
     // Handle worktree workspace if applicable
-    let effectiveWorkspace = this.applyTaskWorkspaceOverrides(effectiveTask, workspace);
-    if (task.worktreePath && task.worktreeStatus === "active") {
-      if (fs.existsSync(task.worktreePath)) {
-        effectiveWorkspace = this.applyTaskWorkspaceOverridesForPath(
-          effectiveTask,
-          workspace,
-          task.worktreePath,
-        );
-      } else {
-        console.warn(
-          `[AgentDaemon] Worktree path ${task.worktreePath} no longer exists for task ${task.id}`,
-        );
-      }
-    }
+    const effectiveWorkspace = this.resolveRequiredWorktreeWorkspace(effectiveTask, workspace);
 
     // Restore any initial browser media as well as transcript state: an early
     // crash can occur after the initial user-message event but before the
@@ -3709,14 +3730,7 @@ export class AgentDaemon extends EventEmitter {
       }
     }
 
-    let effectiveWorkspace = this.applyTaskWorkspaceOverrides(effectiveTask, workspace);
-    if (task.worktreePath && task.worktreeStatus === "active" && fs.existsSync(task.worktreePath)) {
-      effectiveWorkspace = this.applyTaskWorkspaceOverridesForPath(
-        effectiveTask,
-        workspace,
-        task.worktreePath,
-      );
-    }
+    const effectiveWorkspace = this.resolveRequiredWorktreeWorkspace(effectiveTask, workspace);
 
     const executor = new TaskExecutor(effectiveTask, effectiveWorkspace, this);
     executor.rebuildConversationFromEvents(events);
@@ -3947,6 +3961,8 @@ export class AgentDaemon extends EventEmitter {
           permissionMode: undefined,
           shellAccess: false,
           requireWorktree: false,
+          worktreeMode: "local",
+          worktreeBaseBranch: undefined,
           allowUserInput: true,
           humanInputPolicy: "hard_blockers",
           toolRestrictions: ["*"],
@@ -5684,6 +5700,16 @@ export class AgentDaemon extends EventEmitter {
     })();
 
     mergedAgentConfig = resolveWorkerRoleAgentConfig(workerRole, mergedAgentConfig);
+    // Bounded public-source workers can surface an inherited network ask in
+    // their interactive parent's chat. The fixed tool allowlist still applies.
+    if (
+      workerRole === "web_researcher" &&
+      parent &&
+      !mergedAutonomousMode &&
+      canAnswerInlineApproval(parent, { headless: isHeadlessMode() })
+    ) {
+      mergedAgentConfig = { ...mergedAgentConfig, teamWorkItemLane: true, allowUserInput: true };
+    }
 
     const task = this.taskRepo.create(
       {
@@ -6111,6 +6137,21 @@ export class AgentDaemon extends EventEmitter {
       }
       this.emitTeamRunEvent({ type: "team_run_created", timestamp: Date.now(), run });
       void this.teamOrchestrator.tickRun(run.id, "daemon_programmatic_multitask");
+      return true;
+    }
+
+    if (isCollaborativeExecutionTask(task)) {
+      const reviewer = members.find((member) => member.id !== leader.id) || leader;
+      for (const [i, lane] of collaborativeExecutionLanes(leader.id, reviewer.id).entries()) {
+        teamItemRepo.create({
+          teamRunId: run.id,
+          ...lane,
+          status: "todo",
+          sortOrder: (i + 1) * 10,
+        });
+      }
+      this.emitTeamRunEvent({ type: "team_run_created", timestamp: Date.now(), run });
+      void this.teamOrchestrator.tickRun(run.id, "daemon_programmatic_collab");
       return true;
     }
 
@@ -8053,6 +8094,7 @@ export class AgentDaemon extends EventEmitter {
           approvalType: type,
           reason: "assistant_input_denied",
         });
+        AgentDaemon.prototype["relayApprovalReply"].call(this, taskId, response);
       }
       return approved;
     } catch (error) {
@@ -8113,6 +8155,29 @@ export class AgentDaemon extends EventEmitter {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       if (abortListener && signal) signal.removeEventListener("abort", abortListener);
     }
+  }
+
+  /**
+   * A typed reply on an approval card ("Other") denies the operation, and the
+   * tool only learns "not approved". The reply usually says what to do instead,
+   * so deliver it like a message typed into the composer: the running step
+   * reads it at its next turn boundary.
+   */
+  private relayApprovalReply(taskId: string, response: InputRequestResponse): void {
+    if (response.status !== "submitted") return;
+    const reply = Object.values(response.answers || {})
+      .map((answer) => (typeof answer?.otherText === "string" ? answer.otherText.trim() : ""))
+      .find(Boolean);
+    if (!reply || typeof (this as Any).sendMessage !== "function") return;
+    void this.sendMessage(
+      taskId,
+      `Reply to your permission request (the operation was not run): ${reply}`,
+      undefined,
+      undefined,
+      { deliveryMode: "follow_up", messageSource: "user" },
+    ).catch((error) => {
+      log.warn(`Could not deliver the approval reply to task ${taskId}:`, error);
+    });
   }
 
   /** Dismiss the task's open approval card and release its waiter. */
@@ -10617,7 +10682,7 @@ export class AgentDaemon extends EventEmitter {
     }
 
     const task = this.taskRepo.findById(taskId);
-    if (!task) return;
+    if (!task || !DurableContextService.canCapture(task.workspaceId, taskId)) return;
 
     // Event-driven captures can run after the executor has paused or finished.
     // Resolve the live task profile here so automatic memory mirroring cannot
@@ -11909,7 +11974,11 @@ export class AgentDaemon extends EventEmitter {
 
     const task = this.taskRepo.findById(taskId);
     if (!task) return;
-    if (taskDisablesMemoryCapture(task)) return;
+    if (
+      taskDisablesMemoryCapture(task) ||
+      !DurableContextService.canCapture(task.workspaceId, taskId)
+    )
+      return;
 
     let effectiveMemoryWorkspace: Workspace | undefined;
     try {
@@ -14884,6 +14953,12 @@ export class AgentDaemon extends EventEmitter {
       existingTask.agentConfig?.executionMode === "chat" &&
       existingTask.agentConfig?.executionModeSource === "user";
     if (isChatSession) {
+      // A child chat task (team synthesis) hands its answer to the parent through
+      // resultSummary; an interactive chat turn has no summary to keep.
+      const handoffSummary =
+        existingTask.parentTaskId && typeof resultSummary === "string" && resultSummary.trim()
+          ? resultSummary.trim()
+          : undefined;
       const completedAt = Date.now();
       const lastRunDurationMs = this.calculateLatestRunDurationMs(
         taskId,
@@ -14897,7 +14972,7 @@ export class AgentDaemon extends EventEmitter {
         error: null,
         terminalStatus: undefined,
         failureClass: undefined,
-        resultSummary: undefined,
+        resultSummary: handoffSummary,
         bestKnownOutcome: undefined,
         budgetUsage: metadata?.budgetUsage,
         // Reliability outcomes (coreOutcome, dependencyOutcome, failureDomains,
@@ -15884,7 +15959,12 @@ export class AgentDaemon extends EventEmitter {
     try {
       const isTopLevelTask =
         existingTask && !existingTask.parentTaskId && (existingTask.agentType ?? "main") === "main";
-      if (isCompletedOutcome && isTopLevelTask && !taskDisablesMemoryCapture(existingTask)) {
+      if (
+        isCompletedOutcome &&
+        isTopLevelTask &&
+        !taskDisablesMemoryCapture(existingTask) &&
+        DurableContextService.canCapture(existingTask.workspaceId, taskId)
+      ) {
         const workspaceName = this.workspaceRepo.findById(existingTask.workspaceId)?.name;
         PersonalityManager.recordTaskCompleted(workspaceName);
         const gatewayContext = existingTask.agentConfig?.gatewayContext ?? "private";

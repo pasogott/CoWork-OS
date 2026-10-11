@@ -1,3 +1,7 @@
+import {
+  collaborativeExecutionLanes,
+  isCollaborativeExecutionTask,
+} from "../agents/collaborative-execution";
 import { closeBrowserTabViewsForTask } from "../browser/browser-tab-views";
 import { ComposerPredictionCoordinator } from "../agent/ComposerPredictionCoordinator";
 import {
@@ -4988,6 +4992,16 @@ export async function setupIpcHandlers(
                 sortOrder: (i + 1) * 10,
               });
             }
+          } else if (isCollaborativeExecutionTask(task)) {
+            const reviewer = members.find((member) => member.id !== leader.id) || leader;
+            for (const [i, lane] of collaborativeExecutionLanes(leader.id, reviewer.id).entries()) {
+              await teamItemRepo.create({
+                teamRunId: run.id,
+                ...lane,
+                status: "todo",
+                sortOrder: (i + 1) * 10,
+              });
+            }
           } else {
             // One item per agent — each gets the full prompt (Grok model).
             // Exclude "Synthesis" role from initial items — it is created only after all
@@ -9275,6 +9289,8 @@ export async function setupIpcHandlers(
       displayName: u.displayName,
       username: u.username,
       allowed: u.allowed,
+      allowedDm: u.allowedDm,
+      allowedGroup: u.allowedGroup,
       lastSeenAt: u.lastSeenAt,
     }));
   });
@@ -9305,13 +9321,18 @@ export async function setupIpcHandlers(
   ipcMain.handle(IPC_CHANNELS.GATEWAY_GRANT_ACCESS, async (_, data) => {
     if (!gateway) throw new Error("Gateway not initialized");
     const validated = validateInput(GrantAccessSchema, data, "grant access");
-    await gateway.grantUserAccess(validated.channelId, validated.userId, validated.displayName);
+    await gateway.grantUserAccess(
+      validated.channelId,
+      validated.userId,
+      validated.displayName,
+      validated.contextType,
+    );
   });
 
   ipcMain.handle(IPC_CHANNELS.GATEWAY_REVOKE_ACCESS, async (_, data) => {
     if (!gateway) throw new Error("Gateway not initialized");
     const validated = validateInput(RevokeAccessSchema, data, "revoke access");
-    await gateway.revokeUserAccess(validated.channelId, validated.userId);
+    await gateway.revokeUserAccess(validated.channelId, validated.userId, validated.contextType);
   });
 
   ipcMain.handle(IPC_CHANNELS.GATEWAY_GENERATE_PAIRING, async (_, data) => {
@@ -9321,6 +9342,7 @@ export async function setupIpcHandlers(
       validated.channelId,
       validated.userId,
       validated.displayName,
+      validated.contextType,
     );
   });
 
@@ -13408,12 +13430,48 @@ function setupMemoryHandlers(
   });
 
   // Clear all memories for a workspace
+  ipcMain.handle(IPC_CHANNELS.MEMORY_CLEAR_SCOPE, async (_, rawWorkspaceId: unknown) => {
+    const workspaceId = validateInput(WorkspaceIdSchema, rawWorkspaceId, "workspace id");
+    return MemoryWorkspacePurgeService.getClearScope(workspaceId);
+  });
+  ipcMain.handle(IPC_CHANNELS.MEMORY_CLEAR_SESSION, async (_, input: unknown) => {
+    checkRateLimit(IPC_CHANNELS.MEMORY_CLEAR_SESSION, RATE_LIMIT_CONFIGS.limited);
+    if (!input || typeof input !== "object")
+      throw new Error("A workspace and session are required.");
+    const { workspaceId: rawWorkspaceId, taskId: rawTaskId } = input as Record<string, unknown>;
+    const workspaceId = validateInput(WorkspaceIdSchema, rawWorkspaceId, "workspace id");
+    const taskId = validateInput(
+      z
+        .string()
+        .min(1)
+        .max(200)
+        .regex(/^[A-Za-z0-9_-]+$/),
+      rawTaskId,
+      "session id",
+    );
+    return MemoryWorkspacePurgeService.purgeSession(workspaceId, taskId);
+  });
   ipcMain.handle(IPC_CHANNELS.MEMORY_CLEAR, async (_, rawWorkspaceId: unknown) => {
     checkRateLimit(IPC_CHANNELS.MEMORY_CLEAR, RATE_LIMIT_CONFIGS.limited);
     try {
-      const workspaceId = validateInput(WorkspaceIdSchema, rawWorkspaceId, "workspace id");
+      const input =
+        typeof rawWorkspaceId === "object" && rawWorkspaceId !== null
+          ? (rawWorkspaceId as Record<string, unknown>)
+          : null;
+      const workspaceId = validateInput(
+        WorkspaceIdSchema,
+        input ? input.workspaceId : rawWorkspaceId,
+        "workspace id",
+      );
+      const expectedTaskIds = input
+        ? validateInput(
+            z.array(z.string().min(1).max(200)).max(100000),
+            input.expectedTaskIds,
+            "previewed session ids",
+          )
+        : undefined;
       // Every memory store for the workspace, with per-store counts for the UI.
-      return await MemoryWorkspacePurgeService.purgeWorkspace({ id: workspaceId });
+      return await MemoryWorkspacePurgeService.purgeWorkspace({ id: workspaceId, expectedTaskIds });
     } catch (error) {
       logger.error("[Memory] Failed to clear:", error);
       throw error;

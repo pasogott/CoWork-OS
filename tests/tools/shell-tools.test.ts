@@ -4,6 +4,9 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 
 const sandboxMocks = vi.hoisted(() => ({
   sandbox: {
@@ -189,7 +192,7 @@ describe("ShellTools auto-approval", () => {
 
     await expect(
       brokerShellTools.runCommand(SAFE_CMD_1, { cwd: neverWorkspace.path }),
-    ).rejects.toThrow("User denied command execution");
+    ).rejects.toThrow("Command execution was not approved");
     expect(authorizeToolAction).toHaveBeenCalledTimes(1);
     expect(requestApproval).not.toHaveBeenCalled();
     expect(sandboxMocks.createSandbox).not.toHaveBeenCalled();
@@ -218,6 +221,61 @@ describe("ShellTools auto-approval", () => {
     expect(sigA).toBe(sigB);
     expect(sigA).toContain("<num>");
     expect(sigA).toContain("<id>");
+  });
+
+  it("shares the result of a verification that is still in flight", async () => {
+    let complete!: (result: Any) => void;
+    sandboxMocks.sandbox.execute.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const command = "npm run type-check -- --concurrent-fixture";
+    const first = shellTools.runCommand(command);
+    await vi.waitFor(() => expect(sandboxMocks.sandbox.execute).toHaveBeenCalledTimes(1));
+    const second = shellTools.runCommand(command);
+    await vi.waitFor(() =>
+      expect(mockDaemon.logEvent).toHaveBeenCalledWith("task-1", "log", {
+        message: "Reusing concurrent workspace verification command result",
+      }),
+    );
+    complete({ exitCode: 0, stdout: "passed", stderr: "" });
+    const results = await Promise.all([first, second]);
+    expect(results).toEqual([
+      expect.objectContaining({ success: true, stdout: "passed" }),
+      expect.objectContaining({ success: true, stdout: "passed" }),
+    ]);
+    expect(sandboxMocks.sandbox.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("executes each verification again after source changes instead of returning a stale result", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cowork-verification-"));
+    const source = path.join(dir, "source.ts");
+    sandboxMocks.sandbox.execute.mockImplementation(async () => {
+      const valid = fs.readFileSync(source, "utf8") === "valid";
+      return { exitCode: valid ? 0 : 1, stdout: valid ? "passed" : "failed", stderr: "" };
+    });
+    try {
+      fs.writeFileSync(source, "valid");
+      expect(await shellTools.runCommand("npm run type-check")).toMatchObject({
+        success: true,
+        stdout: "passed",
+      });
+      fs.writeFileSync(source, "invalid");
+      expect(await shellTools.runCommand("npm run type-check")).toMatchObject({
+        success: false,
+        stdout: "failed",
+      });
+      fs.writeFileSync(source, "valid");
+      expect(await shellTools.runCommand("npm run type-check")).toMatchObject({
+        success: true,
+        stdout: "passed",
+      });
+      expect(sandboxMocks.sandbox.execute).toHaveBeenCalledTimes(3);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("does not share a signature between different interpreter payloads", () => {
@@ -440,7 +498,7 @@ describe("ShellTools auto-approval", () => {
     expect(first.success).toBe(true);
 
     await expect(shellTools.runCommand("sudo -n true")).rejects.toThrow(
-      "User denied command execution",
+      "Command execution was not approved",
     );
     expect(mockDaemon.requestApproval).toHaveBeenCalledTimes(2);
     expect((mockDaemon.requestApproval as any).mock.calls[1][2]).toBe(
@@ -697,7 +755,9 @@ describe("ShellTools auto-approval", () => {
         expect.objectContaining({ allowNetwork: true }),
       );
       authorizeToolAction.mockResolvedValue(false);
-      await expect(tools.runCommand(SAFE_CMD_1)).rejects.toThrow("User denied command execution");
+      await expect(tools.runCommand(SAFE_CMD_1)).rejects.toThrow(
+        "Command execution was not approved",
+      );
       expect(authorizeToolAction).toHaveBeenLastCalledWith(
         "task-network",
         expect.objectContaining({
@@ -719,7 +779,9 @@ describe("ShellTools auto-approval", () => {
       "does not start a process when network approval is denied: %s",
       async (command) => {
         authorizeToolAction.mockResolvedValue(false);
-        await expect(tools.runCommand(command)).rejects.toThrow("User denied command execution");
+        await expect(tools.runCommand(command)).rejects.toThrow(
+          "Command execution was not approved",
+        );
         expect(sandboxMocks.createSandbox).not.toHaveBeenCalled();
       },
     );
@@ -763,7 +825,7 @@ describe("ShellTools auto-approval", () => {
         tools.runCommand(command, {
           env: { HTTPS_PROXY: "http://127.0.0.1:8787" },
         }),
-      ).rejects.toThrow("User denied command execution");
+      ).rejects.toThrow("Command execution was not approved");
       expect(sandboxMocks.createSandbox).not.toHaveBeenCalled();
       expect(mockShellSessionManager.runCommand).not.toHaveBeenCalled();
     });
@@ -851,7 +913,9 @@ describe("ShellTools auto-approval", () => {
       process.env.COWORK_ALLOW_UNSANDBOXED_SHELL = "1";
       sandboxMocks.createSandbox.mockResolvedValue({ type: "none", cleanup: vi.fn() } as never);
       authorizeToolAction.mockResolvedValue(false);
-      await expect(tools.runCommand(SAFE_CMD_1)).rejects.toThrow("User denied command execution");
+      await expect(tools.runCommand(SAFE_CMD_1)).rejects.toThrow(
+        "Command execution was not approved",
+      );
       expect(sandboxMocks.createSandbox).not.toHaveBeenCalled();
       expect(mockShellSessionManager.runCommand).not.toHaveBeenCalled();
     });

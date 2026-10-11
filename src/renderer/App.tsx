@@ -26,6 +26,12 @@ import { useTaskDuration } from "./hooks/useTaskDuration";
 import { useComposerDraft } from "./hooks/useComposerDraft";
 import { ArrowLeft, ArrowRight } from "lucide-react";
 import { Sidebar } from "./components/Sidebar";
+import {
+  EMPTY_HOME_SESSIONS,
+  buildHomeSessions,
+  sameHomeSessions,
+  type HomeSessions,
+} from "./utils/home-sessions";
 import { SidebarRail } from "./components/sidebar/SidebarRail";
 import { TITLE_BAR_CONTEXT_SLOT_ID } from "./utils/title-bar-slot";
 import { useMainColumnRightEdge } from "./hooks/useMainColumnRightEdge";
@@ -208,8 +214,11 @@ import {
 } from "./utils/renderer-perf";
 import {
   deriveSharedTaskEventUiState,
+  scopeEventsToTask,
   type SharedTaskEventUiState,
 } from "./utils/task-event-derived";
+import { deferredInputForSelectedTask } from "./utils/deferred-task-input";
+import { reconcilePendingInputRequests } from "./utils/pending-input-requests";
 import { isTaskActivelyWorking } from "./utils/task-working-state";
 import { deriveReplayTaskSnapshot } from "./utils/task-replay-state";
 import {
@@ -767,6 +776,7 @@ type SideChatState = {
 
 type SelectedTaskWorkspaceViewProps = {
   task: Task | undefined;
+  homeSessions: HomeSessions;
   selectedTaskId: string | null;
   workspace: Workspace | null;
   replayControls: ReplayControls;
@@ -955,6 +965,7 @@ function getInputRequestsSignature(inputRequests: InputRequest[]): string {
 const SelectedTaskWorkspaceView = memo(
   function SelectedTaskWorkspaceView({
     task,
+    homeSessions,
     selectedTaskId,
     workspace,
     replayControls,
@@ -1723,6 +1734,7 @@ const SelectedTaskWorkspaceView = memo(
           <div className="selected-workspace-main-row">
             <Suspense fallback={<TaskViewSkeleton />}>
               <MainContent
+                key={task?.id || "empty"}
                 headerPlacement="title-bar"
                 rightPanelOpen={!effectiveRightCollapsed && !remoteTaskView}
                 task={task}
@@ -1749,6 +1761,7 @@ const SelectedTaskWorkspaceView = memo(
                 onSelectBotConversation={onSelectBotConversation}
                 onNewBotConversation={onNewBotConversation}
                 onSelectTask={onSelectTask}
+                homeSessions={homeSessions}
                 onSendMessage={onSendMessage}
                 onStartOnboarding={onStartOnboarding}
                 onStartFreshSession={onStartFreshSession}
@@ -2368,6 +2381,14 @@ export function App() {
         : undefined),
     [botConversationTasks, remoteTaskView, tasks, selectedTaskId],
   );
+  // Only the home screen lists sessions; keep the reference stable across task updates
+  // that don't change what it shows, so the memoized workspace view doesn't re-render.
+  const homeSessionsRef = useRef<HomeSessions>(EMPTY_HOME_SESSIONS);
+  const homeSessions = useMemo(() => {
+    const next = selectedTask ? EMPTY_HOME_SESSIONS : buildHomeSessions(tasks);
+    if (!sameHomeSessions(homeSessionsRef.current, next)) homeSessionsRef.current = next;
+    return homeSessionsRef.current;
+  }, [selectedTask, tasks]);
   const selectedBotConversationProjection = useMemo(
     () =>
       selectedTask?.agentConfig?.botConversation && !remoteTaskView
@@ -4170,28 +4191,38 @@ export function App() {
       });
   }, []);
 
-  useEffect(() => {
+  // Live events keep input cards current; this re-sync from the main process repairs a
+  // missed event (for example after a renderer reload) and drops cards answered elsewhere.
+  const resyncPendingInputRequests = useCallback(async () => {
     if (!window.electronAPI?.listInputRequests) return;
-    let cancelled = false;
-    window.electronAPI
-      .listInputRequests({ limit: 200, offset: 0, status: "pending" })
-      .then((requests) => {
-        if (cancelled) return;
-        pendingInputRequestsRef.current.clear();
-        for (const request of requests || []) {
-          if (request?.id) {
-            pendingInputRequestsRef.current.set(request.id, request);
-          }
-        }
-        syncPendingInputRequests();
-      })
-      .catch((error) => {
-        console.error("Failed to load pending input requests:", error);
+    const startedAt = Date.now();
+    try {
+      const requests = await window.electronAPI.listInputRequests({
+        limit: 200,
+        offset: 0,
+        status: "pending",
       });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+      pendingInputRequestsRef.current = reconcilePendingInputRequests(
+        requests || [],
+        pendingInputRequestsRef.current,
+        startedAt,
+      );
+      syncPendingInputRequests();
+    } catch (error) {
+      console.error("Failed to load pending input requests:", error);
+    }
+  }, [syncPendingInputRequests]);
+
+  // Also on every session switch: opening a session shows its current requests.
+  useEffect(() => {
+    void resyncPendingInputRequests();
+  }, [resyncPendingInputRequests, selectedTaskId]);
+
+  useEffect(() => {
+    const onFocus = () => void resyncPendingInputRequests();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [resyncPendingInputRequests]);
 
   // Subscribe to live remote task events when viewing a remote task
   useEffect(() => {
@@ -6628,7 +6659,11 @@ export function App() {
   const deferredEvents = useDeferredValue(events);
   const selectedTaskUsesLiveProjection =
     !replayControls.isReplayMode && isTaskPossiblyRunning(selectedTask?.status);
-  const projectedTaskEvents = selectedTaskUsesLiveProjection ? deferredEvents : events;
+  const projectedTaskEvents = useMemo(
+    () =>
+      scopeEventsToTask(selectedTaskUsesLiveProjection ? deferredEvents : events, selectedTask?.id),
+    [selectedTaskUsesLiveProjection, deferredEvents, events, selectedTask?.id],
+  );
   const sharedTaskEventUi = useMemo(
     () =>
       measureRendererPerf("App.sharedTaskEventUi", rendererPerfLoggingEnabled, () =>
@@ -6733,11 +6768,19 @@ export function App() {
     if (remoteTaskView) return null;
     if (!selectedTaskId) return null;
     const candidates = pendingInputRequests.filter(
-      (request) => request.taskId === selectedTaskId && request.status === "pending",
+      (request) =>
+        request.status === "pending" &&
+        (request.taskId === selectedTaskId ||
+          childTasks.some(
+            (child) =>
+              child.id === request.taskId &&
+              child.parentTaskId === selectedTaskId &&
+              child.agentConfig?.teamWorkItemLane === true,
+          )),
     );
     if (candidates.length === 0) return null;
     return [...candidates].sort((a, b) => b.requestedAt - a.requestedAt)[0];
-  }, [pendingInputRequests, selectedTaskId, remoteTaskView]);
+  }, [pendingInputRequests, selectedTaskId, remoteTaskView, childTasks]);
 
   const clearRemoteTaskView = useCallback(() => {
     remoteTaskOpenRequestSeqRef.current += 1;
@@ -7005,7 +7048,10 @@ export function App() {
   const handleCreateTaskFromPrompt = async (
     prompt: string,
     attachments: PendingAttachment[] = [],
-    taskOptions?: { accessProfileId?: AccessProfileId },
+    taskOptions?: { accessProfileId?: AccessProfileId } & Pick<
+      AgentConfig,
+      "worktreeMode" | "worktreeBaseBranch"
+    >,
   ): Promise<boolean> => {
     let workspace = currentWorkspace;
     if (!workspace) {
@@ -7045,7 +7091,15 @@ export function App() {
       {
         generateTitle: true,
         ...(taskOptions?.accessProfileId ? { accessProfileId: taskOptions.accessProfileId } : {}),
-        ...(isBuildPrompt(prompt) ? { agentConfig: { taskOrigin: "build" as const } } : {}),
+        ...(isBuildPrompt(prompt)
+          ? {
+              agentConfig: {
+                taskOrigin: "build" as const,
+                worktreeMode: taskOptions?.worktreeMode,
+                worktreeBaseBranch: taskOptions?.worktreeBaseBranch,
+              },
+            }
+          : {}),
       },
       images,
       workspace || undefined,
@@ -7268,7 +7322,7 @@ export function App() {
   const titleBarBrowserTaskId = showTitleBarTerminalToggle ? selectedTask?.id : undefined;
   const visibleRightPanelInput = effectiveRightCollapsed
     ? EMPTY_RIGHT_PANEL_INPUT
-    : deferredRightPanelInput;
+    : deferredInputForSelectedTask(deferredRightPanelInput, rightPanelInput);
 
   const handleRightSidebarToggle = useCallback(() => {
     const startedAtMs = typeof performance !== "undefined" ? performance.now() : null;
@@ -8724,6 +8778,7 @@ export function App() {
               ) : (
                 <SelectedTaskWorkspaceView
                   task={selectedTask}
+                  homeSessions={homeSessions}
                   selectedTaskId={selectedTaskId}
                   workspace={currentWorkspace}
                   onViewRoutine={(routineId) => {

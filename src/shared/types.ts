@@ -884,7 +884,12 @@ export interface OrchestrationNodeNotification {
   verificationReport?: string;
 }
 
-export type WorkerRoleKind = "researcher" | "implementer" | "verifier" | "synthesizer";
+export type WorkerRoleKind =
+  | "researcher"
+  | "web_researcher"
+  | "implementer"
+  | "verifier"
+  | "synthesizer";
 export type DelegationWorkerRole = WorkerRoleKind | "auto";
 
 export type VerificationVerdict = "PASS" | "FAIL" | "PARTIAL";
@@ -1038,30 +1043,44 @@ export type PermissionRuleSource =
 
 export type PermissionPersistenceDestination = "session" | "workspace" | "profile" | "recurring";
 
-export type PermissionRuleScope =
-  | {
-      kind: "tool";
-      toolName: string;
-    }
-  | {
-      kind: "domain";
-      domain: string;
-      toolName?: string;
-      toolPrefix?: string;
-    }
-  | {
-      kind: "path";
-      path: string;
-      toolName?: string;
-    }
-  | {
-      kind: "command_prefix";
-      prefix: string;
-    }
-  | {
-      kind: "mcp_server";
-      serverName: string;
-    };
+export type PermissionEffectClass =
+  | "ordinary"
+  | "network_read"
+  | "data_export"
+  | "protected_credential";
+
+export type PermissionScopeConstraints = {
+  /** Missing only on legacy rules; never authorizes exports or credentials. */
+  effectClass?: PermissionEffectClass;
+  http?: { method: string; hasBody: boolean; hasCustomHeaders: boolean; credentialId?: string };
+};
+
+export type PermissionRuleScope = PermissionScopeConstraints &
+  (
+    | {
+        kind: "tool";
+        toolName: string;
+      }
+    | {
+        kind: "domain";
+        domain: string;
+        toolName?: string;
+        toolPrefix?: string;
+      }
+    | {
+        kind: "path";
+        path: string;
+        toolName?: string;
+      }
+    | {
+        kind: "command_prefix";
+        prefix: string;
+      }
+    | {
+        kind: "mcp_server";
+        serverName: string;
+      }
+  );
 
 export interface PermissionRule {
   id?: string;
@@ -2100,6 +2119,7 @@ export interface TaskStrategySnapshot {
   directResponseMode: DirectResponseMode;
   preflightGates: PreflightGate[];
   workflowMode: WorkflowMode;
+  requiresDelegation?: boolean;
   llmProfileHint?: LlmProfile;
   confidence: number;
   overrides: StrategyOverride[];
@@ -2272,6 +2292,10 @@ export interface AgentConfig {
   teamWorkItemLane?: boolean;
   /** Require git worktree isolation for this task and fail fast if unavailable. */
   requireWorktree?: boolean;
+  /** Per-task checkout choice. Omit to use the global worktree setting. */
+  worktreeMode?: "local" | "worktree";
+  /** Existing local branch to base a new isolated checkout on; omit for HEAD. */
+  worktreeBaseBranch?: string;
   /**
    * Optional allow-list of approval types that may be auto-approved when
    * autonomousMode is enabled. Omit to preserve legacy "approve all" behavior.
@@ -2663,6 +2687,14 @@ export type WorktreeStatus =
   | "conflict" // Merge conflict detected
   | "cleaned" // Worktree removed after completion
   | "failed"; // Worktree setup or operation failed
+
+export interface WorktreeWorkspaceInfo {
+  workspaceId: string;
+  available: boolean;
+  reason?: string;
+  currentBranch?: string;
+  branches: string[];
+}
 
 export interface WorktreeInfo {
   taskId: string;
@@ -4988,6 +5020,19 @@ export interface RequestUserInputQuestion {
   id: string; // snake_case
   question: string;
   options: RequestUserInputOption[]; // 2..3 options
+  /**
+   * Exact content an approval covers (for example the AppleScript to run), shown verbatim
+   * in a scrollable block. Set only by the main process for approvals; agent questions
+   * never carry one.
+   */
+  preview?: RequestUserInputPreview;
+}
+
+export interface RequestUserInputPreview {
+  label: string;
+  text: string;
+  /** Characters left out when the content was longer than the card shows. */
+  omittedChars?: number;
 }
 
 export interface RequestUserInputArgs {
@@ -8592,6 +8637,8 @@ export const IPC_CHANNELS = {
   MEMORY_GET_RECENT: "memory:getRecent",
   MEMORY_GET_STATS: "memory:getStats",
   MEMORY_CLEAR: "memory:clear",
+  MEMORY_CLEAR_SCOPE: "memory:clearScope",
+  MEMORY_CLEAR_SESSION: "memory:clearSession",
   MEMORY_OBSERVATIONS_SEARCH: "memoryObservations:search",
   MEMORY_OBSERVATIONS_TIMELINE: "memoryObservations:timeline",
   MEMORY_OBSERVATIONS_DETAILS: "memoryObservations:details",
@@ -8748,6 +8795,7 @@ export const IPC_CHANNELS = {
 
   // Git Worktree operations
   WORKTREE_GET_INFO: "worktree:getInfo",
+  WORKTREE_WORKSPACE_INFO: "worktree:workspaceInfo",
   WORKTREE_LIST: "worktree:list",
   WORKTREE_MERGE: "worktree:merge",
   WORKTREE_CLEANUP: "worktree:cleanup",
@@ -9617,6 +9665,8 @@ export interface ChannelUserData {
   displayName: string;
   username?: string;
   allowed: boolean;
+  allowedDm?: boolean;
+  allowedGroup?: boolean;
   lastSeenAt: number;
 }
 

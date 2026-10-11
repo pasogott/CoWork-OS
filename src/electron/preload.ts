@@ -3849,12 +3849,35 @@ contextBridge.exposeInMainWorld("electronAPI", {
     >,
   sendGatewayTestMessage: (data: { channelType: string; channelDbId?: string; chatId: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.GATEWAY_SEND_TEST_MESSAGE, data) as Promise<{ ok: boolean }>,
-  grantGatewayAccess: (channelId: string, userId: string, displayName?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.GATEWAY_GRANT_ACCESS, { channelId, userId, displayName }),
-  revokeGatewayAccess: (channelId: string, userId: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.GATEWAY_REVOKE_ACCESS, { channelId, userId }),
-  generateGatewayPairing: (channelId: string, userId: string, displayName?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.GATEWAY_GENERATE_PAIRING, { channelId, userId, displayName }),
+  grantGatewayAccess: (
+    channelId: string,
+    userId: string,
+    displayName?: string,
+    contextType?: ContextTypeValue | "both",
+  ) =>
+    ipcRenderer.invoke(IPC_CHANNELS.GATEWAY_GRANT_ACCESS, {
+      channelId,
+      userId,
+      displayName,
+      contextType,
+    }),
+  revokeGatewayAccess: (
+    channelId: string,
+    userId: string,
+    contextType?: ContextTypeValue | "both",
+  ) => ipcRenderer.invoke(IPC_CHANNELS.GATEWAY_REVOKE_ACCESS, { channelId, userId, contextType }),
+  generateGatewayPairing: (
+    channelId: string,
+    userId: string,
+    displayName?: string,
+    contextType?: ContextTypeValue,
+  ) =>
+    ipcRenderer.invoke(IPC_CHANNELS.GATEWAY_GENERATE_PAIRING, {
+      channelId,
+      userId,
+      displayName,
+      contextType,
+    }),
 
   // Gateway event listener
   onGatewayMessage: (callback: (data: Any) => void) => {
@@ -4608,7 +4631,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_GET_RECENT, data),
   getMemoryStats: (workspaceId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.MEMORY_GET_STATS, workspaceId),
-  clearMemory: (workspaceId: string) => ipcRenderer.invoke(IPC_CHANNELS.MEMORY_CLEAR, workspaceId),
+  clearMemory: (workspaceId: string, expectedTaskIds?: string[]) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.MEMORY_CLEAR,
+      expectedTaskIds ? { workspaceId, expectedTaskIds } : workspaceId,
+    ),
+  getMemoryClearScope: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MEMORY_CLEAR_SCOPE, workspaceId),
+  clearSessionMemory: (workspaceId: string, taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MEMORY_CLEAR_SESSION, { workspaceId, taskId }),
 
   // Imported Memory APIs
   getImportedMemoryStats: (workspaceId: string) =>
@@ -5584,6 +5615,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
 
   // Git Worktree APIs
+  getWorktreeWorkspaceInfo: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.WORKTREE_WORKSPACE_INFO, workspaceId),
   getWorktreeInfo: (taskId: string) => ipcRenderer.invoke(IPC_CHANNELS.WORKTREE_GET_INFO, taskId),
   listWorktrees: (workspaceId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.WORKTREE_LIST, workspaceId),
@@ -7451,12 +7484,22 @@ export interface ElectronAPI {
     channelDbId?: string;
     chatId: string;
   }) => Promise<{ ok: boolean }>;
-  grantGatewayAccess: (channelId: string, userId: string, displayName?: string) => Promise<void>;
-  revokeGatewayAccess: (channelId: string, userId: string) => Promise<void>;
+  grantGatewayAccess: (
+    channelId: string,
+    userId: string,
+    displayName?: string,
+    contextType?: ContextTypeValue | "both",
+  ) => Promise<void>;
+  revokeGatewayAccess: (
+    channelId: string,
+    userId: string,
+    contextType?: ContextTypeValue | "both",
+  ) => Promise<void>;
   generateGatewayPairing: (
     channelId: string,
     userId: string,
     displayName?: string,
+    contextType?: ContextTypeValue,
   ) => Promise<string>;
   onGatewayMessage: (callback: (data: Any) => void) => () => void;
   onGatewayUsersUpdated: (
@@ -8636,9 +8679,24 @@ export interface ElectronAPI {
   getMemoryObservationBackfillStatus: () => Promise<MemoryObservationBackfillStatus>;
   getRecentMemories: (data: { workspaceId: string; limit?: number }) => Promise<Memory[]>;
   getMemoryStats: (workspaceId: string) => Promise<MemoryStats>;
-  clearMemory: (workspaceId: string) => Promise<{
+  clearMemory: (
+    workspaceId: string,
+    expectedTaskIds?: string[],
+  ) => Promise<{
     success: boolean;
     /** Rows/files removed per memory store (see MemoryWorkspacePurgeService). */
+    counts?: Record<string, number>;
+    errors?: Record<string, string>;
+    notes?: string[];
+  }>;
+  getMemoryClearScope: (
+    workspaceId: string,
+  ) => Promise<{ tasks: Array<{ id: string; title: string; parentTaskId: string | null }> }>;
+  clearSessionMemory: (
+    workspaceId: string,
+    taskId: string,
+  ) => Promise<{
+    success: boolean;
     counts?: Record<string, number>;
     errors?: Record<string, string>;
     notes?: string[];
@@ -9546,6 +9604,9 @@ export interface ElectronAPI {
   onVoiceEvent: (callback: (event: VoiceEventData) => void) => () => void;
 
   // Git Worktree APIs
+  getWorktreeWorkspaceInfo: (
+    workspaceId: string,
+  ) => Promise<import("../shared/types").WorktreeWorkspaceInfo>;
   getWorktreeInfo: (taskId: string) => Promise<Any>;
   listWorktrees: (workspaceId: string) => Promise<Any[]>;
   mergeWorktree: (taskId: string) => Promise<Any>;
