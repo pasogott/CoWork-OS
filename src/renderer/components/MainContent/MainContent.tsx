@@ -6851,7 +6851,10 @@ function MainContentComponent({
     }
   };
 
+  // A started task is bound to its workspace, so the picker only opens before one exists.
+  const isWorkspaceLocked = Boolean(task);
   const handleWorkspaceDropdownToggle = async () => {
+    if (isWorkspaceLocked) return;
     if (!showWorkspaceDropdown) {
       await loadRecentWorkspaces();
     }
@@ -7323,8 +7326,10 @@ function MainContentComponent({
   // Active placeholder: rotating prompt when available, personality fallback otherwise
   const personalityPlaceholder = agentContext.getPlaceholder();
   const hasCliInputContent = inputValue.length > 0 || hasCliInputDomContent;
-  const showCliPlaceholder = !hasCliInputContent && !isCliInputFocused;
-  const showCliEmptyCursor = !hasCliInputContent && isCliInputFocused;
+  // Calm keeps the rotating placeholder while the empty composer has focus and uses the
+  // native caret; other themes swap the placeholder for their own cursor.
+  const showCliPlaceholder = !hasCliInputContent && (isCalm || !isCliInputFocused);
+  const showCliEmptyCursor = !hasCliInputContent && isCliInputFocused && !isCalm;
   const placeholderPlaylist = useMemo(
     () => (rotatingPlaceholders.length > 0 ? rotatingPlaceholders : [personalityPlaceholder]),
     [personalityPlaceholder, rotatingPlaceholders],
@@ -12963,6 +12968,7 @@ function MainContentComponent({
                   <button
                     className="folder-selector"
                     onClick={handleWorkspaceDropdownToggle}
+                    disabled={isWorkspaceLocked}
                     title={workspace?.path || "Select a workspace folder"}
                   >
                     <svg
@@ -13024,6 +13030,7 @@ function MainContentComponent({
             <button
               className="input-status-workspace"
               onClick={handleWorkspaceDropdownToggle}
+              disabled={isWorkspaceLocked}
               title={
                 isBrowserHost
                   ? workspace?.name || "Select project"
