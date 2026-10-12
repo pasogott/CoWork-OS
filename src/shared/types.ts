@@ -40,6 +40,7 @@ export interface AppearanceSettings {
   homeResearchVaultEnabled?: boolean;
   homeNextActionsEnabled?: boolean;
   costReceiptEnabled?: boolean; // Show the Cost section in the right panel (default: off)
+  autoOpenTurnOutput?: boolean; // Open a turn's single new document/sheet/deck/page in the right panel when the turn finishes (default: off)
   subAgentStatsEnabled?: boolean; // Show sub-agent totals in the right panel (default: off)
   language?: string; // Persisted language preference (e.g. 'en', 'ja', 'zh')
   disclaimerAccepted?: boolean;
@@ -8817,6 +8818,10 @@ export const IPC_CHANNELS = {
   SUGGESTIONS_SNOOZE: "suggestions:snooze",
   SUGGESTIONS_EDIT: "suggestions:edit",
   SUGGESTIONS_ACT: "suggestions:act",
+
+  // Shared "needs you" queue (shared/attention.ts): the snapshot, and a signal when it changed
+  ATTENTION_LIST: "attention:list",
+  ATTENTION_CHANGED: "attention:changed",
 
   // Self-improvement loop
   IMPROVEMENT_GET_SETTINGS: "improvement:getSettings",
