@@ -56,11 +56,14 @@ function sources(overrides: Partial<AttentionSources> = {}): AttentionSources {
 
 describe("AttentionService", () => {
   it("merges every source into one ranked snapshot", async () => {
-    const waiting = task("t1", { terminalStatus: "awaiting_approval" });
+    const waiting = task("t1", { status: "blocked", terminalStatus: "awaiting_approval" });
     const service = new AttentionService(
       sources({
         listPendingApprovals: async () => [approval("a1", "t1")],
-        listRecentTasks: async () => [waiting, task("t2", { terminalStatus: "resume_available" })],
+        listRecentTasks: async () => [
+          waiting,
+          task("t2", { status: "interrupted", terminalStatus: "resume_available" }),
+        ],
         listDueCommitments: async () => [{ id: "c1", text: "Send SOW", dueAt: NOW + 1000 }],
         listSuggestions: async () => [
           {
@@ -138,7 +141,11 @@ describe("AttentionService", () => {
     const service = new AttentionService(
       sources({
         listRecentTasks: async () => [
-          task("child", { parentTaskId: "p", terminalStatus: "needs_user_action" }),
+          task("child", {
+            parentTaskId: "p",
+            status: "paused",
+            terminalStatus: "needs_user_action",
+          }),
         ],
       }),
     );
@@ -146,7 +153,11 @@ describe("AttentionService", () => {
   });
 
   it("names agents when it can and carries on when it cannot", async () => {
-    const waiting = task("t1", { terminalStatus: "needs_user_action", assignedAgentRoleId: "r" });
+    const waiting = task("t1", {
+      status: "paused",
+      terminalStatus: "needs_user_action",
+      assignedAgentRoleId: "r",
+    });
     const named = new AttentionService(
       sources({
         listRecentTasks: async () => [waiting],
@@ -165,6 +176,94 @@ describe("AttentionService", () => {
     const snapshot = await unnamed.snapshot();
     expect(snapshot.failedSources).toEqual([]);
     expect(snapshot.items[0].actor).toEqual({ kind: "you", name: "You" });
+  });
+
+  it("lists the roles an item's work belongs to, nearest first", async () => {
+    const bot = task("bot", { status: "executing", assignedAgentRoleId: "bot-role" });
+    // The sub-agent's own parent is not among the recent sessions, so it is looked up.
+    const helper = task("helper", {
+      status: "executing",
+      parentTaskId: "bot",
+      assignedAgentRoleId: "helper-role",
+    });
+    const worker = task("worker", { status: "executing", parentTaskId: "helper" });
+    const elsewhere = task("elsewhere", {
+      status: "executing",
+      workspaceId: "other",
+      assignedAgentRoleId: "other-role",
+    });
+    const stray = task("stray", { status: "executing", parentTaskId: "elsewhere" });
+    const mine = task("mine", { status: "paused", terminalStatus: "needs_user_action" });
+    const findTask = vi.fn(async (id: string) =>
+      [bot, helper, elsewhere].find((candidate) => candidate.id === id),
+    );
+    const service = new AttentionService(
+      sources({
+        listPendingApprovals: async () => [
+          approval("a-worker", "worker"),
+          approval("a-bot", "bot"),
+          approval("a-stray", "stray"),
+        ],
+        listRecentTasks: async () => [worker, stray, mine],
+        findTask,
+      }),
+    );
+    const owners = Object.fromEntries(
+      (await service.snapshot()).items.map((item) => [item.id, item.ownerAgentRoleIds]),
+    );
+    expect(owners).toEqual({
+      "approval:a-worker": ["helper-role", "bot-role"],
+      "approval:a-bot": ["bot-role"],
+      // Delegation never crosses into another workspace.
+      "approval:a-stray": undefined,
+      "session:mine": undefined,
+    });
+  });
+
+  it("reads a waiting session in full to say why it stopped", async () => {
+    const summary = task("t1", { status: "paused", terminalStatus: "needs_user_action" });
+    const findTask = vi.fn(async (id: string) =>
+      id === "t1" ? { ...summary, error: "Approval request timed out" } : undefined,
+    );
+    const service = new AttentionService(
+      sources({ listRecentTasks: async () => [summary], findTask }),
+    );
+    const [item] = (await service.snapshot()).items;
+    expect(item).toMatchObject({
+      id: "session:t1",
+      state: "Response needed",
+      detail: "Its approval request timed out, so it stopped before that step.",
+    });
+    // A session with a recorded pause reason needs no extra read.
+    findTask.mockClear();
+    const coded = new AttentionService(
+      sources({
+        listRecentTasks: async () => [
+          task("t2", {
+            status: "paused",
+            terminalStatus: "needs_user_action",
+            awaitingUserInputReasonCode: "skill_parameters",
+          }),
+        ],
+        findTask,
+      }),
+    );
+    expect((await coded.snapshot()).items[0].detail).toBe(
+      "It needs a few details from you before it can go on.",
+    );
+    expect(findTask).not.toHaveBeenCalled();
+  });
+
+  it("stops at a cycle of parent links", async () => {
+    const a = task("a", { status: "executing", parentTaskId: "b", assignedAgentRoleId: "ra" });
+    const b = task("b", { status: "executing", parentTaskId: "a", assignedAgentRoleId: "rb" });
+    const service = new AttentionService(
+      sources({
+        listPendingApprovals: async () => [approval("x", "a")],
+        listRecentTasks: async () => [a, b],
+      }),
+    );
+    expect((await service.snapshot()).items[0].ownerAgentRoleIds).toEqual(["ra", "rb"]);
   });
 });
 

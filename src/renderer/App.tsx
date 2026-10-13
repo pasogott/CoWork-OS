@@ -1177,7 +1177,7 @@ const SelectedTaskWorkspaceView = memo(
     const closeSpawnedAgentSidebar = useCallback(() => {
       setSpawnedAgentSidebar(null);
     }, []);
-    // The Sub Agents section lives in the right panel, which only mounts when no other side
+    // The Subagents section lives in the right panel, which only mounts when no other side
     // panel is open. Close those so the request lands now, not when they are closed later.
     const viewSubAgents = useCallback(() => {
       setSpreadsheetArtifact(null);
@@ -2002,6 +2002,7 @@ const SelectedTaskWorkspaceView = memo(
                   childEvents={rightPanelInput.childEvents}
                   childUsageByTaskId={rightPanelInput.childUsageByTaskId}
                   onSelectTask={onSelectTask}
+                  onOpenAgent={openSpawnedAgentSidebar}
                   onOpenSpreadsheetArtifact={openSpreadsheetArtifact}
                   onOpenDocumentArtifact={openDocumentArtifact}
                   onOpenPresentationArtifact={openPresentationArtifact}
@@ -3537,7 +3538,7 @@ export function App() {
   const handleRevealRightSidebar = useCallback(() => {
     setRightSidebarCollapsed(false);
   }, []);
-  // Bumped to make the right panel expand and scroll to its Sub Agents section.
+  // Bumped to make the right panel expand and scroll to its Subagents section.
   const [subAgentsFocusRequest, setSubAgentsFocusRequest] = useState(0);
   const handleViewSubAgents = useCallback(() => {
     setRightSidebarCollapsed(false);
@@ -8105,6 +8106,15 @@ export function App() {
   const canShowNotifications =
     !isBrowserHost ||
     (hasHostCapability("notifications.read") && hasHostCapability("notifications.manage"));
+  // The memoized sidebar bell calls the latest navigation handlers, so its memo only has to
+  // follow its data: the queue snapshot.
+  const bellHandlersRef = useRef({ attention: handleAttentionClick, today: handleClearTaskView });
+  bellHandlersRef.current = { attention: handleAttentionClick, today: handleClearTaskView };
+  const openAttentionFromBell = useCallback(
+    (item: AttentionItem) => bellHandlersRef.current.attention(item),
+    [],
+  );
+  const openTodayFromBell = useCallback(() => bellHandlersRef.current.today(), []);
   // The bell lives in the panel header; the title bar shows it when the panel is hidden.
   const sidebarNotificationBell = useMemo(
     () =>
@@ -8113,11 +8123,17 @@ export function App() {
           placement="sidebar"
           onNotificationClick={handleNotificationClick}
           attention={attentionSnapshot.fromQueue ? attentionSnapshot.items : undefined}
-          onAttentionClick={handleAttentionClick}
-          onOpenToday={handleClearTaskView}
+          onAttentionClick={openAttentionFromBell}
+          onOpenToday={openTodayFromBell}
         />
       ) : null,
-    [canShowNotifications, handleNotificationClick],
+    [
+      attentionSnapshot,
+      canShowNotifications,
+      handleNotificationClick,
+      openAttentionFromBell,
+      openTodayFromBell,
+    ],
   );
   const showTitleBarNotifications =
     canShowNotifications && (leftSidebarCollapsed || !SIDEBAR_SHELL_VIEWS.has(currentView));
@@ -8819,6 +8835,7 @@ export function App() {
                 <main className="main-content mission-control-main">
                   <MissionControlPanel
                     onOpenAgents={() => setCurrentView("agents")}
+                    onOpenAttention={handleAttentionClick}
                     initialCompanyId={missionControlInitialCompanyId}
                     initialIssueId={missionControlInitialIssueId}
                   />
