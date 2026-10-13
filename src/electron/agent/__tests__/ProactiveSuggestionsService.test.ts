@@ -229,6 +229,62 @@ describe("ProactiveSuggestionsService", () => {
     );
   });
 
+  it("keeps a follow-up as a commitment due a day later, and records it as acted on", async () => {
+    seedSuggestion("ws-1", "s4", "Send Dana the Q3 proposal");
+    const remember = vi.fn(async () => true);
+    vi.doMock("../../memory/RelationshipMemoryService", () => ({
+      RelationshipMemoryService: { rememberUserCommitment: remember },
+    }));
+    const { ProactiveSuggestionsService } = await import("../ProactiveSuggestionsService");
+    const now = Date.now();
+
+    expect(await ProactiveSuggestionsService.addAsCommitment("ws-1", "missing", now)).toEqual({
+      ok: false,
+      reason: "not_found",
+    });
+    expect(await ProactiveSuggestionsService.addAsCommitment("ws-1", "s4", now)).toEqual({
+      ok: true,
+    });
+    expect(remember).toHaveBeenCalledWith({
+      text: "Send Dana the Q3 proposal",
+      dueAt: now + 24 * 60 * 60 * 1000,
+      suggestionId: "s4",
+    });
+    expect(profile.db!.prepare("SELECT status FROM suggestions WHERE id = 's4'").get()).toEqual({
+      status: "acted_on",
+    });
+
+    // Not saved: the suggestion stays open.
+    seedSuggestion("ws-1", "s5", "Call the venue");
+    remember.mockResolvedValueOnce(false);
+    expect(await ProactiveSuggestionsService.addAsCommitment("ws-1", "s5", now)).toEqual({
+      ok: false,
+      reason: "unavailable",
+    });
+    expect(profile.db!.prepare("SELECT status FROM suggestions WHERE id = 's5'").get()).toEqual({
+      status: "active",
+    });
+    vi.doUnmock("../../memory/RelationshipMemoryService");
+  });
+
+  it("reads a suggestion for a card action only while it is still shown", async () => {
+    seedSuggestion("ws-1", "s6", "Block focus time for the deck");
+    seedSuggestion("ws-1", "s7", "Old idea", Date.now() - 2 * SEVEN_DAYS);
+    const { ProactiveSuggestionsService } = await import("../ProactiveSuggestionsService");
+
+    expect((await ProactiveSuggestionsService.getActive("ws-1", "s6"))?.title).toBe(
+      "Block focus time for the deck",
+    );
+    expect(await ProactiveSuggestionsService.getActive("ws-1", "missing")).toBeNull();
+    expect(await ProactiveSuggestionsService.getActive("ws-1", "s7")).toBeNull();
+    await ProactiveSuggestionsService.actOn("ws-1", "s6");
+    expect(await ProactiveSuggestionsService.getActive("ws-1", "s6")).toBeNull();
+    // The stored status counts too, not only the ids this run remembers.
+    seedSuggestion("ws-1", "s8", "Plan the offsite");
+    profile.db!.prepare("UPDATE suggestions SET status = 'dismissed' WHERE id = 's8'").run();
+    expect(await ProactiveSuggestionsService.getActive("ws-1", "s8")).toBeNull();
+  });
+
   it("stores nothing when memory settings do not allow it", async () => {
     gate.enabled = false;
     const { ProactiveSuggestionsService } = await import("../ProactiveSuggestionsService");

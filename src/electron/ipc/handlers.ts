@@ -568,8 +568,20 @@ import {
 import { setupMemoryReviewHandlers } from "./memory-review-handlers";
 import { setupAttentionHandlers } from "./attention-handlers";
 import { createAgentRoleAssignmentHandler } from "./agent-role-assignment-handlers";
+import { setupCalendarHandlers } from "./calendar-handlers";
+import { setupMailReplyDraftHandlers } from "./mail-reply-draft-handlers";
+import {
+  MailReplyDraftsService,
+  type MailReplyDraftsState,
+} from "../mailbox/MailReplyDraftsService";
+import { mailboxLlmReplyDraft } from "../mailbox/mailbox-inbox-product-llm";
+import { CalendarService } from "../calendar/CalendarService";
+import { CalendarProposalsService } from "../calendar/CalendarProposalsService";
+import { googleCalendarRequest } from "../utils/google-calendar-api";
+import { googleWorkspaceScopeReady } from "../agent/tools/integration-effect-guard";
 import { AttentionService } from "../attention/AttentionService";
 import {
+  listMemoryChangesAcross,
   listSuggestionsAcross,
   listWaitingFlowSteps,
   toAttentionCommitment,
@@ -1150,6 +1162,7 @@ rateLimiter.configure(IPC_CHANNELS.SUGGESTIONS_DISMISS, RATE_LIMIT_CONFIGS.limit
 rateLimiter.configure(IPC_CHANNELS.SUGGESTIONS_SNOOZE, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.SUGGESTIONS_EDIT, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.SUGGESTIONS_ACT, RATE_LIMIT_CONFIGS.limited);
+rateLimiter.configure(IPC_CHANNELS.SUGGESTIONS_ADD_COMMITMENT, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.LLM_SAVE_SETTINGS, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.LLM_RESET_PROVIDER_CREDENTIALS, RATE_LIMIT_CONFIGS.limited);
 rateLimiter.configure(IPC_CHANNELS.LLM_TEST_PROVIDER, RATE_LIMIT_CONFIGS.expensive);
@@ -10790,6 +10803,21 @@ export async function setupIpcHandlers(
     },
   );
 
+  ipcMain.handle(
+    IPC_CHANNELS.SUGGESTIONS_ADD_COMMITMENT,
+    async (_, workspaceId: string, suggestionId: string) => {
+      checkRateLimit(IPC_CHANNELS.SUGGESTIONS_ADD_COMMITMENT);
+      const validatedWorkspaceId = validateInput(WorkspaceIdSchema, workspaceId, "workspace ID");
+      const validatedSuggestionId = validateInput(UUIDSchema, suggestionId, "suggestion ID");
+      const { ProactiveSuggestionsService } = await import("../agent/ProactiveSuggestionsService");
+      // The text comes from the stored suggestion, never from the renderer.
+      return ProactiveSuggestionsService.addAsCommitment(
+        validatedWorkspaceId,
+        validatedSuggestionId,
+      );
+    },
+  );
+
   // Task Board handlers
   ipcMain.handle(IPC_CHANNELS.TASK_MOVE_COLUMN, async (_, taskId: string, column: string) => {
     checkRateLimit(IPC_CHANNELS.TASK_MOVE_COLUMN);
@@ -11184,9 +11212,72 @@ export async function setupIpcHandlers(
     },
   });
 
+  // Shared by Memory Hub "Review" and the needs-you queue, which lists recent expiries.
+  const memoryReviewService = createMemoryReviewService(db);
+
+  // Today's calendar cards read the connected Google Calendar (cached briefly) and change it
+  // only on the user's click, after re-reading it.
+  const calendarService = new CalendarService({
+    isConnected: () =>
+      googleWorkspaceScopeReady(
+        GoogleWorkspaceSettingsManager.loadSettings(),
+        "workspace",
+        "workspace",
+      ),
+    request: (request) =>
+      googleCalendarRequest(GoogleWorkspaceSettingsManager.loadSettings(), request),
+    accountKey: () => {
+      const settings = GoogleWorkspaceSettingsManager.loadSettings();
+      return settings.activeAccountEmail || settings.loginHint || "";
+    },
+  });
+  // Reply drafts on Today (opt-in): a few drafted replies a day, sent only on the user's click.
+  let notifyAttentionChanged = () => {};
+  const mailReplyDrafts = new MailReplyDraftsService({
+    mailbox: mailboxService,
+    writeReply: mailboxLlmReplyDraft,
+    loadState: () =>
+      SecureSettingsRepository.isInitialized()
+        ? SecureSettingsRepository.getInstance().load<MailReplyDraftsState>("mail-reply-drafts")
+        : undefined,
+    updateState: (mutate) => {
+      if (!SecureSettingsRepository.isInitialized()) return false;
+      SecureSettingsRepository.getInstance().update<MailReplyDraftsState>(
+        "mail-reply-drafts",
+        (current) => mutate(current ?? { enabled: false, prepared: [], hiddenThreads: {} }),
+      );
+      return true;
+    },
+    onPrepared: () => notifyAttentionChanged(),
+  });
+  if (!shouldDisableBackgroundAutostart()) {
+    // Off until the user turns it on; each run stops at the day's allowance.
+    const draftMailReplies = () => void mailReplyDrafts.draftReplies().catch(() => 0);
+    setTimeout(draftMailReplies, 2 * 60 * 1000).unref?.();
+    setInterval(draftMailReplies, 20 * 60 * 1000).unref?.();
+  }
+
+  const calendarProposals = new CalendarProposalsService({
+    calendar: calendarService,
+    listCommitments: () =>
+      RelationshipMemoryService.listDueSoonCommitments(72).flatMap((item) =>
+        typeof item.dueAt === "number" ? [{ id: item.id, text: item.text, dueAt: item.dueAt }] : [],
+      ),
+    loadState: () =>
+      SecureSettingsRepository.isInitialized()
+        ? SecureSettingsRepository.getInstance().load<{ hidden: Record<string, number> }>(
+            "calendar-proposals",
+          )
+        : undefined,
+    saveState: (state) =>
+      SecureSettingsRepository.isInitialized() &&
+      SecureSettingsRepository.getInstance().save("calendar-proposals", state),
+  });
+
   // Shared "needs you" queue: one snapshot of everything waiting on the user (approvals,
-  // agent questions, paused sessions, flow steps, due commitments and suggestions).
-  setupAttentionHandlers({
+  // agent questions, paused sessions, flow steps, due commitments and suggestions), plus
+  // commitments memory recently closed, which can still be undone.
+  const attentionSignal = setupAttentionHandlers({
     service: new AttentionService({
       listPendingApprovals: () => approvalRepo.findAllPending(),
       listPendingInputRequests: () => inputRequestRepo.findAllPending(),
@@ -11200,6 +11291,11 @@ export async function setupIpcHandlers(
         new Map(
           (await agentRoleRepo.findAll()).map((role) => [role.id, role.displayName || role.name]),
         ),
+      // Reads the saved device list only; no device is contacted.
+      listDevices: async () => {
+        const { listStoredManagedDevices } = await import("../control-plane/handlers");
+        return listStoredManagedDevices();
+      },
       listWaitingFlowSteps: () => listWaitingFlowSteps(options?.getRoutineService?.() ?? null),
       listDueCommitments: async () =>
         RelationshipMemoryService.listDueSoonCommitments(24).map(toAttentionCommitment),
@@ -11210,16 +11306,48 @@ export async function setupIpcHandlers(
           ProactiveSuggestionsService.listActive(id, opts, ids),
         );
       },
+      listCalendarProposals: () => calendarProposals.list(),
+      findCalendarHold: () => calendarProposals.suggestedHold(),
+      listMailReplyDrafts: () => mailReplyDrafts.list(),
+      shouldOfferMailReplyDrafts: () => mailReplyDrafts.shouldOffer(),
+      listMemoryChanges: async () =>
+        listMemoryChangesAcross(await workspaceRepo.findAll(), (id, since) =>
+          memoryReviewService.recentSince(id, since),
+        ),
       localLabel: process.platform === "darwin" ? "This Mac" : "This computer",
       log: (message, error) => logger.warn(message, error),
     }),
     events: agentDaemon,
     getMainWindow,
+    assertTrustedSender: assertTrustedMailboxSender,
+  });
+
+  // Today's calendar cards: accept or dismiss a proposal, hold time for a suggestion.
+  setupCalendarHandlers({
+    proposals: calendarProposals,
+    getSuggestionTitle: async (workspaceId, suggestionId) => {
+      const { ProactiveSuggestionsService } = await import("../agent/ProactiveSuggestionsService");
+      const suggestion = await ProactiveSuggestionsService.getActive(workspaceId, suggestionId);
+      return suggestion?.title?.trim() || null;
+    },
+    markSuggestionActedOn: async (workspaceId, suggestionId) => {
+      const { ProactiveSuggestionsService } = await import("../agent/ProactiveSuggestionsService");
+      await ProactiveSuggestionsService.actOn(workspaceId, suggestionId);
+    },
+    onChanged: attentionSignal.notifyChanged,
+  });
+  notifyAttentionChanged = attentionSignal.notifyChanged;
+
+  // Reply drafts on Today: send, undo a send, discard, turn drafting on or off.
+  setupMailReplyDraftHandlers({
+    drafts: mailReplyDrafts,
+    onChanged: attentionSignal.notifyChanged,
+    assertTrustedSender: assertTrustedMailboxSender,
   });
 
   // Memory Hub "Review": automatic commitment expiries with undo.
   setupMemoryReviewHandlers({
-    service: createMemoryReviewService(db),
+    service: memoryReviewService,
     workspaceExists: async (workspaceId) => Boolean(await workspaceRepo.findById(workspaceId)),
   });
 

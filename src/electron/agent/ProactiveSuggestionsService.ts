@@ -404,6 +404,48 @@ export class ProactiveSuggestionsService {
   }
 
   /**
+   * A suggestion by id while it is still shown (not expired, snoozed, dismissed or acted on,
+   * and not private), for a card action to read its stored text.
+   */
+  static async getActive(
+    workspaceId: string,
+    suggestionId: string,
+    now = Date.now(),
+  ): Promise<ProactiveSuggestion | null> {
+    this.loadDismissed();
+    const suggestion = await this.findSuggestionById(workspaceId, suggestionId);
+    if (!suggestion) return null;
+    if (suggestion.expiresAt < now || (suggestion.snoozedUntil || 0) > now) return null;
+    if (suggestion.dismissed || suggestion.actedOn) return null;
+    if (this.dismissedIds.has(suggestion.id) || this.actedOnIds.has(suggestion.id)) return null;
+    return suggestion;
+  }
+
+  /**
+   * Keeps a follow-up suggestion as one of the user's commitments, due a day from now, and
+   * records the suggestion as acted on. Only follow-ups qualify: they are about something
+   * the user means to do.
+   */
+  static async addAsCommitment(
+    workspaceId: string,
+    suggestionId: string,
+    now = Date.now(),
+  ): Promise<{ ok: true } | { ok: false; reason: "not_found" | "not_eligible" | "unavailable" }> {
+    const suggestion = await this.findSuggestionById(workspaceId, suggestionId);
+    if (!suggestion) return { ok: false, reason: "not_found" };
+    if (suggestion.type !== "follow_up") return { ok: false, reason: "not_eligible" };
+    const { RelationshipMemoryService } = await import("../memory/RelationshipMemoryService");
+    const saved = await RelationshipMemoryService.rememberUserCommitment({
+      text: (suggestion.title || "").slice(0, 300),
+      dueAt: now + 24 * 60 * 60 * 1000,
+      suggestionId,
+    });
+    if (!saved) return { ok: false, reason: "unavailable" };
+    await this.actOn(workspaceId, suggestionId);
+    return { ok: true };
+  }
+
+  /**
    * Mark a suggestion as acted-on and return its actionPrompt.
    */
   static async actOn(workspaceId: string, suggestionId: string): Promise<string | null> {
