@@ -30,21 +30,33 @@ function memoryStorage(initial: Record<string, string> = {}) {
 
 const ids = (items: Array<{ id: string }>) => items.map((item) => item.id);
 
+const desktopContext = { isCalm: false, isBrowserHost: false };
+const calmContext = { isCalm: true, isBrowserHost: false };
+
 describe("getActiveSidebarDestination", () => {
   it("maps app views to rail destinations", () => {
-    expect(getActiveSidebarDestination("main", "sessions")).toBe("home");
-    expect(getActiveSidebarDestination("home", "sessions")).toBe("home");
-    expect(getActiveSidebarDestination("inboxAgent", "sessions")).toBe("inbox");
-    expect(getActiveSidebarDestination("agents", "sessions")).toBe("agents");
-    expect(getActiveSidebarDestination("missionControl", "sessions")).toBe("missionControl");
-    expect(getActiveSidebarDestination("git", "sessions")).toBe("gitChanges");
-    expect(getActiveSidebarDestination("settings", "sessions")).toBeNull();
+    const active = (view: string) => getActiveSidebarDestination(view, "sessions", calmContext);
+    expect(active("main")).toBe("home");
+    expect(active("home")).toBe("home");
+    expect(active("work")).toBe("work");
+    expect(active("team")).toBe("team");
+    expect(active("inboxAgent")).toBe("inbox");
+    expect(active("agents")).toBe("agents");
+    expect(active("missionControl")).toBe("missionControl");
+    expect(active("settings")).toBeNull();
+    // Git Changes only exists in the browser host, so the desktop app highlights nothing.
+    expect(getActiveSidebarDestination("git", "sessions", desktopContext)).toBeNull();
+  });
+
+  it("keeps Team highlighted on Devices in Calm, and Devices elsewhere", () => {
+    expect(getActiveSidebarDestination("devices", "sessions", calmContext)).toBe("team");
+    expect(getActiveSidebarDestination("devices", "sessions", desktopContext)).toBe("devices");
   });
 
   it("keeps Agents highlighted while the panel shows the bot roster", () => {
-    expect(getActiveSidebarDestination("main", "bots")).toBe("agents");
-    expect(getActiveSidebarDestination("agents", "bots")).toBe("agents");
-    expect(getActiveSidebarDestination("automations", "bots")).toBe("automations");
+    expect(getActiveSidebarDestination("main", "bots", calmContext)).toBe("agents");
+    expect(getActiveSidebarDestination("agents", "bots", calmContext)).toBe("agents");
+    expect(getActiveSidebarDestination("automations", "bots", calmContext)).toBe("automations");
   });
 });
 
@@ -55,8 +67,12 @@ describe("getSidebarRailLayout", () => {
     expect(ids(desktop.more)).toEqual(["devices", "missionControl", "addTools"]);
 
     const calm = getSidebarRailLayout({ isCalm: true, isBrowserHost: false }, []);
+    expect(ids(calm.rail).slice(0, 3)).toEqual(["home", "work", "team"]);
     expect(ids(calm.rail)).toContain("library");
     expect(ids(calm.more)).toContain("build");
+    // Calm folds Devices into Team; Bots stays its own destination.
+    expect(ids(calm.more)).not.toContain("devices");
+    expect(ids(calm.rail)).toContain("agents");
   });
 
   it("orders pinned items by pin order and drops ones that are not visible", () => {
@@ -93,13 +109,17 @@ describe("rail shortcuts and reordering", () => {
     ]);
     const targets = getSidebarRailShortcutTargets(layout);
     expect(targets).toHaveLength(9);
-    expect(ids(targets).slice(0, 6)).toEqual([
+    // A Devices pin from before Devices moved into Team is dropped in Calm.
+    expect(ids(targets)).toEqual([
       "home",
+      "work",
+      "team",
       "inbox",
       "agents",
       "automations",
       "library",
-      "devices",
+      "missionControl",
+      "build",
     ]);
   });
 
@@ -129,12 +149,21 @@ describe("rail shortcuts and reordering", () => {
     expect(
       isCustomSidebarRailOrder({ isCalm: true, isBrowserHost: false }, [
         "home",
+        "work",
+        "team",
         "inbox",
         "agents",
         "automations",
         "library",
       ]),
     ).toBe(false);
+    // An order saved before Work existed puts Work after the items it names.
+    const saved = getSidebarRailLayout(
+      { isCalm: true, isBrowserHost: false },
+      [],
+      ["home", "inbox", "agents", "automations", "library"],
+    );
+    expect(ids(saved.rail).slice(-2)).toEqual(["work", "team"]);
   });
 
   it("shifts an item one place and stops at the ends", () => {

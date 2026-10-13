@@ -24,6 +24,8 @@ import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerE
 import { useReplayMode, type ReplayControls } from "./hooks/useReplayMode";
 import { useTaskDuration } from "./hooks/useTaskDuration";
 import { useComposerDraft } from "./hooks/useComposerDraft";
+import { useAttentionSnapshot } from "./hooks/useAttentionSnapshot";
+import { attentionWaitingByTask, type AttentionItem } from "../shared/attention";
 import { ArrowLeft, ArrowRight, Globe, Moon, PanelTop, SquareTerminal, Sun } from "lucide-react";
 import { TitleBarMoreMenu } from "./components/TitleBarMoreMenu";
 import { Sidebar } from "./components/Sidebar";
@@ -303,6 +305,12 @@ const BrowserView = lazy(() =>
 );
 const HomeDashboard = lazy(() =>
   import("./components/HomeDashboard").then((module) => ({ default: module.HomeDashboard })),
+);
+const WorkView = lazy(() =>
+  import("./components/work/WorkView").then((module) => ({ default: module.WorkView })),
+);
+const TeamView = lazy(() =>
+  import("./components/team/TeamView").then((module) => ({ default: module.TeamView })),
 );
 const AutomationStudioPanel = lazy(() => import("./components/AutomationStudioPanel"));
 const DevicesPanel = lazy(() =>
@@ -733,6 +741,8 @@ function appendSidebarTaskPage(tasks: Task[], page: Task[]): Task[] {
 
 type AppView =
   | "home"
+  | "work"
+  | "team"
   | "automations"
   | "main"
   | "settings"
@@ -748,6 +758,8 @@ type AppView =
 const SIDEBAR_SHELL_VIEWS: ReadonlySet<AppView> = new Set<AppView>([
   "main",
   "home",
+  "work",
+  "team",
   "automations",
   "devices",
   "inboxAgent",
@@ -2395,6 +2407,21 @@ export function App() {
     if (!sameHomeSessions(homeSessionsRef.current, next)) homeSessionsRef.current = next;
     return homeSessionsRef.current;
   }, [selectedTask, tasks]);
+  // The shared needs-you queue (provided once in main.tsx): Today, Work, Team, the bell and
+  // the sidebar all read this snapshot, so their counts agree.
+  const attentionSnapshot = useAttentionSnapshot(true);
+  // Sessions the queue says wait on the user. Same reference while unchanged, so the
+  // memoized sidebar only re-renders when the waiting set or a reason changes.
+  const attentionWaitingRef = useRef<ReadonlyMap<string, string>>(new Map());
+  const attentionWaiting = useMemo(() => {
+    const next = attentionWaitingByTask(attentionSnapshot.items);
+    const previous = attentionWaitingRef.current;
+    const same =
+      previous.size === next.size &&
+      [...next].every(([taskId, label]) => previous.get(taskId) === label);
+    if (!same) attentionWaitingRef.current = next;
+    return attentionWaitingRef.current;
+  }, [attentionSnapshot.items]);
   const selectedBotConversationProjection = useMemo(
     () =>
       selectedTask?.agentConfig?.botConversation && !remoteTaskView
@@ -3131,6 +3158,20 @@ export function App() {
   const isBrowserHost =
     typeof window !== "undefined" &&
     (window as Window & { coworkBrowserHost?: boolean }).coworkBrowserHost === true;
+  // Which rail destinations exist depends on the theme (Calm folds Devices into Team).
+  const sidebarDestinationContext = useMemo(
+    () => ({ isCalm: visualTheme === "calm", isBrowserHost }),
+    [visualTheme, isBrowserHost],
+  );
+  // What Team asked the Devices view to open on: a device, or the pairing step. Read when
+  // the view mounts and cleared once the user leaves it, so a later visit starts fresh.
+  const [devicesFocus, setDevicesFocus] = useState<{
+    deviceId?: string;
+    pairing?: boolean;
+  } | null>(null);
+  useEffect(() => {
+    if (currentView !== "devices") setDevicesFocus(null);
+  }, [currentView]);
   const [browserProviderReady, setBrowserProviderReady] = useState(
     () => !isBrowserHost || window.coworkBrowserHostInfo?.providerReady === true,
   );
@@ -7648,6 +7689,12 @@ export function App() {
         case "home":
           setCurrentView("main");
           return;
+        case "work":
+          setCurrentView("work");
+          return;
+        case "team":
+          setCurrentView("team");
+          return;
         case "inbox":
           setCurrentView("inboxAgent");
           return;
@@ -7699,7 +7746,11 @@ export function App() {
   // menu read the same everywhere.
   const sidebarRail = (
     <SidebarRail
-      activeId={getActiveSidebarDestination(currentView, sidebarPanelTab)}
+      activeId={getActiveSidebarDestination(
+        currentView,
+        sidebarPanelTab,
+        sidebarDestinationContext,
+      )}
       settingsActive={currentView === "settings"}
       onNavigate={handleSidebarNavigate}
       onOpenSettings={handleSidebarRailOpenSettings}
@@ -7993,6 +8044,21 @@ export function App() {
     return typeof unsubscribe === "function" ? unsubscribe : undefined;
   }, [openBotConversationByDeepLink]);
 
+  // A "Needs you" item from the bell opens where it is decided: its session, its
+  // automation, or Today for commitments and suggestions.
+  const handleAttentionClick = (item: AttentionItem) => {
+    if (item.ref.type === "workflow_step") {
+      setFocusAutomationRoutineId(item.ref.routineId);
+      setCurrentView("automations");
+      return;
+    }
+    if (item.taskId) {
+      void openTaskById(item.taskId);
+      return;
+    }
+    handleClearTaskView();
+  };
+
   const handleNotificationClick = useCallback(
     (notification: NotificationPanelNotification) => {
       // Prioritize taskId to show the completed task result
@@ -8043,7 +8109,13 @@ export function App() {
   const sidebarNotificationBell = useMemo(
     () =>
       canShowNotifications ? (
-        <NotificationPanel placement="sidebar" onNotificationClick={handleNotificationClick} />
+        <NotificationPanel
+          placement="sidebar"
+          onNotificationClick={handleNotificationClick}
+          attention={attentionSnapshot.fromQueue ? attentionSnapshot.items : undefined}
+          onAttentionClick={handleAttentionClick}
+          onOpenToday={handleClearTaskView}
+        />
       ) : null,
     [canShowNotifications, handleNotificationClick],
   );
@@ -8269,7 +8341,12 @@ export function App() {
         <div className="title-bar-spacer" />
         <div className="title-bar-actions">
           {showTitleBarNotifications && (
-            <NotificationPanel onNotificationClick={handleNotificationClick} />
+            <NotificationPanel
+              onNotificationClick={handleNotificationClick}
+              attention={attentionSnapshot.fromQueue ? attentionSnapshot.items : undefined}
+              onAttentionClick={handleAttentionClick}
+              onOpenToday={handleClearTaskView}
+            />
           )}
           {isBrowserHost && (
             <button
@@ -8444,12 +8521,17 @@ export function App() {
                 botConversationProjections={botConversationProjections}
                 activeTab={sidebarPanelTab}
                 headerAccessory={sidebarNotificationBell}
-                activeDestinationId={getActiveSidebarDestination(currentView, sidebarPanelTab)}
+                activeDestinationId={getActiveSidebarDestination(
+                  currentView,
+                  sidebarPanelTab,
+                  sidebarDestinationContext,
+                )}
                 onNavigate={handleSidebarNavigate}
                 isDevicesActive={currentView === "devices"}
                 isLoadingSessions={isInitialTaskListLoading}
                 isLoadingMoreTasks={isLoadingMoreTasks}
                 completionAttentionTaskIds={unseenCompletedTaskIds}
+                attentionWaiting={attentionWaiting}
                 onSelectTask={handleSelectTaskFromShell}
                 onOpenAgents={() => setCurrentView("agents")}
                 onOpenBot={handleOpenBot}
@@ -8535,6 +8617,8 @@ export function App() {
                 />
               ) : currentView === "devices" ? (
                 <DevicesPanel
+                  initialDeviceId={devicesFocus?.deviceId}
+                  openPairing={devicesFocus?.pairing === true}
                   onOpenTask={(taskId, remote) => {
                     if (remote) {
                       void openRemoteTaskView(taskId, remote);
@@ -8660,6 +8744,42 @@ export function App() {
                     onOpenTask={handleOpenManagedAgentTask}
                   />
                 </main>
+              ) : currentView === "work" ? (
+                <WorkView
+                  tasks={tasks}
+                  onOpenTask={(taskId) => {
+                    void selectTaskAfterDraftFlush(taskId);
+                    setCurrentView("main");
+                  }}
+                  onTasksChanged={refreshTaskLists}
+                  hasMoreTasks={hasMoreTasks}
+                  onLoadMoreTasks={loadMoreTasks}
+                />
+              ) : currentView === "team" ? (
+                <TeamView
+                  tasks={tasks}
+                  onOpenTask={(taskId) => {
+                    void selectTaskAfterDraftFlush(taskId);
+                    setCurrentView("main");
+                  }}
+                  onOpenBots={() => setCurrentView("agents")}
+                  onOpenSchedules={() => {
+                    setSettingsTab("scheduled");
+                    setCurrentView("settings");
+                  }}
+                  onOpenRoutine={(routineId) => {
+                    setFocusAutomationRoutineId(routineId);
+                    setCurrentView("automations");
+                  }}
+                  onOpenDevices={(deviceId) => {
+                    setDevicesFocus(deviceId ? { deviceId } : null);
+                    setCurrentView("devices");
+                  }}
+                  onAddDevice={() => {
+                    setDevicesFocus({ pairing: true });
+                    setCurrentView("devices");
+                  }}
+                />
               ) : currentView === "library" ? (
                 <LibraryPanel workspaceId={currentWorkspace?.id} />
               ) : currentView === "git" ? (

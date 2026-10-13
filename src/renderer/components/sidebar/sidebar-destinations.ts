@@ -1,9 +1,11 @@
 import type { ComponentType } from "react";
 import {
+  ContactRound,
   GitBranch,
   Hammer,
   House,
   Inbox,
+  Layers,
   Library,
   Monitor,
   Puzzle,
@@ -15,6 +17,8 @@ import { hasHostCapability, hasHostMethods } from "../../host/browser-capabiliti
 
 export type SidebarDestinationId =
   | "home"
+  | "work"
+  | "team"
   | "inbox"
   | "agents"
   | "automations"
@@ -49,9 +53,29 @@ export interface SidebarDestination {
 }
 
 const calmOnly = ({ isCalm }: SidebarDestinationContext) => isCalm;
+const notCalm = ({ isCalm }: SidebarDestinationContext) => !isCalm;
 
 export const SIDEBAR_DESTINATIONS: readonly SidebarDestination[] = [
   { id: "home", label: "Home", icon: House, placement: "rail", views: ["main", "home"] },
+  {
+    // Every session grouped by project; styled for the Calm theme, like Library and Build.
+    id: "work",
+    label: "Work",
+    icon: Layers,
+    placement: "rail",
+    views: ["work"],
+    isVisible: calmOnly,
+  },
+  {
+    // Agents, schedules, automations and devices as teammates; Calm only, like Work.
+    // In Calm the Devices view opens from Team's device cards, so Team owns it.
+    id: "team",
+    label: "Team",
+    icon: ContactRound,
+    placement: "rail",
+    views: ["team", "devices"],
+    isVisible: calmOnly,
+  },
   {
     id: "inbox",
     label: "Inbox",
@@ -103,6 +127,8 @@ export const SIDEBAR_DESTINATIONS: readonly SidebarDestination[] = [
     views: ["devices"],
     panel: "devices",
     hostMethods: ["listManagedDevices", "getDeviceSummary"],
+    // Calm folds Devices into Team.
+    isVisible: notCalm,
   },
   {
     id: "missionControl",
@@ -145,17 +171,24 @@ export function isSidebarDestinationAvailable(destination: SidebarDestination): 
 }
 
 /**
- * The destination to highlight. A bot conversation keeps Agents highlighted
- * because its roster is what the panel is showing.
+ * The destination to highlight: the first one shown in this theme that owns the view.
+ * A bot conversation keeps Agents highlighted because its roster is what the panel is
+ * showing.
  */
 export function getActiveSidebarDestination(
   view: string,
   panelTab: SidebarPanelTab,
+  context: SidebarDestinationContext,
 ): SidebarDestinationId | null {
   if (panelTab === "bots" && (view === "main" || view === "home" || view === "agents")) {
     return "agents";
   }
-  return SIDEBAR_DESTINATIONS.find((destination) => destination.views.includes(view))?.id ?? null;
+  return (
+    SIDEBAR_DESTINATIONS.find(
+      (destination) =>
+        destination.views.includes(view) && (destination.isVisible?.(context) ?? true),
+    )?.id ?? null
+  );
 }
 
 export interface SidebarRailLayout {
