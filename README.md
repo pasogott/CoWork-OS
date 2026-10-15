@@ -178,15 +178,15 @@ See the [Development Guide](docs/development.md) for prerequisites and details.
 
 | Signal | Current | All time |
 |---|---:|---:|
-| GitHub stars | 484 | n/a |
+| GitHub stars | 485 | n/a |
 | GitHub forks | 87 | n/a |
-| Installer/server downloads | 1,742 | 1,742 |
-| Download delta | +25 | n/a |
+| Installer/server downloads | 1,754 | 1,754 |
+| Download delta | +12 | n/a |
 | npm downloads | 243 (last week) | 9,583 |
-| GitHub views, last 14-ish days | 970 total / 431 unique | n/a |
-| GitHub clones, last 14-ish days | 15,940 total / 1,110 unique | n/a |
+| GitHub views, last 14-ish days | 944 total / 419 unique | n/a |
+| GitHub clones, last 14-ish days | 15,131 total / 1,171 unique | n/a |
 
-Generated 2026-10-14T08:40:18.722Z. These are public GitHub/npm adoption signals, not active-user or in-app telemetry numbers. All-time values are shown only where the source API provides lifetime coverage. [Full report](docs/public-adoption-stats.md).
+Generated 2026-10-15T08:14:59.873Z. These are public GitHub/npm adoption signals, not active-user or in-app telemetry numbers. All-time values are shown only where the source API provides lifetime coverage. [Full report](docs/public-adoption-stats.md).
 <!-- COWORK_PUBLIC_ADOPTION_STATS_END -->
 
 ## How It Works
@@ -385,6 +385,8 @@ Advanced web scraping powered by [Scrapling](https://github.com/D4Vinci/Scraplin
 
 - **Cloud Storage/Productivity**: 6 integrations, including Notion, Box, OneDrive, Google Workspace, Dropbox, and SharePoint
 - **MCP Connectors**: pre-built enterprise integrations for CRM, support, productivity, analytics, payments, and local creative tools (Salesforce, Jira, HubSpot, Zendesk, Stripe, Tavily, Grafana, Metabase, Socket, Rhino, Blender, ComfyUI, and more), with connector notifications available as trigger inputs for automations
+- **Background app work**: CoWork works in other apps in the background, without taking your screen, pointer, keyboard or clipboard. It uses the app's API or MCP server first, then the app's own scripting (background Photoshop), then one exact window through `native_app` on macOS, and checks every result against a fresh readback. See [Working with apps in the background](docs/background-app-work.md).
+- **Remote MCP servers with OAuth**: connect OAuth 2.1 MCP servers such as Workday Agent-Ready Tools, signing in as a person or with an agent key for headless runs, and register the Workday agent's tools from inside CoWork. See [Remote MCP OAuth](docs/remote-mcp-oauth.md).
 - **Composer mentions**: type `@` in the message box to choose configured integrations. Google Workspace appears as service-specific options: Gmail, Google Drive, Google Calendar, Google Docs, Google Sheets, Google Slides, Google Tasks, and Google Chat when native or MCP-backed tools are available. The Google Calendar chip can include both `calendar_action` and `google-workspace.calendar_*` tools for scheduling, availability, and event CRUD. Mentions render as icon+name chips and are passed as soft routing hints, not permission grants. [Learn more](docs/composer-mentions.md)
 - **Google Workspace**: one OAuth connection covers Gmail, Calendar, Drive, Docs, Sheets, Slides, Tasks, and Chat. Existing users may need to reconnect when a release adds new required scopes.
 - **Developer Tools**: `glob`/`grep`/`edit_file`, Playwright browser automation, MCP client/host/registry

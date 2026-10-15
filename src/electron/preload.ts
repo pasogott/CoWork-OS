@@ -22,7 +22,21 @@ import type {
   BotResponsibilitySave,
   BotResponsibilityRevise,
 } from "../shared/bot-responsibility";
-import type { BotWorkQuery, BotWorkPage } from "../shared/types";
+import type {
+  BotWorkQuery,
+  BotWorkPage,
+  RemoteOAuthAuthorizeResult,
+  RemoteOAuthServerRequest,
+  RemoteOAuthServerUpdateRequest,
+  WorkdayAdminConnectionRequest,
+  WorkdayAdminConnectionSummary,
+  WorkdayAdminSignInResult,
+  WorkdayAgentListResult,
+  WorkdayAgentSaveRequest,
+  WorkdayAgentSaveResult,
+  WorkdayAgentSearchRequest,
+  WorkdayAgentSearchResult,
+} from "../shared/types";
 import * as path from "path";
 import { contextBridge, ipcRenderer } from "electron";
 import * as fs from "fs";
@@ -875,7 +889,7 @@ interface BuiltinToolsSettings {
   codexRuntimeMode: "native" | "acpx";
   computerUseAutomation: {
     browserAutomationMode: "background" | "visible" | "ask";
-    nativeComputerUseMode: "background_first" | "ask_visible" | "visible";
+    nativeComputerUseMode: "background" | "background_first" | "ask_visible" | "visible";
   };
   version: string;
 }
@@ -4271,6 +4285,50 @@ contextBridge.exposeInMainWorld("electronAPI", {
     loginHint?: string;
     prompt?: "select_account" | "consent";
   }) => ipcRenderer.invoke(IPC_CHANNELS.MCP_CONNECTOR_OAUTH_START, payload),
+  addRemoteOAuthMCPServer: (payload: RemoteOAuthServerRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MCP_ADD_REMOTE_OAUTH_SERVER, payload),
+  updateRemoteOAuthMCPServer: (payload: RemoteOAuthServerUpdateRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MCP_UPDATE_REMOTE_OAUTH_SERVER, payload) as Promise<{
+      id: string;
+      name: string;
+      signedOut: boolean;
+    }>,
+  discoverMCPOAuth: (url: string) => ipcRenderer.invoke(IPC_CHANNELS.MCP_OAUTH_DISCOVER, url),
+  authorizeMCPServer: (serverId: string) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.MCP_OAUTH_AUTHORIZE,
+      serverId,
+    ) as Promise<RemoteOAuthAuthorizeResult>,
+  cancelMCPOAuth: (serverId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MCP_OAUTH_CANCEL, serverId) as Promise<{ cancelled: boolean }>,
+
+  // Workday agent setup (admin API client on a Workday preset server)
+  saveWorkdayAdminConnection: (payload: WorkdayAdminConnectionRequest) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.WORKDAY_AGENT_ADMIN_SAVE_CONNECTION,
+      payload,
+    ) as Promise<WorkdayAdminConnectionSummary>,
+  signInWorkdayAdmin: (serverId: string) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.WORKDAY_AGENT_ADMIN_SIGN_IN,
+      serverId,
+    ) as Promise<WorkdayAdminSignInResult>,
+  cancelWorkdayAdminSignIn: (serverId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.WORKDAY_AGENT_ADMIN_CANCEL, serverId) as Promise<{
+      cancelled: boolean;
+    }>,
+  listWorkdayAgents: (serverId: string) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.WORKDAY_AGENT_LIST,
+      serverId,
+    ) as Promise<WorkdayAgentListResult>,
+  searchWorkdayAgentResources: (payload: WorkdayAgentSearchRequest) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.WORKDAY_AGENT_SEARCH,
+      payload,
+    ) as Promise<WorkdayAgentSearchResult>,
+  saveWorkdayAgent: (payload: WorkdayAgentSaveRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.WORKDAY_AGENT_SAVE, payload) as Promise<WorkdayAgentSaveResult>,
 
   // MCP Status change event listener
   onMCPStatusChange: (callback: (status: Any[]) => void) => {
@@ -8284,6 +8342,31 @@ export interface ElectronAPI {
     workspaces?: Array<{ id: string; name: string }>;
     error?: string;
   }>;
+  addRemoteOAuthMCPServer: (
+    payload: RemoteOAuthServerRequest,
+  ) => Promise<{ id: string; name: string }>;
+  updateRemoteOAuthMCPServer: (
+    payload: RemoteOAuthServerUpdateRequest,
+  ) => Promise<{ id: string; name: string; signedOut: boolean }>;
+  cancelMCPOAuth: (serverId: string) => Promise<{ cancelled: boolean }>;
+  discoverMCPOAuth: (url: string) => Promise<{
+    authorizationUrl?: string;
+    tokenUrl?: string;
+    scopes?: string[];
+    resource?: string;
+    issuer?: string;
+  }>;
+  authorizeMCPServer: (serverId: string) => Promise<RemoteOAuthAuthorizeResult>;
+  saveWorkdayAdminConnection: (
+    payload: WorkdayAdminConnectionRequest,
+  ) => Promise<WorkdayAdminConnectionSummary>;
+  signInWorkdayAdmin: (serverId: string) => Promise<WorkdayAdminSignInResult>;
+  cancelWorkdayAdminSignIn: (serverId: string) => Promise<{ cancelled: boolean }>;
+  listWorkdayAgents: (serverId: string) => Promise<WorkdayAgentListResult>;
+  searchWorkdayAgentResources: (
+    payload: WorkdayAgentSearchRequest,
+  ) => Promise<WorkdayAgentSearchResult>;
+  saveWorkdayAgent: (payload: WorkdayAgentSaveRequest) => Promise<WorkdayAgentSaveResult>;
   startConnectorOAuth: (payload: {
     provider:
       | "box"
