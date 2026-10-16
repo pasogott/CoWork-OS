@@ -271,6 +271,14 @@ provider is later disconnected, the conversation falls back to the global
 model. An effort level picked there is saved as that provider's effort setting.
 With no conversation open, the picker still changes the global default.
 
+A bot can also have its own model: choose it under **Model** when you create or edit the bot.
+Every conversation of that bot (and the work it runs for responsibilities) uses it, unless the
+conversation picked its own model in the picker. The order is: the conversation's pick, then
+the bot's model, then the global default. The bot's model is read on every turn, so changing it
+applies to its conversations on their next message; choosing **Default model** sends them back
+to the global default. A bot model on a provider that is no longer connected falls back to the
+global default.
+
 ### 5. Start a separate conversation
 
 Open the bot's header menu and select **New conversation**, or choose **New**
@@ -443,6 +451,15 @@ the same format, writer, screening and git history as the rest of the folder
 - **Reviewing.** The bot's details panel has a **Memory** section: the saved entries with
   **Forget**, and **Recent changes** (the file's last 20 commits) with **Undo**, which removes
   what a change added and restores what it removed in a new commit.
+- **In the Memory Hub.** Settings > Memory > What CoWork knows lists every bot's file under
+  **Bots** (in every workspace, since a bot's memory is not tied to one), with Edit and Delete
+  but no Pin: pinning would put a bot's fact into every conversation. **What this bot knows**
+  in a bot's work view opens the Hub on that bot's section. A deleted bot's file is marked
+  "Bot deleted" until you remove it.
+- **Deleting a bot.** When the bot saved anything, deleting it asks a second question: also
+  delete what it remembers? Yes removes its file in one commit; Cancel keeps the file in the
+  memory folder. Like Forget, removed lines stay in the folder's git history until you
+  compact it in Memory settings.
 
 CoWork does not log every turn into the bot's file (each line would be a commit); the
 conversation index already holds that history and `memory_recall` scope `bot` reads it.
