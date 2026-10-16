@@ -1,3 +1,4 @@
+import type { ComputerViewState } from "../shared/computer-view";
 import {
   BROWSER_VAULT_IPC,
   type BrowserVaultItem,
@@ -51,6 +52,7 @@ import * as fs from "fs";
 import * as os from "os";
 import { randomBytes } from "crypto";
 import { IPC_CHANNELS as SHARED_IPC_CHANNELS, isTempWorkspaceId } from "../shared/types";
+import type { BotOutcomeMetrics, BotOutcomeMetricsRequest } from "../shared/bot-outcome-metrics";
 import type {
   ChannelHealthResponse,
   MeetingArtifactProvider,
@@ -1695,6 +1697,8 @@ interface AgentRoleData {
   autonomyLevel?: AgentAutonomyLevel;
   /** "May do alone": the most access this agent's work gets. */
   accessProfileId?: string;
+  /** Where this bot works; unset means Auto. */
+  worksOn?: import("../shared/bot-computer").BotWorksOn;
   soul?: string;
   heartbeatPolicy?: import("../shared/types").HeartbeatPolicy;
   heartbeatEnabled?: boolean;
@@ -1736,6 +1740,7 @@ interface CreateAgentRoleRequest {
   toolRestrictions?: AgentToolRestrictions;
   // Automation fields
   autonomyLevel?: AgentAutonomyLevel;
+  worksOn?: import("../shared/bot-computer").BotWorksOn;
   soul?: string;
   operatorMandate?: string;
   allowedLoopTypes?: import("../shared/types").CompanyLoopType[];
@@ -1768,6 +1773,7 @@ interface UpdateAgentRoleRequest {
   autonomyLevel?: AgentAutonomyLevel;
   /** The agent's access limit; null clears it. */
   accessProfileId?: string | null;
+  worksOn?: import("../shared/bot-computer").BotWorksOn | null;
   soul?: string;
   operatorMandate?: string;
   allowedLoopTypes?: import("../shared/types").CompanyLoopType[];
@@ -3251,6 +3257,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     >,
   listBotWork: (query: BotWorkQuery) =>
     ipcRenderer.invoke(IPC_CHANNELS.BOT_WORK_LIST, query) as Promise<BotWorkPage>,
+  getBotMetricsSummary: (request: BotOutcomeMetricsRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.BOT_METRICS_SUMMARY, request) as Promise<BotOutcomeMetrics>,
   listBotConversations: (query: BotConversationListQuery) =>
     invokeTaskIpcWithRendererTiming(IPC_CHANNELS.BOT_CONVERSATIONS_LIST, query),
   listBotMessages: (request: import("../shared/bot-messages").BotMessagePageRequest) =>
@@ -4447,6 +4455,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
   onComputerUseEvent: (callback: (event: Any) => void) => {
     const channel = IPC_CHANNELS.COMPUTER_USE_EVENT;
     const listener = (_e: Any, payload: Any) => callback(payload);
+    ipcRenderer.on(channel, listener);
+    return () => ipcRenderer.removeListener(channel, listener);
+  },
+  watchComputerView: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_WATCH, taskId),
+  unwatchComputerView: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_UNWATCH, taskId),
+  takeOverComputer: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_TAKE_OVER, taskId),
+  handBackComputer: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_HAND_BACK, taskId),
+  onComputerViewEvent: (callback: (state: ComputerViewState) => void) => {
+    const channel = IPC_CHANNELS.COMPUTER_VIEW_EVENT;
+    const listener = (_e: Any, payload: ComputerViewState) => callback(payload);
     ipcRenderer.on(channel, listener);
     return () => ipcRenderer.removeListener(channel, listener);
   },
@@ -7010,6 +7032,7 @@ export interface ElectronAPI {
     request: import("../shared/bot-work-result").BotWorkResultRequest,
   ) => Promise<import("../shared/bot-work-result").BotWorkResult>;
   listBotWork: (query: BotWorkQuery) => Promise<BotWorkPage>;
+  getBotMetricsSummary: (request: BotOutcomeMetricsRequest) => Promise<BotOutcomeMetrics>;
   activateBotResponsibility: (
     request: import("../shared/bot-responsibility").BotResponsibilityControl,
   ) => Promise<BotResponsibility>;
@@ -8579,6 +8602,13 @@ export interface ElectronAPI {
   openComputerUseAccessibilitySettings: () => Promise<{ success: boolean }>;
   openComputerUseScreenRecordingSettings: () => Promise<{ success: boolean }>;
   onComputerUseEvent: (callback: (event: Any) => void) => () => void;
+  /** Starts showing a task's computer in the bot's panel; returns its current state. */
+  watchComputerView: (taskId: string) => Promise<ComputerViewState>;
+  unwatchComputerView: (taskId: string) => Promise<void>;
+  /** The person takes over: the bot's computer and browser actions are refused until hand-back. */
+  takeOverComputer: (taskId: string) => Promise<ComputerViewState>;
+  handBackComputer: (taskId: string) => Promise<ComputerViewState>;
+  onComputerViewEvent: (callback: (state: ComputerViewState) => void) => () => void;
   // Tray (Menu Bar)
   getTraySettings: () => Promise<TraySettings>;
   saveTraySettings: (
