@@ -1481,6 +1481,15 @@ export type ToolType =
   | "scratchpad_read"
   // Hand a computer step to the person (passwords, codes, payments)
   | "request_takeover"
+  // The bot's own desktop (Works on: Its own desktop)
+  | "desktop_screenshot"
+  | "desktop_open_url"
+  | "desktop_click"
+  | "desktop_type"
+  | "desktop_key"
+  | "desktop_scroll"
+  | "desktop_drag"
+  | "desktop_run"
   // Orchestration tools
   | "orchestrate_agents"
   // QA tools (Playwright visual QA)
@@ -1609,7 +1618,7 @@ export const TOOL_GROUPS = {
     "batch_image_process",
   ],
   // Destructive operations - high risk, requires approval
-  "group:destructive": ["delete_file", "run_command"],
+  "group:destructive": ["delete_file", "run_command", "desktop_run"],
   // System operations - requires explicit permission
   "group:system": [
     "android_phone_devices",
@@ -1642,6 +1651,7 @@ export const TOOL_GROUPS = {
   "group:network": [
     "manage_connector_events",
     "http_request",
+    "desktop_open_url",
     "generate_image",
     "generate_video",
     "get_video_generation_job",
@@ -1970,6 +1980,17 @@ export const TOOL_RISK_LEVELS: Record<ToolType, ToolRiskLevel> = {
   scratchpad_read: "read",
   // Only asks the person to take over; it changes nothing itself.
   request_takeover: "read",
+  // The bot's own desktop is a separate container: actions there don't touch this computer.
+  desktop_screenshot: "read",
+  desktop_open_url: "network",
+  desktop_click: "write",
+  desktop_type: "write",
+  desktop_key: "write",
+  desktop_scroll: "write",
+  desktop_drag: "write",
+  // A shell command, like run_command: approval and policy treat it as destructive even
+  // though it runs in the container, since it can reach the network with the bot's sign-ins.
+  desktop_run: "destructive",
   // Orchestration
   orchestrate_agents: "write",
   // Meta
@@ -4860,7 +4881,18 @@ export function isTempWorkspaceId(id: string | null | undefined): boolean {
 /**
  * Sandbox type for command execution isolation
  */
-export type SandboxType = "auto" | "macos" | "docker" | "none";
+export type SandboxType = "auto" | "macos" | "docker" | "space" | "none";
+
+/** Explicit workspace file selection for the opt-in remote SPACE backend.
+ * Connection credentials live in the host environment, never in workspace JSON. */
+export interface SpaceSandboxConfig {
+  /** Published Linux template with python3, /bin/sh, and (for JavaScript) node. */
+  template: string;
+  /** Regular files relative to the workspace. No directories, links, or implicit sync. */
+  inputPaths?: string[];
+  /** Remote workspace-relative files to publish locally. Destinations must be new files. */
+  outputPaths?: string[];
+}
 
 /**
  * Docker sandbox configuration
@@ -4889,6 +4921,7 @@ export interface WorkspacePermissions {
   // Sandbox configuration
   sandboxType?: SandboxType; // Which sandbox to use (auto-detect if not specified)
   dockerConfig?: DockerSandboxConfig; // Docker-specific configuration
+  spaceConfig?: SpaceSandboxConfig;
   /** Effective access-profile metadata applied to an agent workspace view. */
   accessProfileId?: AccessProfileId;
   accessSandboxMode?: import("./access-profiles").AccessSandboxMode;
@@ -5716,6 +5749,11 @@ export interface AgentRole {
   accessProfileId?: AccessProfileId;
   /** Where this bot works: which computer its tasks may drive. Unset means Auto. */
   worksOn?: BotWorksOn;
+  /**
+   * For "Its own desktop": the SSH host (from your SSH config) its desktop runs on. Unset means
+   * this computer.
+   */
+  desktopHost?: string;
   soul?: string; // Extended personality (JSON: communication style, focus areas, preferences)
   heartbeatPolicy?: HeartbeatPolicy;
   heartbeatEnabled?: boolean; // Whether agent participates in heartbeat system
@@ -5766,6 +5804,8 @@ export interface CreateAgentRoleRequest {
   autonomyLevel?: AgentAutonomyLevel;
   /** Where this bot works; unset means Auto. */
   worksOn?: BotWorksOn;
+  /** The SSH host its own desktop runs on; unset means this computer. */
+  desktopHost?: string;
   soul?: string;
   heartbeatPolicy?: HeartbeatPolicyInput;
   heartbeatEnabled?: boolean;
@@ -5813,6 +5853,8 @@ export interface UpdateAgentRoleRequest {
   accessProfileId?: AccessProfileId | null;
   /** Where this bot works; null resets it to Auto. */
   worksOn?: BotWorksOn | null;
+  /** The SSH host its own desktop runs on; null means this computer. */
+  desktopHost?: string | null;
   soul?: string;
   monthlyBudgetCost?: number | null;
   autoPausedAt?: number | null;
@@ -8509,6 +8551,10 @@ export const IPC_CHANNELS = {
   APP_UPDATE_PROGRESS: "app:updateProgress",
   APP_UPDATE_DOWNLOADED: "app:updateDownloaded",
   APP_UPDATE_ERROR: "app:updateError",
+  APP_CANCEL_UPDATE: "app:cancelUpdate",
+  APP_OPEN_UPDATE_WINDOW: "app:openUpdateWindow",
+  APP_GET_UPDATE_PREFERENCES: "app:getUpdatePreferences",
+  APP_SET_UPDATE_PREFERENCES: "app:setUpdatePreferences",
   SYSTEM_OPEN_SETTINGS: "system:openSettings",
 
   // CoWork Pulse (explicit opt-in, content-free daily usage aggregates)
@@ -8655,6 +8701,8 @@ export const IPC_CHANNELS = {
   COMPUTER_VIEW_TAKE_OVER: "computerView:takeOver",
   COMPUTER_VIEW_HAND_BACK: "computerView:handBack",
   COMPUTER_VIEW_EVENT: "computerView:event",
+  COMPUTER_VIEW_OPEN_DESKTOP: "computerView:openDesktop",
+  COMPUTER_VIEW_STOP_DESKTOP: "computerView:stopDesktop",
 
   // Tray (Menu Bar)
   TRAY_GET_SETTINGS: "tray:getSettings",
@@ -10847,12 +10895,30 @@ export interface UpdateInfo {
 }
 
 export interface UpdateProgress {
-  phase: "checking" | "downloading" | "extracting" | "installing" | "complete" | "error";
+  phase:
+    | "checking"
+    | "downloading"
+    | "verifying"
+    | "extracting"
+    | "installing"
+    | "complete"
+    | "cancelled"
+    | "error";
   percent?: number;
   message: string;
   bytesDownloaded?: number;
   bytesTotal?: number;
 }
+
+/** How the app treats new releases it finds on its own (Settings > Updates and the update window). */
+export interface UpdatePreferences {
+  /** Download packaged updates in the background as soon as they are found. */
+  autoDownload: boolean;
+  /** A version the user chose to skip; background checks stay quiet about it. */
+  skippedVersion?: string;
+}
+
+export const DEFAULT_UPDATE_PREFERENCES: UpdatePreferences = { autoDownload: false };
 
 export interface AppVersionInfo {
   version: string;

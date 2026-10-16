@@ -10,7 +10,7 @@ import {
   COMPOSER_PREDICTION_CHANNEL,
   COMPOSER_PREDICTION_CANCEL_CHANNEL,
 } from "../shared/composer-predictions";
-import type { ApprovalRequest } from "../shared/types";
+import type { ApprovalRequest, SpaceSandboxConfig, SandboxType } from "../shared/types";
 import type { AndroidPhoneSettings, AndroidPhoneStatus } from "../shared/android-phone";
 import type {
   ApprovalDraftPreview,
@@ -1699,6 +1699,7 @@ interface AgentRoleData {
   accessProfileId?: string;
   /** Where this bot works; unset means Auto. */
   worksOn?: import("../shared/bot-computer").BotWorksOn;
+  desktopHost?: string;
   soul?: string;
   heartbeatPolicy?: import("../shared/types").HeartbeatPolicy;
   heartbeatEnabled?: boolean;
@@ -1741,6 +1742,7 @@ interface CreateAgentRoleRequest {
   // Automation fields
   autonomyLevel?: AgentAutonomyLevel;
   worksOn?: import("../shared/bot-computer").BotWorksOn;
+  desktopHost?: string;
   soul?: string;
   operatorMandate?: string;
   allowedLoopTypes?: import("../shared/types").CompanyLoopType[];
@@ -1774,6 +1776,7 @@ interface UpdateAgentRoleRequest {
   /** The agent's access limit; null clears it. */
   accessProfileId?: string | null;
   worksOn?: import("../shared/bot-computer").BotWorksOn | null;
+  desktopHost?: string | null;
   soul?: string;
   operatorMandate?: string;
   allowedLoopTypes?: import("../shared/types").CompanyLoopType[];
@@ -3432,6 +3435,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
       read?: boolean;
       write?: boolean;
       delete?: boolean;
+      sandboxType?: SandboxType;
+      spaceConfig?: SpaceSandboxConfig;
     },
   ) => ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_UPDATE_PERMISSIONS, id, permissions),
 
@@ -4145,6 +4150,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   downloadUpdate: (updateInfo: Any) =>
     ipcRenderer.invoke(IPC_CHANNELS.APP_DOWNLOAD_UPDATE, updateInfo),
   installUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_INSTALL_UPDATE),
+  cancelUpdate: () => ipcRenderer.invoke(IPC_CHANNELS.APP_CANCEL_UPDATE),
+  openUpdateWindow: () => ipcRenderer.invoke(IPC_CHANNELS.APP_OPEN_UPDATE_WINDOW),
+  getUpdatePreferences: () => ipcRenderer.invoke(IPC_CHANNELS.APP_GET_UPDATE_PREFERENCES),
+  setUpdatePreferences: (patch: { autoDownload?: boolean; skippedVersion?: string | null }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.APP_SET_UPDATE_PREFERENCES, patch),
 
   // CoWork Pulse APIs
   getPulseSettings: () => ipcRenderer.invoke(IPC_CHANNELS.PULSE_GET_SETTINGS),
@@ -4466,6 +4476,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_TAKE_OVER, taskId),
   handBackComputer: (taskId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_HAND_BACK, taskId),
+  openBotDesktop: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_OPEN_DESKTOP, taskId),
+  stopBotDesktop: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_STOP_DESKTOP, taskId),
   onComputerViewEvent: (callback: (state: ComputerViewState) => void) => {
     const channel = IPC_CHANNELS.COMPUTER_VIEW_EVENT;
     const listener = (_e: Any, payload: ComputerViewState) => callback(payload);
@@ -7258,6 +7272,8 @@ export interface ElectronAPI {
       read?: boolean;
       write?: boolean;
       delete?: boolean;
+      sandboxType?: SandboxType;
+      spaceConfig?: SpaceSandboxConfig;
     },
   ) => Promise<Any>;
   getInputRequestDraftReview: (
@@ -8049,14 +8065,18 @@ export interface ElectronAPI {
   ) => Promise<import("../shared/types").UpdateInfo>;
   downloadUpdate: (updateInfo: Any) => Promise<{ success: boolean }>;
   installUpdate: () => Promise<{ success: boolean }>;
+  /** Stop a packaged download in flight; false when nothing could be cancelled. */
+  cancelUpdate: () => Promise<{ cancelled: boolean }>;
+  /** "Check for Updates…": opens the update window with the answer. */
+  openUpdateWindow: () => Promise<{ success: boolean }>;
+  getUpdatePreferences: () => Promise<import("../shared/types").UpdatePreferences>;
+  /** `skippedVersion: null` clears a skipped version. */
+  setUpdatePreferences: (patch: {
+    autoDownload?: boolean;
+    skippedVersion?: string | null;
+  }) => Promise<import("../shared/types").UpdatePreferences>;
   onUpdateProgress: (
-    callback: (progress: {
-      phase: "checking" | "downloading" | "extracting" | "installing" | "complete" | "error";
-      percent?: number;
-      message: string;
-      bytesDownloaded?: number;
-      bytesTotal?: number;
-    }) => void,
+    callback: (progress: import("../shared/types").UpdateProgress) => void,
   ) => () => void;
   onUpdateDownloaded: (
     callback: (info: { requiresRestart: boolean; message: string }) => void,
@@ -8610,6 +8630,9 @@ export interface ElectronAPI {
   /** The person takes over: the bot's computer and browser actions are refused until hand-back. */
   takeOverComputer: (taskId: string) => Promise<ComputerViewState>;
   handBackComputer: (taskId: string) => Promise<ComputerViewState>;
+  /** Opens the bot's own desktop in a window (full view; you can use it after taking over). */
+  openBotDesktop: (taskId: string) => Promise<{ opened: boolean }>;
+  stopBotDesktop: (taskId: string) => Promise<{ stopped: boolean }>;
   onComputerViewEvent: (callback: (state: ComputerViewState) => void) => () => void;
   // Tray (Menu Bar)
   getTraySettings: () => Promise<TraySettings>;
@@ -9497,7 +9520,7 @@ export interface ElectronAPI {
     agents: { maxHeartbeatFrequencySec: number; maxConcurrentAgents: number };
     runtime: {
       allowedPermissionModes: PermissionMode[];
-      allowedSandboxTypes: Array<"macos" | "docker" | "none">;
+      allowedSandboxTypes: Array<"macos" | "docker" | "space" | "none">;
       requireSandboxForShell: boolean;
       allowUnsandboxedShell: boolean;
       network: {
@@ -9525,7 +9548,7 @@ export interface ElectronAPI {
     agents: { maxHeartbeatFrequencySec: number; maxConcurrentAgents: number };
     runtime: {
       allowedPermissionModes: PermissionMode[];
-      allowedSandboxTypes: Array<"macos" | "docker" | "none">;
+      allowedSandboxTypes: Array<"macos" | "docker" | "space" | "none">;
       requireSandboxForShell: boolean;
       allowUnsandboxedShell: boolean;
       network: {

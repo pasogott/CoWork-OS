@@ -1,3 +1,4 @@
+import { describeSpaceExecution } from "../../../shared/space-sandbox";
 import { isReadOnlyHttpRequestInput } from "../security/http-permission-context";
 import { mcpConfigurationCurrent } from "../../mcp/configuration-authority";
 import { MCPEventService } from "../../mcp/events/MCPEventService";
@@ -180,6 +181,7 @@ import { AndroidPhoneTools, ANDROID_PHONE_TOOLS } from "./android-phone-tools";
 import { BatchImageTools } from "./batch-image-tools";
 import { ScratchpadTools } from "./scratchpad-tools";
 import { ComputerHandoffTools } from "./computer-handoff-tools";
+import { BotDesktopTools } from "./bot-desktop-tools";
 import { QATools } from "./qa-tools";
 import { WebPreviewTools } from "./web-preview-tools";
 import {
@@ -668,6 +670,7 @@ export class ToolRegistry {
   private documentTools: DocumentTools;
   private scratchpadTools: ScratchpadTools;
   private computerHandoffTools: ComputerHandoffTools;
+  private botDesktopTools: BotDesktopTools;
   private qaTools: QATools;
   private webPreviewTools: WebPreviewTools;
   private citationTracker?: CitationTracker;
@@ -762,6 +765,7 @@ export class ToolRegistry {
     );
     this.scratchpadTools = new ScratchpadTools(taskId, workspace);
     this.computerHandoffTools = new ComputerHandoffTools(taskId);
+    this.botDesktopTools = new BotDesktopTools(daemon as Any, taskId);
     this.qaTools = new QATools(workspace, daemon, taskId);
     this.webPreviewTools = new WebPreviewTools(workspace, daemon, taskId);
     // Some unit tests stub daemon as a plain object. Make database-backed tools optional.
@@ -1204,6 +1208,10 @@ export class ToolRegistry {
    * Used when switching workspaces mid-task
    */
   setWorkspace(workspace: Workspace): void {
+    const codeScopeChanged =
+      this.workspace.id !== workspace.id ||
+      this.workspace.path !== workspace.path ||
+      JSON.stringify(this.workspace.permissions) !== JSON.stringify(workspace.permissions);
     this.workspace = workspace;
     this.fileTools.setWorkspace(workspace);
     this.skillTools.setWorkspace(workspace);
@@ -1249,7 +1257,12 @@ export class ToolRegistry {
     this.swarmTools.setWorkspace(workspace);
     this.documentTools.setWorkspace(workspace);
     this.scratchpadTools.setWorkspace(workspace);
-    this._codeExecTools = undefined;
+    // Profile changes cancel remote work before discarding its adapter.
+    // The adapter journals and completes its independent cleanup.
+    if (codeScopeChanged) {
+      void this._codeExecTools?.cleanup().catch(() => undefined);
+      this._codeExecTools = undefined;
+    }
     this.invalidateToolCaches();
   }
 
@@ -1368,9 +1381,10 @@ export class ToolRegistry {
   /** Whether the bot's "Works on" setting takes this tool away. */
   private isBlockedByBotWorksOn(toolName: string): boolean {
     const worksOn = this.currentBotWorksOn();
-    if (!worksOn || worksOn === "auto" || worksOn === "this_computer") return false;
+    const restricted = worksOn === "browser" || worksOn === "off" || worksOn === "own_desktop";
     const kind = computerToolKind(toolName, {
-      hostDesktopMcp: this.getCodexConsentServer(toolName) !== null,
+      // Only a restricted setting needs to know whether an MCP tool drives this computer.
+      hostDesktopMcp: restricted && this.getCodexConsentServer(toolName) !== null,
     });
     return isComputerToolBlocked(worksOn, kind);
   }
@@ -1674,6 +1688,9 @@ export class ToolRegistry {
 
     // Hand a step to the person (passwords, codes, payments) instead of doing it
     allTools.push(...ComputerHandoffTools.getToolDefinitions());
+
+    // The bot's own desktop (offered only to a bot set to work there; see isBlockedByBotWorksOn)
+    allTools.push(...BotDesktopTools.getToolDefinitions());
 
     // Playwright QA tools (automated visual testing for web apps)
     allTools.push(...QATools.getToolDefinitions());
@@ -3203,6 +3220,30 @@ export class ToolRegistry {
     register("request_takeover", async ({ request }) =>
       this.computerHandoffTools.requestTakeover(request.input),
     );
+    register("desktop_screenshot", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_screenshot", request.input),
+    );
+    register("desktop_open_url", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_open_url", request.input),
+    );
+    register("desktop_click", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_click", request.input),
+    );
+    register("desktop_type", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_type", request.input),
+    );
+    register("desktop_key", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_key", request.input),
+    );
+    register("desktop_scroll", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_scroll", request.input),
+    );
+    register("desktop_drag", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_drag", request.input),
+    );
+    register("desktop_run", async ({ request }) =>
+      this.botDesktopTools.execute("desktop_run", request.input),
+    );
     register("read_clipboard", async () => this.systemTools.readClipboard());
     register("write_clipboard", async ({ request }) =>
       this.systemTools.writeClipboard(request.input.text),
@@ -3893,7 +3934,12 @@ export class ToolRegistry {
     register("set_vibes", async ({ request }) => this.setVibes(request.input));
     register("update_lore", async ({ request }) => this.updateLore(request.input));
     register("manage_heartbeat", async ({ request }) => this.manageHeartbeat(request.input));
-    register("execute_code", async ({ request }) => this.executeCode(request.input));
+    register("execute_code", async ({ request }) =>
+      this.executeCode(
+        request.input,
+        request.runtime?.signal instanceof AbortSignal ? request.runtime.signal : undefined,
+      ),
+    );
     register("parse_document", async ({ request }) => this.parseDocument(request.input));
     register("acp_discover", async ({ request }) => this.acpDiscover(request.input));
     register("Skill", async ({ request }) => this.executeSkillCommand(request.input));
@@ -5308,6 +5354,7 @@ ${skillDescriptions}`;
     if (name === "scratchpad_write") return this.scratchpadTools.write(input);
     if (name === "scratchpad_read") return this.scratchpadTools.read(input);
     if (name === "request_takeover") return this.computerHandoffTools.requestTakeover(input);
+    if (name.startsWith("desktop_")) return this.botDesktopTools.execute(name, input);
     if (name === "read_clipboard") return await this.systemTools.readClipboard();
     if (name === "write_clipboard") return await this.systemTools.writeClipboard(input.text);
     if (name === "take_screenshot") return await this.systemTools.takeScreenshot(input);
@@ -5717,7 +5764,10 @@ ${skillDescriptions}`;
 
     // Sandboxed code execution
     if (name === "execute_code") {
-      return await this.executeCode(input);
+      return await this.executeCode(
+        input,
+        _runtime?.signal instanceof AbortSignal ? _runtime.signal : undefined,
+      );
     }
 
     // Document parsing
@@ -6253,6 +6303,7 @@ ${skillDescriptions}`;
    * Cleanup resources (call when task is done)
    */
   async cleanup(): Promise<void> {
+    await this._codeExecTools?.cleanup().catch(() => undefined);
     this.codexConsentClosed = true;
     this.codexTaskConsents?.clear();
     await this.browserTools.cleanup();
@@ -9837,7 +9888,9 @@ ${skillDescriptions}`;
       {
         name: "run_command",
         description:
-          "Execute a shell command in the workspace directory. On macOS/Linux prefer python3 for Python scripts; do not assume a python alias exists or retry python after python3 succeeded. Use get_file_info with inspectArtifact:true for saved workbook sheet/formula/chart counts and Word style structure, or parse_document for content and PDF pagination before shell dependency probes. IMPORTANT: Commands run within the active access profile. Additional authority is requested only when the operation requires it. If additional authority is needed, the request identifies that boundary. Use this for installing packages (npm, pip, brew), running build commands, git operations, or terminal commands. Commands run non-interactively, with no terminal to answer prompts: pass flags such as -y/--yes, --no-input, or git commit -m, and avoid editors and pagers. For anything that runs until stopped (dev servers such as npm run dev or vite, python -m http.server, file watchers, --watch modes), set background: true: the call returns after a short startup window with the process_id and startup output, and the process keeps running; then use process_output to read its output and stop_process to stop it. Without background, such commands block until the timeout and are killed. Do not use shell heredocs or echo/printf redirection to create artifact files when write_file or edit_file is available; use file tools for file creation and editing. To read or check the contents of .xlsx, .docx, .pptx, or .pdf files, use parse_document instead of unzipping them or parsing their XML in a script.",
+          this.workspace.permissions.sandboxType === "space"
+            ? describeSpaceExecution(this.workspace.permissions.spaceConfig || {})
+            : "Execute a shell command in the workspace directory. On macOS/Linux prefer python3 for Python scripts; do not assume a python alias exists or retry python after python3 succeeded. Use get_file_info with inspectArtifact:true for saved workbook sheet/formula/chart counts and Word style structure, or parse_document for content and PDF pagination before shell dependency probes. IMPORTANT: Commands run within the active access profile. Additional authority is requested only when the operation requires it. If additional authority is needed, the request identifies that boundary. Use this for installing packages (npm, pip, brew), running build commands, git operations, or terminal commands. Commands run non-interactively, with no terminal to answer prompts: pass flags such as -y/--yes, --no-input, or git commit -m, and avoid editors and pagers. For anything that runs until stopped (dev servers such as npm run dev or vite, python -m http.server, file watchers, --watch modes), set background: true: the call returns after a short startup window with the process_id and startup output, and the process keeps running; then use process_output to read its output and stop_process to stop it. Without background, such commands block until the timeout and are killed. Do not use shell heredocs or echo/printf redirection to create artifact files when write_file or edit_file is available; use file tools for file creation and editing. To read or check the contents of .xlsx, .docx, .pptx, or .pdf files, use parse_document instead of unzipping them or parsing their XML in a script.",
         input_schema: {
           type: "object",
           properties: {
@@ -11410,17 +11463,22 @@ ${skillDescriptions}`;
   /**
    * Execute code in a sandboxed process.
    */
-  private async executeCode(input: {
-    language: "python" | "javascript" | "shell";
-    code: string;
-    timeout_seconds?: number;
-    allow_network?: boolean;
-  }) {
+  private async executeCode(
+    input: {
+      language: "python" | "javascript" | "shell";
+      code: string;
+      timeout_seconds?: number;
+      allow_network?: boolean;
+    },
+    signal?: AbortSignal,
+  ) {
     if (!this._codeExecTools) {
       this._codeExecTools = new CodeExecTools(this.workspace);
     }
     try {
-      return await this._codeExecTools.executeCode(input);
+      return await (signal
+        ? this._codeExecTools.executeCode(input, signal)
+        : this._codeExecTools.executeCode(input));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return {
@@ -14430,7 +14488,11 @@ ${skillDescriptions}`;
         },
       },
       // Sandboxed code execution
-      ...CodeExecTools.getToolDefinitions(),
+      ...CodeExecTools.getToolDefinitions(
+        this.workspace.permissions.sandboxType === "space"
+          ? this.workspace.permissions.spaceConfig
+          : undefined,
+      ),
       // Document parsing
       ...DocumentParserTools.getToolDefinitions(),
       // Sub-Agent / Parallel Agent tools

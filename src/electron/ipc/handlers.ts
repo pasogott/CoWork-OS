@@ -283,6 +283,7 @@ import {
   UpdateChannelRequest as _UpdateChannelRequest,
   SecurityMode as _SecurityMode,
   UpdateInfo,
+  UpdatePreferences,
   TEMP_WORKSPACE_NAME,
   TEMP_WORKSPACE_ROOT_DIR_NAME,
   Workspace,
@@ -375,7 +376,7 @@ import { assertTerminalShellAllowed } from "../terminal/terminal-shell-policy";
 import { normalizeTerminalAttachInput } from "../terminal/terminal-input-policy";
 import { ChannelGateway } from "../gateway";
 import { CHANNEL_TYPES } from "../gateway/channels/types";
-import { updateManager } from "../updater";
+import { getUpdatePrompt, UpdatePreferencesStore, updateManager } from "../updater";
 import { rateLimiter, RATE_LIMIT_CONFIGS } from "../utils/rate-limiter";
 import { toPublicChannel } from "./channel-config-sanitizer";
 import { buildSavedLLMSettings } from "./llm-settings-save";
@@ -397,6 +398,7 @@ import {
   CronListOptionsSchema,
   CronRunModeSchema,
   WorkspaceCreateSchema,
+  WorkspacePermissionsUpdateSchema,
   TaskCreateSchema,
   TaskRenameSchema,
   TaskWorkspaceUpdateSchema,
@@ -438,6 +440,7 @@ import {
   StringIdSchema,
   AgentRoleAccessProfileIdSchema,
   AgentRoleWorksOnSchema,
+  AgentRoleDesktopHostSchema,
   MCPConnectorOAuthSchema,
   ChatGPTImportSchema,
   TextMemoryImportSchema,
@@ -524,6 +527,7 @@ import {
 } from "../chronicle";
 import { ComputerUseSessionManager } from "../computer-use/session-manager";
 import { ComputerViewService } from "../computer-use/computer-view-service";
+import { BotDesktopManager, findBotDesktopResources } from "../computer-use/bot-desktop-manager";
 import { registerAndroidPhoneHandlers } from "./android-phone-handlers";
 import { ComputerUseHelperRuntime } from "../computer-use/helper-runtime";
 import {
@@ -1613,6 +1617,26 @@ export async function setupIpcHandlers(
     options?.getMainWindow?.() ?? getMainWindow();
   ComputerUseSessionManager.getInstance().setMainWindowGetter(computerUseMainWindow);
   registerAndroidPhoneHandlers(computerUseMainWindow);
+  // Each bot's own desktop (Works on: Its own desktop), in containers on this computer.
+  const desktopViewers = new Map<string, BrowserWindow>();
+  const botDesktops = BotDesktopManager.configure({
+    dataDir: () => _app.getPath("userData"),
+    resourcesDir: findBotDesktopResources,
+    desktopHostFor: (botId) => agentDaemon.getAgentRoleById(botId)?.desktopHost,
+    desktopHosts: () =>
+      agentDaemon
+        .getActiveAgentRoles()
+        .map((role) => role.desktopHost)
+        .filter((host): host is string => typeof host === "string" && host.length > 0),
+    hostUid: process.getuid?.(),
+    // An open viewer window (after take-over) is use: the desktop is not stopped as idle.
+    inUse: (botId) => {
+      const viewer = desktopViewers.get(botId);
+      return Boolean(viewer && !viewer.isDestroyed());
+    },
+  });
+  void botDesktops.stopLeftovers();
+  _app.on("will-quit", () => botDesktops.stopAllOnQuit());
   const computerView = ComputerViewService.getInstance();
   computerView.configure({
     notify: (state) => {
@@ -1621,6 +1645,11 @@ export async function setupIpcHandlers(
     },
     logEvent: (taskId, type, payload) => agentDaemon.logEvent(taskId, type as Any, payload),
     captureBrowser: (taskId) => getBrowserWorkbenchService().capturePreview(taskId),
+    captureDesktop: async (taskId) => {
+      const botId = agentDaemon.getTask(taskId)?.assignedAgentRoleId;
+      const png = botId ? await botDesktops.captureIfRunning(botId) : null;
+      return png ? { png, label: "Its own desktop" } : null;
+    },
     setBrowserPaused: (taskId, paused) =>
       getBrowserWorkbenchService().setPausedByUserForTask(taskId, paused),
   });
@@ -1672,6 +1701,61 @@ export async function setupIpcHandlers(
   ipcMain.handle(IPC_CHANNELS.COMPUTER_VIEW_HAND_BACK, (_event, taskId: unknown) => {
     checkRateLimit(IPC_CHANNELS.COMPUTER_VIEW_HAND_BACK);
     return computerView.handBack(readComputerViewTaskId(taskId));
+  });
+  // The bot's own desktop in a window of its own: the full, interactive view for take-over.
+  const desktopBotForTask = async (taskId: unknown): Promise<{ botId: string; name: string }> => {
+    const task = await agentDaemon.getTaskById(readComputerViewTaskId(taskId));
+    const botId = task?.assignedAgentRoleId;
+    const role = botId ? agentDaemon.getAgentRoleById(botId) : undefined;
+    if (!botId || role?.worksOn !== "own_desktop") {
+      throw new Error("This bot doesn't work on its own desktop.");
+    }
+    return { botId, name: role.displayName || "Bot" };
+  };
+  ipcMain.handle(IPC_CHANNELS.COMPUTER_VIEW_OPEN_DESKTOP, async (_event, taskId: unknown) => {
+    checkRateLimit(IPC_CHANNELS.COMPUTER_VIEW_OPEN_DESKTOP);
+    const { botId, name } = await desktopBotForTask(taskId);
+    // You can use the desktop only after taking over; otherwise the view is read-only.
+    const url = await botDesktops.viewerUrl(botId, {
+      viewOnly: !computerView.isHeldByPerson(readComputerViewTaskId(taskId)),
+    });
+    const origin = new URL(url).origin;
+    const existing = desktopViewers.get(botId);
+    if (existing && !existing.isDestroyed()) {
+      if (existing.webContents.getURL() !== url) await existing.loadURL(url);
+      existing.focus();
+      return { opened: true };
+    }
+    const viewer = new BrowserWindow({
+      width: 1300,
+      height: 860,
+      title: `${name}'s desktop`,
+      autoHideMenuBar: true,
+      webPreferences: {
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        partition: "cowork-bot-desktop-viewer",
+      },
+    });
+    // The viewer stays on the desktop's own loopback address.
+    viewer.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    viewer.webContents.on("will-navigate", (navigation, target) => {
+      if (!target.startsWith(origin)) navigation.preventDefault();
+    });
+    viewer.on("page-title-updated", (titleEvent) => titleEvent.preventDefault());
+    viewer.on("closed", () => desktopViewers.delete(botId));
+    desktopViewers.set(botId, viewer);
+    await viewer.loadURL(url);
+    return { opened: true };
+  });
+  ipcMain.handle(IPC_CHANNELS.COMPUTER_VIEW_STOP_DESKTOP, async (_event, taskId: unknown) => {
+    checkRateLimit(IPC_CHANNELS.COMPUTER_VIEW_STOP_DESKTOP);
+    const { botId } = await desktopBotForTask(taskId);
+    desktopViewers.get(botId)?.close();
+    await botDesktops.stop(botId);
+    computerView.noteReleased(readComputerViewTaskId(taskId), "own_desktop");
+    return { stopped: true };
   });
 
   const db = dbManager.getDatabase();
@@ -4656,7 +4740,10 @@ export async function setupIpcHandlers(
       if (!workspace) {
         throw new Error(`Workspace not found: ${id}`);
       }
-      return agentDaemon.updateWorkspacePermissions(id, permissions);
+      return agentDaemon.updateWorkspacePermissions(
+        id,
+        validateInput(WorkspacePermissionsUpdateSchema, permissions, "workspace permissions"),
+      );
     },
   );
 
@@ -9539,6 +9626,37 @@ export async function setupIpcHandlers(
     return { success: true };
   });
 
+  ipcMain.handle(IPC_CHANNELS.APP_CANCEL_UPDATE, async () => {
+    return { cancelled: updateManager.cancelDownload() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.APP_OPEN_UPDATE_WINDOW, async () => {
+    await getUpdatePrompt().checkNow();
+    return { success: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.APP_GET_UPDATE_PREFERENCES, async () => {
+    return UpdatePreferencesStore.load();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.APP_SET_UPDATE_PREFERENCES, async (_, patch: unknown) => {
+    // Renderer input: only the two known fields, each type-checked; null clears the skip.
+    if (!patch || typeof patch !== "object") throw new Error("Invalid update preferences");
+    const input = patch as Record<string, unknown>;
+    const next: Partial<UpdatePreferences> = {};
+    if ("autoDownload" in input) {
+      if (typeof input.autoDownload !== "boolean") throw new Error("Invalid autoDownload");
+      next.autoDownload = input.autoDownload;
+    }
+    if ("skippedVersion" in input) {
+      if (input.skippedVersion !== null && typeof input.skippedVersion !== "string") {
+        throw new Error("Invalid skippedVersion");
+      }
+      next.skippedVersion = input.skippedVersion ?? undefined;
+    }
+    return UpdatePreferencesStore.save(next);
+  });
+
   // Guardrail Settings handlers
   ipcMain.handle(IPC_CHANNELS.GUARDRAIL_GET_SETTINGS, async () => {
     return GuardrailManager.loadSettings();
@@ -9789,6 +9907,11 @@ export async function setupIpcHandlers(
       request.worksOn =
         validateInput(AgentRoleWorksOnSchema, request.worksOn, "works on") ?? undefined;
     }
+    if (request.desktopHost !== undefined) {
+      request.desktopHost =
+        validateInput(AgentRoleDesktopHostSchema, request.desktopHost, "desktop server") ??
+        undefined;
+    }
     return agentRoleRepo.create(request);
   });
 
@@ -9832,6 +9955,13 @@ export async function setupIpcHandlers(
         AgentRoleWorksOnSchema,
         normalizedRequest.worksOn,
         "works on",
+      );
+    }
+    if (normalizedRequest.desktopHost !== undefined) {
+      normalizedRequest.desktopHost = validateInput(
+        AgentRoleDesktopHostSchema,
+        normalizedRequest.desktopHost,
+        "desktop server",
       );
     }
     const result = await agentRoleRepo.update(normalizedRequest);

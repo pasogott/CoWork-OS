@@ -190,6 +190,7 @@
     "models:check": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/sync-model-metadata.mjs --check",
     "skills:check": "node scripts/qa/skills-check.mjs",
     "qa:application-execution": "vitest run src/electron/applications/__tests__",
+    "qa:space:live": "npm run build:daemon && node scripts/qa/space-live-smoke.cjs",
     "qa:application-execution:smoke": "npm run build:electron && node scripts/qa/application-execution-smoke.cjs",
     "qa:application-execution:smoke:daemon": "npm run build:daemon && cross-env COWORK_SMOKE_DIST=daemon node scripts/qa/application-execution-smoke.cjs",
     "type-check": "tsc --noEmit",
@@ -384,6 +385,10 @@
       {
         "from": "resources/computer-use",
         "to": "computer-use"
+      },
+      {
+        "from": "resources/bot-desktop",
+        "to": "bot-desktop"
       },
       {
         "from": "build/numbat",
