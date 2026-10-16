@@ -1,8 +1,16 @@
 import {
+  BROWSER_VAULT_IPC,
+  type BrowserVaultItem,
+  type BrowserVaultAnswer,
+  type BrowserVaultCommand,
+  type BrowserVaultPrompt,
+} from "../shared/browser-vault";
+import {
   COMPOSER_PREDICTION_CHANNEL,
   COMPOSER_PREDICTION_CANCEL_CHANNEL,
 } from "../shared/composer-predictions";
 import type { ApprovalRequest } from "../shared/types";
+import type { AndroidPhoneSettings, AndroidPhoneStatus } from "../shared/android-phone";
 import type {
   ApprovalDraftPreview,
   InlineApprovalDraftReview,
@@ -85,6 +93,7 @@ import type { AnswerImageRequest, AnswerImageResult } from "../shared/answer-sur
 import type {
   MemoryRepoCompactResult,
   MemoryRepoSyncNowResult,
+  MemoryRepoBotMemoryReport,
   MemoryRepoDreamActionResult,
   MemoryRepoDreamNowResult,
   MemoryRepoDreamPart,
@@ -2426,6 +2435,23 @@ contextBridge.exposeInMainWorld("electronAPI", {
       deleted?: boolean;
       error?: string;
     }>,
+  listBrowserVaultPrompts: () =>
+    ipcRenderer.invoke(BROWSER_VAULT_IPC.prompts) as Promise<BrowserVaultPrompt[]>,
+  respondBrowserVaultPrompt: (id: string, answer: BrowserVaultAnswer | null) =>
+    ipcRenderer.invoke(BROWSER_VAULT_IPC.respond, { id, answer }) as Promise<{ success: boolean }>,
+  dismissBrowserVaultPrompt: (id: string) =>
+    ipcRenderer.invoke(BROWSER_VAULT_IPC.dismiss, id) as Promise<{ success: boolean }>,
+  browserVaultCommand: (taskId: string, command: BrowserVaultCommand) =>
+    ipcRenderer.invoke(BROWSER_VAULT_IPC.command, { taskId, command }) as Promise<{
+      success: boolean;
+      error?: string;
+      [key: string]: unknown;
+    }>,
+  onBrowserVaultPromptChanged: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on(BROWSER_VAULT_IPC.changed, listener);
+    return () => ipcRenderer.removeListener(BROWSER_VAULT_IPC.changed, listener);
+  },
   listBrowserLogins: (data: { workspaceId: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.BROWSER_VAULT_LIST, data) as Promise<BrowserLoginsResult>,
   listBrowserLoginsForPage: (data: { workspaceId: string; url: string }) =>
@@ -3279,6 +3305,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.TASK_RENAME, { id, title }),
   updateTaskWorkspace: (taskId: string, workspaceId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.TASK_UPDATE_WORKSPACE, { taskId, workspaceId }),
+  setTaskModel: (selection: {
+    taskId: string;
+    providerType: LLMProviderType;
+    modelKey: string;
+    reasoningEffort?: LLMReasoningEffort;
+  }) => ipcRenderer.invoke(IPC_CHANNELS.TASK_SET_MODEL, selection),
   archiveTask: (id: string) => ipcRenderer.invoke(IPC_CHANNELS.TASK_ARCHIVE, id),
   archiveWorkspaceSessions: (workspaceId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.TASK_ARCHIVE_WORKSPACE_SESSIONS, workspaceId),
@@ -4402,6 +4434,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.CHRONICLE_CLEAR_OBSERVATIONS, input),
 
   getComputerUseStatus: () => ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_USE_GET_STATUS),
+  getAndroidPhoneStatus: () => ipcRenderer.invoke("androidPhone:status"),
+  saveAndroidPhoneSettings: (settings: AndroidPhoneSettings) =>
+    ipcRenderer.invoke("androidPhone:settings", settings),
+  installAndroidPhoneRuntime: () => ipcRenderer.invoke("androidPhone:install"),
+  stopAndroidPhone: () => ipcRenderer.invoke("androidPhone:stop"),
   endComputerUseSession: () => ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_USE_END_SESSION),
   openComputerUseAccessibilitySettings: () =>
     ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_USE_OPEN_ACCESSIBILITY),
@@ -4614,7 +4651,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.CANVAS_SNAPSHOT, sessionId),
   canvasExportHTML: (sessionId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.CANVAS_EXPORT_HTML, sessionId),
-  canvasExportToFolder: (data: { sessionId: string; targetDir: string }) =>
+  canvasExportToFolder: (data: { sessionId: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.CANVAS_EXPORT_TO_FOLDER, data),
   canvasOpenInBrowser: (sessionId: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.CANVAS_OPEN_IN_BROWSER, sessionId),
@@ -4809,6 +4846,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   openMemoryRepoFolder: () => ipcRenderer.invoke(IPC_CHANNELS.MEMORY_REPO_OPEN_FOLDER),
   compactMemoryRepoHistory: () => ipcRenderer.invoke(IPC_CHANNELS.MEMORY_REPO_COMPACT_HISTORY),
   syncMemoryRepoNow: () => ipcRenderer.invoke(IPC_CHANNELS.MEMORY_REPO_SYNC_NOW),
+  getBotMemory: (data: { botId: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MEMORY_REPO_BOT_MEMORY, data),
+  forgetBotMemoryEntry: (data: { botId: string; ref: string; hash: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MEMORY_REPO_BOT_FORGET, data),
+  undoBotMemoryChange: (data: { botId: string; commit: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.MEMORY_REPO_BOT_UNDO, data),
 
   // PACT business agents (docs/pact.md)
   getPactStatus: () => ipcRenderer.invoke(IPC_CHANNELS.PACT_STATUS),
@@ -5769,6 +5812,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   listTriggers: (workspaceId: string) => ipcRenderer.invoke(IPC_CHANNELS.TRIGGER_LIST, workspaceId),
   listMcpEvents: (serverId: string) => ipcRenderer.invoke(IPC_CHANNELS.MCP_EVENTS_LIST, serverId),
   getMcpEventsStatus: () => ipcRenderer.invoke(IPC_CHANNELS.MCP_EVENTS_STATUS),
+  getMcpEventsReceiverPort: () => ipcRenderer.invoke(IPC_CHANNELS.MCP_EVENTS_RECEIVER_PORT),
   addTrigger: (data: Any) => ipcRenderer.invoke(IPC_CHANNELS.TRIGGER_ADD, data),
   updateTrigger: (id: string, updates: Any) =>
     ipcRenderer.invoke(IPC_CHANNELS.TRIGGER_UPDATE, { id, updates }),
@@ -6138,6 +6182,7 @@ export interface BrowserSavedLogin {
   lastUsedAt?: number;
 }
 export interface BrowserLoginsResult {
+  items?: BrowserVaultItem[];
   success: boolean;
   logins: BrowserSavedLogin[];
   canStore?: boolean;
@@ -6466,6 +6511,17 @@ export interface ElectronAPI {
   browserImportDeleteFile: (data: {
     token: string;
   }) => Promise<{ success: boolean; deleted?: boolean; error?: string }>;
+  listBrowserVaultPrompts: () => Promise<BrowserVaultPrompt[]>;
+  dismissBrowserVaultPrompt: (id: string) => Promise<{ success: boolean }>;
+  respondBrowserVaultPrompt: (
+    id: string,
+    answer: BrowserVaultAnswer | null,
+  ) => Promise<{ success: boolean }>;
+  browserVaultCommand: (
+    taskId: string,
+    command: BrowserVaultCommand,
+  ) => Promise<{ success: boolean; error?: string; [key: string]: unknown }>;
+  onBrowserVaultPromptChanged: (callback: () => void) => () => void;
   listBrowserLogins: (data: { workspaceId: string }) => Promise<BrowserLoginsResult>;
   listBrowserLoginsForPage: (data: {
     workspaceId: string;
@@ -7043,6 +7099,12 @@ export interface ElectronAPI {
   killCommand: (taskId: string, force?: boolean) => Promise<boolean>;
   renameTask: (id: string, title: string) => Promise<void>;
   updateTaskWorkspace: (taskId: string, workspaceId: string) => Promise<Any>;
+  setTaskModel: (selection: {
+    taskId: string;
+    providerType: LLMProviderType;
+    modelKey: string;
+    reasoningEffort?: LLMReasoningEffort;
+  }) => Promise<Task>;
   archiveTask: (id: string) => Promise<Any>;
   archiveWorkspaceSessions?: (workspaceId: string) => Promise<{ sessionCount: number }>;
   deleteTask: (id: string) => Promise<void>;
@@ -8509,6 +8571,10 @@ export interface ElectronAPI {
     screenCaptureStatus: string;
     error: string | null;
   }>;
+  getAndroidPhoneStatus: () => Promise<AndroidPhoneStatus>;
+  saveAndroidPhoneSettings: (settings: AndroidPhoneSettings) => Promise<AndroidPhoneSettings>;
+  installAndroidPhoneRuntime: () => Promise<void>;
+  stopAndroidPhone: () => Promise<void>;
   endComputerUseSession: () => Promise<{ success: boolean }>;
   openComputerUseAccessibilitySettings: () => Promise<{ success: boolean }>;
   openComputerUseScreenRecordingSettings: () => Promise<{ success: boolean }>;
@@ -8716,8 +8782,7 @@ export interface ElectronAPI {
   canvasExportHTML: (sessionId: string) => Promise<{ content: string; filename: string }>;
   canvasExportToFolder: (data: {
     sessionId: string;
-    targetDir: string;
-  }) => Promise<{ files: string[]; targetDir: string }>;
+  }) => Promise<{ files: string[]; targetDir: string } | null>;
   canvasOpenInBrowser: (sessionId: string) => Promise<{ success: boolean; path: string }>;
   canvasOpenUrl: (data: {
     sessionId: string;
@@ -8940,6 +9005,16 @@ export interface ElectronAPI {
   openMemoryRepoFolder: () => Promise<{ success: true }>;
   compactMemoryRepoHistory: () => Promise<MemoryRepoCompactResult>;
   syncMemoryRepoNow: () => Promise<MemoryRepoSyncNowResult>;
+  getBotMemory: (data: { botId: string }) => Promise<MemoryRepoBotMemoryReport>;
+  forgetBotMemoryEntry: (data: {
+    botId: string;
+    ref: string;
+    hash: string;
+  }) => Promise<MemoryRepoEntryActionResult>;
+  undoBotMemoryChange: (data: {
+    botId: string;
+    commit: string;
+  }) => Promise<MemoryRepoEntryActionResult>;
 
   // PACT business agents. Sign-in links never reach the desktop renderer; openPactSignIn
   // opens the business's own login in the system browser from main.
@@ -9811,6 +9886,9 @@ export interface ElectronAPI {
   listAttention: () => Promise<import("../shared/attention").AttentionSnapshot>;
   /** Fires, without data, when the queue may have changed; reload it with listAttention. */
   onAttentionChanged: (callback: () => void) => () => void;
+
+  // MCP Events
+  getMcpEventsReceiverPort: () => Promise<number | null>;
 
   // Playwright QA APIs
   qaGetRuns: () => Promise<Any[]>;

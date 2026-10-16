@@ -1,3 +1,4 @@
+import { PrivateBrowserPrompts } from "./components/BrowserWorkbench/PrivateBrowserPrompt";
 import { requestBotMemoryContext } from "./components/memory/memory-hub-focus";
 import {
   BROWSER_HOST_UNSUPPORTED_ACTION_EVENT,
@@ -24,6 +25,7 @@ import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerE
 import { useReplayMode, type ReplayControls } from "./hooks/useReplayMode";
 import { useTaskDuration } from "./hooks/useTaskDuration";
 import { useComposerDraft } from "./hooks/useComposerDraft";
+import { useThreadModelSelection } from "./hooks/useThreadModelSelection";
 import { useAttentionSnapshot } from "./hooks/useAttentionSnapshot";
 import { attentionWaitingByTask, type AttentionItem } from "../shared/attention";
 import { ArrowLeft, ArrowRight, Globe, Moon, PanelTop, SquareTerminal, Sun } from "lucide-react";
@@ -61,6 +63,8 @@ import type { AutomationOwner } from "./components/automation-library";
 import { ResizableDividerHandle } from "./components/ResizableDividerHandle";
 import { DisclaimerModal } from "./components/DisclaimerModal";
 import { Onboarding } from "./components/Onboarding";
+import { ContextualConnectorSetup } from "./components/ContextualConnectorSetup";
+import { useContextualConnectorSetup } from "./hooks/useContextualConnectorSetup";
 import { ToastContainer } from "./components/Toast";
 import {
   ComputerUseApprovalDialog,
@@ -2500,6 +2504,15 @@ export function App() {
   const [sessionModelOverride, setSessionModelOverride] = useState<string>("");
   const [availableModels, setAvailableModels] = useState<LLMModelInfo[]>([]);
   const [availableProviders, setAvailableProviders] = useState<LLMProviderInfo[]>([]);
+  // The open conversation's own model (when pinned) drives the picker inside that conversation.
+  const threadModel = useThreadModelSelection({
+    task: remoteTaskView ? undefined : selectedTask,
+    globalModel: selectedModel,
+    globalProvider: selectedProvider,
+    globalModels: availableModels,
+    globalReasoningEffort: selectedReasoningEffort,
+    globalProviders: availableProviders,
+  });
 
   // Update notification state
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -3179,6 +3192,7 @@ export function App() {
   // Onboarding state (null = loading)
   const [onboardingCompleted, setOnboardingCompleted] = useState<boolean | null>(null);
   const [pendingOnboardingPrompt, setPendingOnboardingPrompt] = useState<string | null>(null);
+  const contextualConnectorSetup = useContextualConnectorSetup();
   const firstOnboardingPromptStartedRef = useRef(false);
   // Timestamp of when onboarding was completed
   const [onboardingCompletedAt, setOnboardingCompletedAt] = useState<string | undefined>(undefined);
@@ -3580,6 +3594,8 @@ export function App() {
   const handleSubAgentsFocusConsumed = useCallback(() => setSubAgentsFocusRequest(0), []);
 
   const handleShowOnboarding = () => {
+    firstOnboardingPromptStartedRef.current = false;
+    setPendingOnboardingPrompt(null);
     // Reset onboarding state to show the wizard again
     setOnboardingCompleted(false);
     // Close settings view if open
@@ -6319,6 +6335,7 @@ export function App() {
   ): Promise<boolean> => {
     const effectiveWorkspace = workspaceOverride ?? currentWorkspace;
     if (!effectiveWorkspace) return false;
+    if (!(await contextualConnectorSetup.prepareSubmission(prompt))) return false;
 
     const multitaskCommand = findMultitaskCommand(prompt, title);
     if (multitaskCommand?.isMultitask && !multitaskCommand.valid) {
@@ -6549,21 +6566,25 @@ export function App() {
       return;
     firstOnboardingPromptStartedRef.current = true;
     const prompt = pendingOnboardingPrompt;
-    setPendingOnboardingPrompt(null);
     void (async () => {
       try {
         const workspace =
           currentWorkspace ?? (await window.electronAPI.getTempWorkspace({ createNew: true }));
         if (!workspace) throw new Error("Could not create a workspace for the first task.");
         if (!currentWorkspace) setCurrentWorkspace(workspace);
-        await handleCreateTask(
+        const started = await handleCreateTask(
           prompt.slice(0, 80),
           prompt,
           { generateTitle: true },
           undefined,
           workspace,
         );
+        if (!started)
+          throw new Error("Your task has not started. Your request is ready to edit or try again.");
+        setPendingOnboardingPrompt(null);
       } catch (error) {
+        firstOnboardingPromptStartedRef.current = false;
+        setOnboardingCompleted(false);
         addToast({
           type: "error",
           title: "First task could not start",
@@ -6998,6 +7019,13 @@ export function App() {
     },
   ) => {
     if (!selectedTaskId) return;
+    if (
+      !remoteTaskView &&
+      !options?.verbatim &&
+      !(await contextualConnectorSetup.prepareSubmission(message))
+    ) {
+      throw new Error("Message not sent. Your request is ready to edit or try again.");
+    }
     const { verbatim = false, ...sendOptions } = options ?? {};
 
     try {
@@ -7251,6 +7279,43 @@ export function App() {
   }) => {
     const modelKey = selection.modelKey.trim();
     if (!modelKey) return;
+    // In an open conversation the choice belongs to that conversation: it keeps its history
+    // and the global default stays as it is.
+    const conversationTask = remoteTaskView ? undefined : selectedTask;
+    if (conversationTask && window.electronAPI?.setTaskModel) {
+      const providerType = selection.providerType || threadModel.providerType;
+      try {
+        const updated = await window.electronAPI.setTaskModel({
+          taskId: conversationTask.id,
+          providerType,
+          modelKey,
+          ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+        });
+        if (updated) {
+          setTasks((prev) => upsertTaskPreservingIdentity(prev, updated));
+          setBotConversationTasks((prev) => upsertTaskPreservingIdentity(prev, updated));
+        }
+        if (selection.reasoningEffort && providerType === selectedProvider) {
+          setSelectedReasoningEffort(selection.reasoningEffort);
+        }
+        if (selection.reasoningEffort) {
+          // task:setModel saved it as the provider's effort; show it without a reload.
+          const effort = selection.reasoningEffort;
+          setAvailableProviders((prev) =>
+            prev.map((p) => (p.type === providerType ? { ...p, reasoningEffort: effort } : p)),
+          );
+        }
+      } catch (error) {
+        console.error("Failed to set the conversation model:", error);
+        addToast({
+          type: "error",
+          title: "Model not changed",
+          message:
+            error instanceof Error ? error.message : "Could not change this conversation's model.",
+        });
+      }
+      return;
+    }
     const providerType = selection.providerType || selectedProvider;
     setSelectedModel(modelKey);
     setSelectedProvider(providerType);
@@ -8315,6 +8380,7 @@ export function App() {
       <div className="app">
         <Onboarding
           onComplete={handleOnboardingComplete}
+          initialPrompt={pendingOnboardingPrompt ?? undefined}
           workspaceId={currentWorkspace?.id ?? null}
         />
       </div>
@@ -8333,6 +8399,13 @@ export function App() {
 
   return (
     <div className={`app${RAIL_VIEWS.has(currentView) ? " app-shell" : ""}`}>
+      {contextualConnectorSetup.request && (
+        <ContextualConnectorSetup
+          request={contextualConnectorSetup.request}
+          onResolve={contextualConnectorSetup.resolve}
+        />
+      )}
+      <PrivateBrowserPrompts />
       <div
         className={`title-bar${RAIL_VIEWS.has(currentView) ? " title-bar-shell" : ""}`}
         style={
@@ -8917,10 +8990,10 @@ export function App() {
                   childEvents={childEvents}
                   activeInputRequest={activeInputRequest}
                   pendingInputRequests={pendingInputRequests}
-                  selectedModel={selectedModel}
-                  selectedProvider={selectedProvider}
-                  selectedReasoningEffort={selectedReasoningEffort}
-                  availableModels={availableModels}
+                  selectedModel={threadModel.modelKey}
+                  selectedProvider={threadModel.providerType}
+                  selectedReasoningEffort={threadModel.reasoningEffort}
+                  availableModels={threadModel.models}
                   availableProviders={availableProviders}
                   uiDensity={uiDensity}
                   homeResearchVaultEnabled={homeResearchVaultEnabled}

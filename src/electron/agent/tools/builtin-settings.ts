@@ -193,6 +193,7 @@ const TOOL_CATEGORIES: Record<string, keyof BuiltinToolsSettings["categories"]> 
   sharepoint_action: "webfetch",
   voice_call: "webfetch",
   // Browser tools
+  browser_vault: "browser",
   browser_navigate: "browser",
   browser_screenshot: "browser",
   browser_snapshot: "browser",
@@ -245,6 +246,11 @@ const TOOL_CATEGORIES: Record<string, keyof BuiltinToolsSettings["categories"]> 
   // Computer use tools
   screen_context_resolve: "chronicle",
   native_app: "computer_use",
+  android_phone_devices: "computer_use",
+  android_phone_observe: "computer_use",
+  android_phone_authorize: "computer_use",
+  android_phone_dispatch: "computer_use",
+  android_phone_readback: "computer_use",
   screenshot: "computer_use",
   click: "computer_use",
   double_click: "computer_use",

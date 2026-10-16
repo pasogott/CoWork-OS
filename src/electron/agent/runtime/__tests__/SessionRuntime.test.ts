@@ -8,6 +8,12 @@ import type { LLMMessage } from "../../llm";
 import { estimateTotalTokens } from "../../context-manager";
 import { fromOpenAICompatibleResponse } from "../../llm/openai-compatible";
 import { extractAnthropicUsage } from "../../llm/prompt-cache";
+import {
+  prepareAnthropicConversation,
+  anthropicContextFromResponse,
+} from "../../llm/anthropic-turn-context";
+import { anthropicReasoningFromResponse } from "../../llm/anthropic-thinking";
+import { appendAssistantResponseToConversation } from "../../executor-loop-utils";
 import { FileOperationTracker, ToolFailureTracker } from "../../executor-helpers";
 import { DurableContextService } from "../../../memory/DurableContextService";
 import {
@@ -43,6 +49,7 @@ function createBaseState(): SessionRuntimeState {
       toolUsageEventsSinceDecay: 0,
       toolSelectionEpoch: 0,
       discoveredDeferredToolNames: new Set(),
+      exposedToolNames: new Set(),
       availableToolsCacheKey: null,
       availableToolsCache: null,
       lastWebFetchFailure: null,
@@ -578,6 +585,63 @@ describe("SessionRuntime", () => {
     expect(harness.runtime.takeNextFollowUpAtTurnBoundary()?.message).toBe("Plan first");
     expect(harness.runtime.takeNextFollowUpAtTurnBoundary()?.message).toBe("Then continue");
   });
+  it("preserves scoped Claude context and signed thinking through real snapshot save and restoration", () => {
+    const source = createHarness();
+    const messages = source.runtime.state.transcript.conversationHistory;
+    messages.push({ role: "user", content: [{ type: "text", text: "Go" }] });
+    const request = {
+      model: "claude-opus-5-5",
+      maxTokens: 64,
+      system: "Stable\n\nCurrent",
+      messages,
+      systemBlocks: [
+        { text: "Stable", scope: "session" as const, cacheable: true, stableKey: "stable" },
+        { text: "Current", scope: "turn" as const, cacheable: false, stableKey: "turn" },
+      ],
+    };
+    const build = (history: LLMMessage[]) =>
+      prepareAnthropicConversation({
+        request,
+        messages: history,
+        converted: history.map((message) => ({ role: message.role, content: message.content })),
+        tools: undefined,
+        model: request.model,
+        provider: "anthropic",
+        replay: true,
+        enableTurnContext: true,
+      });
+    const first = build(messages);
+    const content = [{ type: "text" as const, text: "Done" }];
+    appendAssistantResponseToConversation(
+      messages,
+      {
+        content,
+        providerContext: anthropicContextFromResponse(first.pendingContext, content),
+        reasoning: anthropicReasoningFromResponse({
+          content: [{ type: "thinking", thinking: "", signature: "signature" }, ...content],
+          visibleContent: content,
+          model: request.model,
+          provider: "anthropic",
+          prefixHash: first.prefixHash,
+        }),
+      },
+      0,
+    );
+    messages.push({ role: "user", content: "Next" });
+    expect(source.runtime.saveSnapshot()).toBe(true);
+    const snapshot = source.emittedEvents
+      .filter((event) => event.type === "conversation_snapshot")
+      .at(-1)!;
+    const restored = createHarness();
+    restored.runtime.restoreFromEvents([JSON.parse(JSON.stringify(snapshot)) as Any]);
+    const history = restored.runtime.state.transcript.conversationHistory;
+    expect(history).toEqual(messages);
+    const replay = build(history);
+    expect(replay.replayedBlocks).toBe(1);
+    expect(replay.messages[1]).toEqual(first.messages[1]);
+    expect(replay.messages[2].content[0].signature).toBe("signature");
+  });
+
   it("holds mode-bearing messages for a turn boundary and restores their selections", () => {
     const harness = createHarness();
     harness.runtime.queueFollowUp("Discuss", undefined, undefined, undefined, undefined, {
@@ -1295,6 +1359,18 @@ describe("SessionRuntime", () => {
         }),
       ]),
     );
+  });
+
+  it("records why a request missed the prompt cache in llm_usage", () => {
+    const harness = createHarness();
+    harness.runtime.state.promptCache.promptCacheInvalidationReason = "tool_schema_changed";
+    harness.runtime.updateTracking(120, 45, 0);
+    harness.runtime.state.promptCache.promptCacheInvalidationReason = null;
+    harness.runtime.updateTracking(130, 40, 100);
+
+    const usage = harness.emittedEvents.filter((event) => event.type === "llm_usage");
+    expect(usage[0]?.payload.delta.cacheInvalidation).toBe("tool_schema_changed");
+    expect(usage[1]?.payload.delta).not.toHaveProperty("cacheInvalidation");
   });
 
   it("emits llm_usage with structured provider metadata from model selection", () => {
@@ -2191,10 +2267,27 @@ describe("SessionRuntime", () => {
 
   it("continues a max_tokens text turn with a user turn instead of an assistant prefill", async () => {
     const harness = createHarness();
+    const providerContext = {
+      format: "anthropic-turn-context-v1",
+      model: "claude-opus-5-5",
+      provider: "anthropic",
+      prefixHash: "prefix",
+      contentHash: "visible",
+      text: "Current context",
+    };
+    const reasoning = [
+      {
+        format: "anthropic",
+        model: "claude-opus-5-5",
+        data: { block: { type: "thinking", signature: "signature", thinking: "" } },
+      },
+    ];
     harness.createMessageWithTimeout
       .mockResolvedValueOnce({
         stopReason: "max_tokens",
         content: [{ type: "text", text: "Hello" }],
+        providerContext,
+        reasoning,
         usage: { inputTokens: 10, outputTokens: 5, cachedTokens: 0 },
       })
       .mockResolvedValueOnce({
@@ -2220,12 +2313,14 @@ describe("SessionRuntime", () => {
     expect(continuationMessages.at(-2)).toEqual({
       role: "assistant",
       content: [{ type: "text", text: "Hello" }],
+      providerContext,
+      reasoning,
     });
     expect(result.assistantText).toBe("Hello world");
-    // The stored transcript keeps one joined assistant answer, not the nudge.
+    // Keep each provider response and the continuation turn unchanged for replay.
     expect(result.messages).toEqual([
-      { role: "user", content: "Start" },
-      { role: "assistant", content: [{ type: "text", text: "Hello world" }] },
+      ...continuationMessages,
+      { role: "assistant", content: [{ type: "text", text: " world" }] },
     ]);
   });
 
@@ -3247,6 +3342,98 @@ describe("SessionRuntime", () => {
       "create_spreadsheet",
     );
     expect(renderToolsForContext).toHaveBeenCalledTimes(2);
+  });
+
+  describe("tools offered earlier stay offered", () => {
+    const graphTool = { name: "kg_create_entity", description: "Create a knowledge graph entity" };
+    const registry = (deferredGraph = false) => {
+      const kg = deferredGraph ? { ...graphTool, runtime: { deferLoad: true } } : graphTool;
+      return {
+        getTools: vi.fn(() => [{ name: "read_file" }, kg, { name: "web_search" }]),
+        getDeferredTools: vi.fn(() => (deferredGraph ? [kg] : [])),
+        getToolCatalogVersion: vi.fn(() => "catalog:sticky"),
+        cleanup: vi.fn(async () => undefined),
+      };
+    };
+    const names = (harness: ReturnType<typeof createHarness>) =>
+      harness.runtime.getAvailableTools().map((tool: Any) => tool.name);
+    // Stands in for the message-driven relevance filter.
+    const graphOnlyWhenAsked = (harness: ReturnType<typeof createHarness>) => {
+      harness.deps.applyAdaptiveToolAvailabilityFilter = (tools) =>
+        /graph/.test(String(harness.runtime.state.transcript.lastUserMessage || ""))
+          ? tools
+          : tools.filter((tool) => tool.name !== "kg_create_entity");
+    };
+
+    it("keeps the same list on a follow-up whose wording no longer matches", () => {
+      const harness = createHarness();
+      harness.setToolRegistry(registry());
+      graphOnlyWhenAsked(harness);
+
+      harness.runtime.state.transcript.lastUserMessage = "Hello";
+      expect(names(harness)).toEqual(["read_file", "web_search"]);
+
+      harness.runtime.state.transcript.lastUserMessage = "Add this to the knowledge graph";
+      const offered = harness.runtime.getAvailableTools();
+      expect(offered.map((tool: Any) => tool.name)).toEqual([
+        "read_file",
+        "kg_create_entity",
+        "web_search",
+      ]);
+
+      harness.runtime.state.transcript.lastUserMessage = "Thanks";
+      expect(JSON.stringify(harness.runtime.getAvailableTools())).toBe(JSON.stringify(offered));
+    });
+
+    it("keeps a deferred tool that a search surfaced once", () => {
+      const harness = createHarness();
+      harness.setToolRegistry(registry(true));
+
+      harness.runtime.state.transcript.lastUserMessage = "create a knowledge graph entity";
+      expect(names(harness)).toContain("kg_create_entity");
+
+      harness.runtime.state.transcript.lastUserMessage = "Thanks";
+      expect(names(harness)).toContain("kg_create_entity");
+    });
+
+    it("still drops a tool that a policy or step gate removes later", () => {
+      const harness = createHarness();
+      harness.setToolRegistry(registry());
+      harness.runtime.state.transcript.lastUserMessage = "Add this to the knowledge graph";
+      expect(names(harness)).toContain("kg_create_entity");
+
+      harness.deps.applyAgentPolicyToolFilter = (tools) =>
+        tools.filter((tool) => tool.name !== "kg_create_entity");
+      harness.runtime.state.transcript.lastUserMessage = "Now without it";
+      expect(names(harness)).toEqual(["read_file", "web_search"]);
+    });
+
+    it("restores the offered tools from a snapshot", () => {
+      const source = createHarness();
+      source.setToolRegistry(registry());
+      graphOnlyWhenAsked(source);
+      source.runtime.state.transcript.conversationHistory = [
+        { role: "user", content: "Add this to the knowledge graph" },
+      ];
+      source.runtime.state.transcript.lastUserMessage = "Add this to the knowledge graph";
+      source.runtime.getAvailableTools();
+      source.runtime.saveSnapshot();
+      const snapshot = source.emittedEvents.find((event) => event.type === "conversation_snapshot");
+      expect(snapshot?.payload.tooling.exposedToolNames).toEqual([
+        "read_file",
+        "kg_create_entity",
+        "web_search",
+      ]);
+
+      const restored = createHarness();
+      restored.setToolRegistry(registry());
+      graphOnlyWhenAsked(restored);
+      restored.runtime.restoreFromEvents([
+        { type: "conversation_snapshot", payload: snapshot?.payload } as Any,
+      ]);
+      restored.runtime.state.transcript.lastUserMessage = "Thanks";
+      expect(names(restored)).toEqual(["read_file", "kg_create_entity", "web_search"]);
+    });
   });
 
   it("restores pending slash-skill parameter collection from replay events", () => {

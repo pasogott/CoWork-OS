@@ -1,5 +1,7 @@
 # Shared application execution backend
 
+The Android `phone.android.v1` route adds selected-device phone-harness input, explicit approvals, screenshots, durable receipts, and fresh package/text readback. See [Android phone control](android-phone-control.md) for setup and its verification limits.
+
 The backend carries application operations from a task's existing WorkSession through preparation, optional feedback, dispatch, observation, cancellation, and verification. It uses CoWork's existing tool coordinator and permissions. No model, vendor SDK, or application category owns the durable business state.
 
 This is the shared foundation for the application pilots. It does not declare every legacy tool a qualified integration. The Excel/Photoshop pilots add bounded named adapters and native app commands. Browser and desktop conformance tests exercise controlled adapter states; they do not prove live GUI automation or isolation.
@@ -53,6 +55,8 @@ For example, a host-qualified adapter can receive:
 This example is a contract, not a shipped example-app connector. A real adapter must validate that its input and resource references identify the same actual targets and account. It must implement authoritative readback and the application's concurrency rules. Local locks cannot prevent outside edits or revoke an already-issued request.
 
 Register an `ApplicationAdapter` on [the catalog](../src/electron/applications/ApplicationAdapterCatalog.ts). Implement pure `validateInput`, `readiness`, and `execute`; implement and declare optional `prepare`, `observe`, `cancel`, and `verify` methods. Use `context.tools.call` for existing tools so the current task's restrictions, account context, permissions, and policy remain active. Preparing remote drafts and cancelling jobs are effects too.
+
+A trusted adapter may also implement `authorize(context)` for approval only. It must not send application input or external effects. The operation holds its lease and resource locks while awaiting review, but the adapter execution deadline begins only after authorization succeeds. Cancellation or failure before this boundary is definitively not dispatched and releases the locks; after dispatch begins, interrupted effects retain the usual unknown/reconciliation rules.
 
 Adapters return `running` with a stable external ID, `completed` with a typed result, `failed`, or `unknown`. Observation can additionally recover `prepared`, confirm `cancelled`, or report authoritative `not_applied`. A missing record is not sufficient proof of `not_applied`: the adapter must establish that the original request cannot still commit later. A preparation/cancellation lookup cannot make the final business action replayable.
 
@@ -115,4 +119,17 @@ The conformance suite requires real SQLite and includes a real database worker, 
 
 [The compiled-runtime smoke](../scripts/qa/application-execution-smoke.cjs) uses a real AgentDaemon, ToolRegistry, coordinator, permission boundary, SQLite profile, and file tools without a model. It checks qualified verification, legacy uncertainty, blocked direct retries, and original-route recovery. Both builds run on Node; this does not establish live Electron UI behavior or packaged release proof. All smoke state is temporary.
 
-For each pilot, qualify installation/account readiness, input/resource identity, native fidelity, conditional writes/conflict detection, observation after a lost reply, cancellation, domain verifiers, and the actual browser/desktop environment when needed. Measure verified outcomes and intervention/recovery effort. Add the pilot's failures to this conformance suite before expanding categories.
+For each pilot, qualify installation/account readiness, input/resource identity, native fidelity, conditional writes/conflict detection, observation after a lost reply, cancellation, domain verifiers, and the actual browser/desktop environment when needed. Add the pilot's failures to this conformance suite before expanding categories.
+
+### Measuring progress
+
+Judge each route and pilot by the work it completes, not by tool success:
+
+- **Verified outcomes:** requests finished with fresh domain evidence, with partial and unknown outcomes counted separately.
+- **Human effort:** interventions, takeovers and corrections the user had to make.
+- **Unnecessary interruptions:** decisions asked for when the request, its limits and earlier answers already settled them.
+- **Recovery correctness:** lost replies, interruptions and cancellations resolved without a duplicate or blind retry.
+- **Latency and cost:** time to a verified result, and every billed attempt.
+- **Adapter effort:** code a new application needs. A new application should mostly need an adapter and domain verifiers; repeated changes to the shared lifecycle point to a missing abstraction.
+
+Tool success, an accepted job and a hidden window are not proof that work is complete.

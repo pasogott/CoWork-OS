@@ -1,3 +1,6 @@
+import { verifiedPhoneScreenshotPath } from "../phone/phone-screenshot-evidence";
+import { readOnlyReviewSystemRestrictions } from "../phone/phone-tool-visibility";
+import { needsTaskWebEvidence } from "./task-web-evidence-policy";
 import { applicationWorkerPrompt } from "../applications/application-worker-prompt";
 import {
   buildNativeActionLedger,
@@ -13,9 +16,11 @@ import {
   isNativeApplicationReadbackStep,
   isNativeApplicationPresentationStep,
   isNativeUiOperationStep,
+  requestsCliAnythingApp,
 } from "../applications/application-task-intent";
 import { enforceResponsibilityTaskStart } from "../automation/responsibility-task-policy";
 import { collectCrossStepEvidence, formatCrossStepEvidence } from "./cross-step-evidence";
+import { buildModelHandoffNote, type ModelHandoff } from "./model-handoff-note";
 import { buildBotTeamContextPrompt, hasBotTeamDelegationRequest } from "../agents/bot-team";
 import { ensureWorkspaceDirectory } from "../utils/workspace-directory";
 import { resolveInteractionMode } from "./strategy/interaction-mode";
@@ -686,6 +691,9 @@ const DEFAULT_PROMPT_SECTION_BUDGETS = {
 // (was capped at 1,200), and design-system context, project guidance and the
 // external profile have their own sections instead of sharing that cap.
 // Overflow still drops/shrinks optional sections by drop priority.
+/** A bot's own memory (memory folder `bots/<slug>.md`) and its earlier conversations. */
+const BOT_MEMORY_GUIDANCE =
+  'You have your own memory as this bot: what you save with memory_remember scope bot (your job, what the user wants from you, decisions you made together) is shown to you in every conversation you have with the user. Before asking the user to repeat something or redoing earlier work, search your earlier conversations with memory_recall scopes ["bot"] (add since, e.g. "3d", for recent ones).';
 const EXECUTION_SYSTEM_PROMPT_TOTAL_BUDGET = 7600;
 type BasePromptRoutingBlock = "cloud_storage" | "messaging" | "maps" | "pdf" | "rich_surfaces";
 // Same provider list the IntentRouter uses for its cloud-storage signals.
@@ -1075,6 +1083,7 @@ const SAFE_INTEGRATION_MENTION_TOOL_ALLOWLIST = new Set<string>([
   "sharepoint_action",
   "google_drive_action",
   "calendar_action",
+  "browser_vault",
   "browser_navigate",
   "browser_snapshot",
   "browser_click",
@@ -7069,6 +7078,8 @@ ${transcript}
   > = [];
   private providerFailoverIndex = 0;
   private providerFailoverPreserveUntil = 0;
+  /** Set when a thread moves to another provider; noted once on the next user message. */
+  private pendingModelHandoff: ModelHandoff | null = null;
   private providerFailoverRequiresImageInput = false;
   private toolBatchExecutor?: ToolBatchExecutor;
 
@@ -7126,7 +7137,7 @@ ${transcript}
       ...(this.task.agentConfig?.chronicleMode === "disabled" ? ["screen_context_resolve"] : []),
       ...(isReadOnlyReview
         ? [
-            "group:system",
+            ...readOnlyReviewSystemRestrictions(this.task.rawPrompt || this.task.prompt || ""),
             "take_screenshot",
             "type_text",
             "screenshot",
@@ -7643,6 +7654,7 @@ ${transcript}
           self.discoveredDeferredToolNames instanceof Set
             ? self.discoveredDeferredToolNames
             : new Set<string>(),
+        exposedToolNames: new Set<string>(),
         availableToolsCacheKey:
           typeof self.availableToolsCacheKey === "string" ? self.availableToolsCacheKey : null,
         availableToolsCache: Array.isArray(self.availableToolsCache)
@@ -8884,6 +8896,12 @@ ${transcript}
         if (rolePersona) {
           lines.push(rolePersona);
         }
+        if (
+          this.task.agentConfig?.botConversation === true &&
+          MemoryRepoService.get()?.isWritable()
+        ) {
+          lines.push(BOT_MEMORY_GUIDANCE);
+        }
       }
     }
 
@@ -9076,7 +9094,10 @@ ${transcript}
   ): Promise<MemoryRepoContextBlock | null> {
     if (!decision.layers.memoryRepo) return null;
     try {
-      return await getMemoryRepoContext().build({ workspaceId: this.workspace?.id ?? null });
+      return await getMemoryRepoContext().build({
+        workspaceId: this.workspace?.id ?? null,
+        botId: this.task.assignedAgentRoleId ?? null,
+      });
     } catch (error) {
       logger.warn("[Executor] Memory repo block build failed:", (error as Error)?.message ?? error);
       return null;
@@ -9285,7 +9306,6 @@ ${transcript}
           "- When supplied attachment content is partial, say so; do not invent unseen content or claim to read the full file.",
           "- Respond naturally as a friendly teammate.",
           ...sideChatRules,
-          ...(ctx.extraChatRules || []),
         ].join("\n");
 
     return [
@@ -9341,6 +9361,12 @@ ${transcript}
         "session",
       ),
       buildSystemBlock(`chat_rules:${hashPromptCacheValue(rules)}`, rules, "session"),
+      buildSystemBlock(
+        "chat_turn_rules",
+        !isThinkMode ? (ctx.extraChatRules || []).join("\n") : "",
+        "turn",
+        false,
+      ),
     ].filter((block) => block.text.length > 0);
   }
 
@@ -11382,6 +11408,10 @@ ${transcript}
           cachedTokens: safeCached,
           ...(safeCacheWrite > 0 ? { cacheWriteTokens: safeCacheWrite } : {}),
           ...(cacheWriteTtl ? { cacheWriteTtl } : {}),
+          // Why this request could not reuse the previous prompt cache, if known.
+          ...(this.promptCacheInvalidationReason
+            ? { cacheInvalidation: this.promptCacheInvalidationReason }
+            : {}),
           totalTokens: safeInput + safeOutput,
           cost: deltaCost,
           costKnown,
@@ -11424,6 +11454,18 @@ ${transcript}
       if (!Number.isFinite(ms) || ms <= 0) return TOOL_TIMEOUT_MS;
       return Math.min(Math.round(ms), maxMs);
     };
+
+    if (
+      toolName === "application_operation" &&
+      ["execute", "reconcile"].includes(toolInput.action)
+    ) {
+      // A durable call can prepare, ask for input approval, dispatch, then verify.
+      // Its individual adapter phases retain their own deadlines and cancellation.
+      return (
+        normalizedSettingsTimeout ??
+        clampToStepTimeout(TaskExecutor.APPROVAL_GATED_TOOL_TIMEOUT_MS + 3 * 120_000)
+      );
+    }
 
     if (toolName === "run_command") {
       const inputTimeoutRaw =
@@ -11481,6 +11523,9 @@ ${transcript}
       // plus the local approval and the send itself; aborting earlier would cancel the wait.
       return normalizedSettingsTimeout ?? 45 * 60 * 1000;
     }
+
+    // Private input and approvals wait for a human; cancellation is forwarded to the credential service.
+    if (toolName === "browser_vault") return normalizedSettingsTimeout ?? 20 * 60 * 1000;
 
     if (toolName === "request_user_input") {
       // Structured user input waits on a real human response and can legitimately
@@ -11719,10 +11764,17 @@ ${transcript}
             swarm ? swarmFolderPath(swarm.slug) : null,
           )
         : null;
+    // A bot's task recalls from its own bot file and no other bot's.
+    const botFile =
+      memoryRepoReadAllowed && this.task.assignedAgentRoleId
+        ? await MemoryRepoService.get()
+            ?.botFile(this.task.assignedAgentRoleId)
+            .catch(() => null)
+        : null;
 
     try {
       const coordinated = await withTimeout(
-        runWithMemoryRepoAccess({ readAllowed: memoryRepoReadAllowed, swarmPrefix }, () =>
+        runWithMemoryRepoAccess({ readAllowed: memoryRepoReadAllowed, swarmPrefix, botFile }, () =>
           this.toolExecutionCoordinator.executeTool(
             toolName,
             input as Any,
@@ -12123,6 +12175,19 @@ ${transcript}
         files = result.files;
       }
       this.fileOperationTracker.recordDirectoryListing(input.path, files);
+    }
+
+    // Approved phone captures are real workspace artifacts, not evidence of app-side success.
+    if (toolSucceeded && result?.screenshot) {
+      const screenshotPath = verifiedPhoneScreenshotPath(
+        toolName,
+        input,
+        result,
+        this.task?.id,
+        this.workspace.path,
+      );
+      if (screenshotPath && this.canReadWorkspacePath(screenshotPath))
+        this.fileOperationTracker.recordFileCreation(screenshotPath);
     }
 
     // Record file creations
@@ -15205,6 +15270,7 @@ ${transcript}
   private hasNonImageGenerationWorkIntent(taskText: string): boolean {
     return (
       hasNativeApplicationOutputIntent(taskText) ||
+      requestsCliAnythingApp(taskText) ||
       /\b(edit|modify|change|update|retouch|inpaint|remove|replace|analy[sz]e|describe|review|compare|inspect|website|webapp|code|component|page|ui|screenshot)\b/.test(
         taskText,
       )
@@ -18972,6 +19038,18 @@ ${transcript}
     ].join("\n");
   }
 
+  private buildExecutionApplicationWorkerPrompt(): string {
+    const forbidsScripting = taskForbidsScripting(
+      `${this.task.title || ""}\n${this.task.rawPrompt || this.task.prompt || ""}`,
+    );
+    return (
+      applicationWorkerPrompt({ forbidsScripting }) +
+      (forbidsScripting
+        ? "\n\nThis task forbids application scripting: application_operation, local_photoshop_create/edit, native_application_create and run_applescript are unavailable and refused, and CLI-Anything harnesses must not be used. Make the change through native_app; read-only readbacks such as local_photoshop_read remain available for verification. If the UI cannot apply the change, report that limit."
+        : "")
+    );
+  }
+
   private buildExecutionBaseInstructionPrompt(): string {
     const novelistConstraintPrompt = this.buildNovelistConstraintPrompt();
     const routing = this.getActiveBasePromptRoutingBlocks();
@@ -19849,13 +19927,7 @@ ${transcript}
       identityPrompt: params.identityPrompt,
       safetyCorePrompt: SHARED_PROMPT_POLICY_CORE,
       baseInstructionPrompt: this.buildExecutionBaseInstructionPrompt(),
-      applicationWorkerPrompt:
-        applicationWorkerPrompt() +
-        (taskForbidsScripting(
-          `${this.task.title || ""}\n${this.task.rawPrompt || this.task.prompt || ""}`,
-        )
-          ? "\n\nThis task forbids application scripting: application_operation, local_photoshop_create/edit, native_application_create and run_applescript are unavailable and refused. Make the change through native_app; read-only readbacks such as local_photoshop_read remain available for verification. If the UI cannot apply the change, report that limit."
-          : ""),
+      applicationWorkerPrompt: this.buildExecutionApplicationWorkerPrompt(),
       answerSurfacePrompt: richSurfacesPrompt,
       inputPolicyPrompt: this.buildExecutionInputPolicyPrompt(),
       workspaceContextPrompt: this.buildExecutionWorkspaceContextPrompt(),
@@ -20197,6 +20269,16 @@ ${transcript}
     ]);
 
     const isBotConversation = this.task.agentConfig?.botConversation === true;
+    if (/\bandroid\b|phone-harness|phone\.android\.|android_phone_/i.test(nativeGuiText || "")) {
+      for (const name of [
+        "android_phone_devices",
+        "android_phone_observe",
+        "android_phone_authorize",
+        "android_phone_dispatch",
+        "android_phone_readback",
+      ])
+        always.add(name);
+    }
     const botTeamDelegationRequested = this.hasExplicitBotTeamDelegationRequest(stepText);
 
     if (this.swarmForTools) {
@@ -20234,6 +20316,7 @@ ${transcript}
       "analyze_image",
       "get_video_generation_job",
       "cancel_video_generation_job",
+      "browser_vault",
       "browser_navigate",
       "browser_get_content",
       "browser_get_text",
@@ -20269,6 +20352,7 @@ ${transcript}
 
     const verification = new Set<string>([
       ...analysis,
+      "browser_vault",
       "browser_navigate",
       "browser_get_content",
       "browser_get_text",
@@ -28097,28 +28181,7 @@ You are continuing a previous conversation. The context from the previous conver
     // file exploration), not web research — skip the web evidence requirement.
     if (this.task.parentTaskId && this.task.agentType === "sub") return false;
 
-    const prompt = `${this.task.title}\n${this.getContractPrompt()}`.toLowerCase();
-    // Use word-boundary regex to avoid false positives (e.g. "Researcher" matching "search")
-    const researchSignalPattern =
-      /\b(?:news|latest|today|trending|breaking|reddit|search|headline|current events)\b/;
-    if (!researchSignalPattern.test(prompt)) return false;
-    // Build/creation tasks mentioning news-related keywords don't need web evidence —
-    // they are building a tool about news, not fetching news itself.
-    const buildSignals = [
-      "create an app",
-      "build an app",
-      "make an app",
-      "write an app",
-      "create a tool",
-      "build a tool",
-      "create a website",
-      "build a website",
-      "implement",
-      "develop an app",
-      "develop a tool",
-    ];
-    if (buildSignals.some((signal) => prompt.includes(signal))) return false;
-    return true;
+    return needsTaskWebEvidence(this.task.title, this.getContractPrompt());
   }
 
   private taskRequiresTodayContext(): boolean {
@@ -30641,6 +30704,7 @@ You are continuing a previous conversation. The context from the previous conver
     });
 
     const companionUserContent = await this.buildUserContent(rawPrompt, this.initialImages);
+    const companionMessages: LLMMessage[] = [{ role: "user", content: companionUserContent }];
     const emptyFallback = isThinkMode
       ? "I'd like to help you think through this. Could you share more about what's on your mind?"
       : this.generateCompanionFallbackResponse(rawPrompt);
@@ -30661,7 +30725,7 @@ You are continuing a previous conversation. The context from the previous conver
               model: this.modelId,
               maxTokens: companionMaxTokens,
               system: systemPrompt,
-              messages: [{ role: "user", content: companionUserContent }],
+              messages: [...companionMessages],
               ...promptCacheExtras,
             },
             this.getRetryTimeoutMs(LLM_TIMEOUT_MS, attempt, false, companionMaxTokens),
@@ -30684,10 +30748,15 @@ You are continuing a previous conversation. The context from the previous conver
       }
 
       let text = this.extractTextFromLLMContent(response.content || []);
+      if (text.trim()) appendAssistantResponseToConversationUtil(companionMessages, response, 0);
 
       // If the response was truncated (hit max_tokens), do a single continuation
       // call so the reply doesn't cut off mid-sentence.
       if (response.stopReason === "max_tokens" && text && !isThinkMode) {
+        companionMessages.push({
+          role: "user",
+          content: [{ type: "text", text: TEXT_CONTINUATION_PROMPT }],
+        });
         try {
           const contResponse = await this.createMessageWithTimeout(
             {
@@ -30695,11 +30764,7 @@ You are continuing a previous conversation. The context from the previous conver
               maxTokens: CHAT_REPLY_MAX_OUTPUT_TOKENS,
               system: systemPrompt,
               // End on a user turn: Claude 4.6+ rejects assistant prefill.
-              messages: [
-                { role: "user", content: companionUserContent },
-                { role: "assistant", content: [{ type: "text", text }] },
-                { role: "user", content: [{ type: "text", text: TEXT_CONTINUATION_PROMPT }] },
-              ],
+              messages: [...companionMessages],
               ...promptCacheExtras,
             },
             this.getRetryTimeoutMs(LLM_TIMEOUT_MS, 0, false, CHAT_REPLY_MAX_OUTPUT_TOKENS),
@@ -30721,9 +30786,13 @@ You are continuing a previous conversation. The context from the previous conver
           }
           const contText = this.extractTextFromLLMContent(contResponse.content || []);
           if (contText) {
+            appendAssistantResponseToConversationUtil(companionMessages, contResponse, 0);
             text = text + contText;
+          } else {
+            companionMessages.pop();
           }
         } catch {
+          companionMessages.pop();
           // Continuation failed — use the partial response as-is
         }
       }
@@ -30742,10 +30811,14 @@ You are continuing a previous conversation. The context from the previous conver
         typeof companionUserContent === "string"
           ? [{ type: "text" as const, text: companionUserContent }]
           : companionUserContent;
-      this.updateConversationHistory([
-        { role: "user", content: userHistoryContent },
-        { role: "assistant", content: [{ type: "text", text: assistantText }] },
-      ]);
+      this.updateConversationHistory(
+        text.trim() && assistantText === text.trim()
+          ? companionMessages
+          : [
+              { role: "user", content: userHistoryContent },
+              { role: "assistant", content: [{ type: "text", text: assistantText }] },
+            ],
+      );
       const resultSummary = this.buildResultSummary() || assistantText;
       // Companion mode (both chat and think) runs with 0 tools and a
       // minimal token budget, so strict guard checks designed for full
@@ -42322,6 +42395,13 @@ Return ONLY a JSON object:
     );
   }
 
+  private takeModelHandoffNote(): string | null {
+    const handoff = this.pendingModelHandoff;
+    if (!handoff) return null;
+    this.pendingModelHandoff = null;
+    return buildModelHandoffNote(handoff, this.conversationHistory);
+  }
+
   private hasExplicitTaskRouteOverride(): boolean {
     return Boolean(this.task.agentConfig?.providerType || this.task.agentConfig?.modelKey);
   }
@@ -42586,7 +42666,9 @@ Return ONLY a JSON object:
     this.cachedLlmSettings = currentSettings;
     const currentSettingsProvider = String(currentSettings.providerType || "").trim();
     const providerChangedInSettings =
-      currentSettingsProvider.length > 0 && currentSettingsProvider !== this.provider.type;
+      this.task.agentConfig?.modelPinned !== true &&
+      currentSettingsProvider.length > 0 &&
+      currentSettingsProvider !== this.provider.type;
 
     const selectionConfig = providerChangedInSettings
       ? {
@@ -42613,8 +42695,19 @@ Return ONLY a JSON object:
       logger.info(
         `${this.logTag} Provider/model changed mid-session: ${this.provider.type}/${this.modelId} → ${newSelection.providerType}/${newSelection.modelId}`,
       );
+      const previousRoute = { providerType: this.provider.type, modelId: this.modelId };
       try {
         this.applyResolvedProviderSelection(newSelection);
+        // Only a model the person pinned to this thread gets a handoff note; a global
+        // provider switch (or a later switch back) clears any note still pending.
+        this.pendingModelHandoff =
+          this.task.agentConfig?.modelPinned === true &&
+          previousRoute.providerType !== newSelection.providerType
+            ? {
+                from: previousRoute,
+                to: { providerType: newSelection.providerType, modelId: newSelection.modelId },
+              }
+            : null;
         this.rebuildProviderFailoverSelections(newSelection, desiredProfile);
         this.emitEvent("log", {
           message:
@@ -43059,9 +43152,14 @@ Return ONLY a JSON object:
     }
     // Both the chat path and the task path below add this to the message the model sees.
     const answerSurfaceNote = await this.takeAnswerSurfaceChanges();
+    const modelHandoffNote =
+      recoveredFromTurnLimit || opts?.transcriptAlreadyContainsMessage
+        ? null
+        : this.takeModelHandoffNote();
     const withAnswerState = (text: string) => {
       const noted = withSurfaceOriginNote(text, opts?.messageContext?.surfaceOrigin);
-      return answerSurfaceNote ? `${noted}\n\n${answerSurfaceNote}` : noted;
+      const withHandoff = modelHandoffNote ? `${modelHandoffNote}\n\n${noted}` : noted;
+      return answerSurfaceNote ? `${withHandoff}\n\n${answerSurfaceNote}` : withHandoff;
     };
     const followUpConversationMessage = this.buildQuotedAssistantContextMessage(
       withAnswerState(executionMessage),

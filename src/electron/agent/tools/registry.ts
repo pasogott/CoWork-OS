@@ -171,6 +171,7 @@ import { ScrapingTools } from "./scraping-tools";
 import { DocumentTools } from "./document-tools";
 import { ComputerUseTools } from "./computer-use-tools";
 import { NativeAppTools, NATIVE_APP_TOOL } from "./native-app-tools";
+import { AndroidPhoneTools, ANDROID_PHONE_TOOLS } from "./android-phone-tools";
 import { BatchImageTools } from "./batch-image-tools";
 import { ScratchpadTools } from "./scratchpad-tools";
 import { QATools } from "./qa-tools";
@@ -1345,6 +1346,11 @@ export class ToolRegistry {
   }
 
   isToolAllowed(toolName: string): boolean {
+    if (
+      toolName.startsWith("android_phone_") &&
+      isThirdPartyGatewayTask(this.daemon.getTask?.(this.taskId))
+    )
+      return false;
     if (this.denyAllTools) {
       return false;
     }
@@ -1373,6 +1379,7 @@ export class ToolRegistry {
 
     const headless = isHeadlessMode();
     const allTools: LLMTool[] = [
+      ...ANDROID_PHONE_TOOLS,
       ...this.getFileToolDefinitions(),
       ...this.getSkillToolDefinitions(),
       ...GlobTools.getToolDefinitions(),
@@ -2122,7 +2129,11 @@ export class ToolRegistry {
     // PACT conversation is local.
     if (canonicalToolName === "pact_send_message") return "external_service";
     if (canonicalToolName === "pact_get_conversation") return null;
-    if (canonicalToolName === "open_application" || isComputerUseToolName(canonicalToolName)) {
+    if (
+      canonicalToolName.startsWith("android_phone_") ||
+      canonicalToolName === "open_application" ||
+      isComputerUseToolName(canonicalToolName)
+    ) {
       return "computer_use";
     }
     if (NETWORK_TOOL_NAMES.has(canonicalToolName)) return "network_access";
@@ -2233,6 +2244,7 @@ export class ToolRegistry {
       toolName === "local_photoshop_create" ||
       toolName === "local_photoshop_edit" ||
       toolName === "native_application_create" ||
+      toolName.startsWith("android_phone_") ||
       toolName === "take_screenshot" ||
       toolName === "open_path" ||
       toolName === "show_in_folder" ||
@@ -3042,7 +3054,8 @@ export class ToolRegistry {
     );
     registerPredicate(
       (name) => BrowserTools.isBrowserTool(name),
-      async ({ request }) => this.browserTools.executeTool(request.name, request.input),
+      async ({ request }) =>
+        this.browserTools.executeTool(request.name, request.input, request.runtime),
       serialSchedulerSpec,
     );
     registerPredicate(
@@ -3340,6 +3353,18 @@ export class ToolRegistry {
       async ({ request }) => this.nativeAppTools.run(request.input),
       serialSchedulerSpec,
     );
+    for (const tool of ANDROID_PHONE_TOOLS) {
+      register(
+        tool.name,
+        async ({ request }) =>
+          new AndroidPhoneTools(this.daemon, this.taskId).run(
+            tool.name,
+            request.input,
+            request.runtime,
+          ),
+        serialSchedulerSpec,
+      );
+    }
     register(
       "screenshot",
       async ({ request }) =>
@@ -3485,6 +3510,18 @@ export class ToolRegistry {
     register(
       "canvas_snapshot",
       async ({ request }) => this.canvasTools.takeSnapshot(request.input.session_id),
+      serialSchedulerSpec,
+    );
+    register(
+      "canvas_add_asset",
+      async ({ request }) =>
+        this.canvasTools.addAsset(request.input.session_id, request.input.path, request.input.name),
+      serialSchedulerSpec,
+    );
+    register(
+      "canvas_export",
+      async ({ request }) =>
+        this.canvasTools.exportCanvas(request.input.session_id, request.input.target_dir),
       serialSchedulerSpec,
     );
     register("canvas_list", async () => this.canvasTools.listSessions(), serialSchedulerSpec);
@@ -4699,6 +4736,8 @@ Live Canvas (Visual Workspace):
 - canvas_hide: Hide the canvas window
 - canvas_close: Close a canvas session
 - canvas_eval: Execute JavaScript in the canvas context
+- canvas_add_asset: Copy a workspace image/video/audio file into the canvas assets/ folder; use the returned relative url in canvas_push HTML instead of base64.
+- canvas_export: Export the canvas page and its assets to a workspace folder.
 - canvas_snapshot: Take a screenshot of the canvas
 - canvas_list: List all active canvas sessions
 IMPORTANT: When using canvas_push for visual output, provide content when available.
@@ -5066,7 +5105,7 @@ ${skillDescriptions}`;
           };
         }
       }
-      return await this.browserTools.executeTool(name, input);
+      return await this.browserTools.executeTool(name, input, _runtime);
     }
 
     // QA tools (Playwright automated visual testing)
@@ -5241,6 +5280,8 @@ ${skillDescriptions}`;
 
     // Computer use tools (CUA)
     if (name === "native_app") return await this.nativeAppTools.run(input);
+    if (ANDROID_PHONE_TOOLS.some((tool) => tool.name === name))
+      return new AndroidPhoneTools(this.daemon, this.taskId).run(name, input);
     if (name === "screenshot")
       return await this.computerUseTools.screenshot({
         app: input.app,
@@ -5318,6 +5359,10 @@ ${skillDescriptions}`;
     if (name === "canvas_eval")
       return await this.canvasTools.evalScript(input.session_id, input.script);
     if (name === "canvas_snapshot") return await this.canvasTools.takeSnapshot(input.session_id);
+    if (name === "canvas_add_asset")
+      return await this.canvasTools.addAsset(input.session_id, input.path, input.name);
+    if (name === "canvas_export")
+      return await this.canvasTools.exportCanvas(input.session_id, input.target_dir);
     if (name === "canvas_list") return this.canvasTools.listSessions();
     if (name === "canvas_checkpoint")
       return await this.canvasTools.saveCheckpoint(input.session_id, input.label);
@@ -6579,19 +6624,15 @@ ${skillDescriptions}`;
       artifactDir,
       workspaceArtifactDir,
     });
+    // Tool prerequisites determine eligibility; they are not an exhaustive
+    // task allowlist. Promoting them to allowedTools would hide unrelated
+    // capabilities needed by later steps (for example, saving a summary).
     const contextDirectives: SkillContextDirectives = {
-      ...(Array.isArray((skill.requires as Any)?.tools) &&
-      ((skill.requires as Any)?.tools as unknown[]).some((tool) => typeof tool === "string")
-        ? {
-            allowedTools: ((skill.requires as Any).tools as unknown[]).filter(
-              (tool): tool is string => typeof tool === "string" && tool.trim().length > 0,
-            ),
-          }
-        : {}),
       artifactDirectories: [artifactDir, workspaceArtifactDir],
       metadata: {
         source: skill.source || "unknown",
         category: skill.category || "General",
+        requiredTools,
       },
     };
     const skillApplication: SkillApplication = {
