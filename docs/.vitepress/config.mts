@@ -48,6 +48,9 @@ export default defineConfig({
         items: [
           { text: "Introduction", link: "/" },
           { text: "Getting Started", link: "/getting-started" },
+          { text: "macOS Installation", link: "/macos-installation" },
+          { text: "Windows Installation", link: "/windows-installation" },
+          { text: "Feature Tour", link: "/feature-tour" },
           { text: "CoWork CLI", link: "/cli" },
           { text: "Beginner's Guide", link: "/cowork-school" },
           { text: "Platform Updates", link: "/integration-skill-bootstrap-lifecycle" },
@@ -62,6 +65,8 @@ export default defineConfig({
           { text: "MLX-LM Local Inference", link: "/mlx-lm" },
           { text: "Compare CoWork OS", link: "/comparisons/" },
           { text: "Migration Guide", link: "/migration" },
+          { text: "Migrating from Hermes", link: "/migrating-from-hermes" },
+          { text: "Migrating from OpenClaw", link: "/migrating-from-openclaw" },
           { text: "OpenClaw Comparison", link: "/openclaw-comparison" },
         ],
       },

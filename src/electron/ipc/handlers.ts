@@ -356,6 +356,7 @@ import {
   recommendChatGPTModelForPlan,
   XAIOAuth,
 } from "../agent/llm";
+import { applyOpenRouterOAuthKey, OpenRouterOAuth } from "../agent/llm/openrouter-oauth";
 import {
   clearOpenAIOAuthSession,
   createSiwcHostId,
@@ -619,6 +620,7 @@ import { configuredImageSearch } from "../answer-surfaces/web-image-search";
 import { AnswerImageService } from "../answer-surfaces/AnswerImageService";
 import { AnswerSurfaceStateStore } from "../answer-surfaces/AnswerSurfaceStateStore";
 import { setupMemoryRepoHandlers } from "./memory-repo-handlers";
+import { setupAgentImportHandlers } from "./agent-import-handlers";
 import { setupPactHandlers } from "./pact-handlers";
 import { PactSurfaceService } from "../pact/pact-surface-service";
 import { PactSettingsManager } from "../pact/settings";
@@ -1222,6 +1224,7 @@ rateLimiter.configure(IPC_CHANNELS.LLM_GET_GROQ_MODELS, RATE_LIMIT_CONFIGS.stand
 rateLimiter.configure(IPC_CHANNELS.LLM_GET_XAI_MODELS, RATE_LIMIT_CONFIGS.standard);
 rateLimiter.configure(IPC_CHANNELS.LLM_XAI_OAUTH_START, RATE_LIMIT_CONFIGS.expensive);
 rateLimiter.configure(IPC_CHANNELS.LLM_XAI_OAUTH_LOGOUT, RATE_LIMIT_CONFIGS.limited);
+rateLimiter.configure(IPC_CHANNELS.LLM_OPENROUTER_OAUTH_START, RATE_LIMIT_CONFIGS.expensive);
 rateLimiter.configure(IPC_CHANNELS.LLM_GET_KIMI_MODELS, RATE_LIMIT_CONFIGS.standard);
 rateLimiter.configure(IPC_CHANNELS.LLM_GET_PI_MODELS, RATE_LIMIT_CONFIGS.standard);
 rateLimiter.configure(IPC_CHANNELS.LLM_GET_PI_PROVIDERS, RATE_LIMIT_CONFIGS.standard);
@@ -8429,6 +8432,24 @@ export async function setupIpcHandlers(
     return { success: true };
   });
 
+  // OpenRouter PKCE sign-in. Takes no renderer input; the key stays in main and is
+  // persisted through the encrypted settings store.
+  ipcMain.handle(IPC_CHANNELS.LLM_OPENROUTER_OAUTH_START, async () => {
+    checkRateLimit(IPC_CHANNELS.LLM_OPENROUTER_OAUTH_START);
+    logger.info("[IPC] Starting OpenRouter sign-in...");
+
+    try {
+      const { key } = await new OpenRouterOAuth().authenticate();
+      const settings = applyOpenRouterOAuthKey(LLMProviderFactory.loadSettings(), key);
+      LLMProviderFactory.saveSettings(settings);
+      LLMProviderFactory.clearCache();
+      return { success: true, model: settings.openrouter?.model };
+    } catch (error: Any) {
+      logger.error("[IPC] OpenRouter sign-in failed:", error?.message);
+      return { success: false, error: error?.message || "OpenRouter sign-in failed" };
+    }
+  });
+
   ipcMain.handle(
     IPC_CHANNELS.LLM_GET_BEDROCK_MODELS,
     async (
@@ -11878,6 +11899,29 @@ export async function setupIpcHandlers(
           ? await dialog.showOpenDialog(owner, options)
           : await dialog.showOpenDialog(options);
       return result.canceled ? null : (result.filePaths[0] ?? null);
+    },
+  });
+
+  // Import a Hermes or OpenClaw home (Settings > Import, onboarding). The home folder is
+  // resolved in main; the renderer only names the source.
+  setupAgentImportHandlers({
+    db,
+    findWorkspace: async (workspaceId) => {
+      if (isTempWorkspaceId(workspaceId)) return null;
+      const workspace = await workspaceRepo.findById(workspaceId);
+      return workspace && !workspace.isTemp
+        ? { id: workspace.id, name: workspace.name, path: workspace.path }
+        : null;
+    },
+    getCronService: () => {
+      // oxlint-disable-next-line typescript-eslint(no-require-imports)
+      const { getCronService } = require("../cron");
+      return getCronService();
+    },
+    onSkillsInstalled: async () => {
+      await ensureCustomSkillLoaderInitialized();
+      await customSkillLoader.reloadSkills();
+      customSkillLoader.clearEligibilityCache();
     },
   });
 }
