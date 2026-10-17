@@ -274,6 +274,10 @@ import type {
   ShellSessionLifecycleEvent,
   TerminalTabRunResult,
   TerminalTabOutputEvent,
+  TerminalBlockRunRequest,
+  TerminalBlockRunResult,
+  TerminalBlockOutputEvent,
+  MessageSurfaceOrigin,
   LLMRoutingRuntimeState,
   AgentMailApiKeySummary,
   AgentMailConnectionTestResult,
@@ -2288,6 +2292,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on(IPC_CHANNELS.TERMINAL_TAB_OUTPUT, handler);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.TERMINAL_TAB_OUTPUT, handler);
   },
+  runTerminalBlock: (data: TerminalBlockRunRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_BLOCK_RUN, data) as Promise<TerminalBlockRunResult>,
+  stopTerminalBlock: (data: { runId: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_BLOCK_STOP, data) as Promise<{ stopped: boolean }>,
+  onTerminalBlockOutput: (callback: (event: TerminalBlockOutputEvent) => void) => {
+    const handler = (_: Any, event: TerminalBlockOutputEvent) => callback(event);
+    ipcRenderer.on(IPC_CHANNELS.TERMINAL_BLOCK_OUTPUT, handler);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.TERMINAL_BLOCK_OUTPUT, handler);
+  },
   listLocalPreviewTemplates: () =>
     ipcRenderer.invoke(IPC_CHANNELS.LOCAL_PREVIEW_TEMPLATES) as Promise<
       LocalPreviewCommandTemplate[]
@@ -3383,7 +3396,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
       shellAccess?: boolean;
       accessProfileId?: AccessProfileId;
       integrationMentions?: IntegrationMentionSelection[];
-      surfaceOrigin?: "answer" | "page";
+      surfaceOrigin?: MessageSurfaceOrigin;
     },
   ) => {
     const validatedImages = validateSendMessageAttachments(images);
@@ -4487,6 +4500,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_DESKTOP_FILES, taskId),
   revealBotDesktopFile: (taskId: string, filePath: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_REVEAL_DESKTOP_FILE, taskId, filePath),
+  startTeachingTask: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_START_RECORDING, taskId),
+  finishTeachingTask: (taskId: string, name: string | null) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_FINISH_RECORDING, taskId, name),
+  listTaughtTasks: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_TAUGHT_TASKS, taskId),
+  deleteTaughtTask: (taskId: string, taughtTaskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.COMPUTER_VIEW_DELETE_TAUGHT_TASK, taskId, taughtTaskId),
   onComputerViewEvent: (callback: (state: ComputerViewState) => void) => {
     const channel = IPC_CHANNELS.COMPUTER_VIEW_EVENT;
     const listener = (_e: Any, payload: ComputerViewState) => callback(payload);
@@ -7177,7 +7198,7 @@ export interface ElectronAPI {
       shellAccess?: boolean;
       accessProfileId?: AccessProfileId;
       integrationMentions?: IntegrationMentionSelection[];
-      surfaceOrigin?: "answer" | "page";
+      surfaceOrigin?: MessageSurfaceOrigin;
     },
   ) => Promise<{
     queued: boolean;
@@ -7254,6 +7275,10 @@ export interface ElectronAPI {
     taskId?: string;
   }) => Promise<{ success: boolean }>;
   onTerminalTabOutput: (callback: (event: TerminalTabOutputEvent) => void) => () => void;
+  /** Run a shell code block from an answer in the task's terminal tab and wait for it to finish. */
+  runTerminalBlock: (data: TerminalBlockRunRequest) => Promise<TerminalBlockRunResult>;
+  stopTerminalBlock: (data: { runId: string }) => Promise<{ stopped: boolean }>;
+  onTerminalBlockOutput: (callback: (event: TerminalBlockOutputEvent) => void) => () => void;
   createWorkspace: (data: Any) => Promise<Workspace>;
   listWorkspaces: () => Promise<Workspace[]>;
   selectWorkspace: (id: string) => Promise<Workspace>;
@@ -8645,6 +8670,15 @@ export interface ElectronAPI {
     taskId: string,
   ) => Promise<Array<{ path: string; size: number; modifiedAt: number }>>;
   revealBotDesktopFile: (taskId: string, filePath: string) => Promise<{ revealed: boolean }>;
+  /** Teach a task: starts recording what you do on the bot's desktop (after taking over). */
+  startTeachingTask: (taskId: string) => Promise<{ recording: boolean }>;
+  /** Stops recording; saves it under the name, or discards it when the name is null. */
+  finishTeachingTask: (
+    taskId: string,
+    name: string | null,
+  ) => Promise<import("../shared/bot-computer").TaughtTask | null>;
+  listTaughtTasks: (taskId: string) => Promise<import("../shared/bot-computer").TaughtTask[]>;
+  deleteTaughtTask: (taskId: string, taughtTaskId: string) => Promise<{ deleted: boolean }>;
   onComputerViewEvent: (callback: (state: ComputerViewState) => void) => () => void;
   // Tray (Menu Bar)
   getTraySettings: () => Promise<TraySettings>;

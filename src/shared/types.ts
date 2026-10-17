@@ -1491,6 +1491,8 @@ export type ToolType =
   | "desktop_drag"
   | "desktop_run"
   | "desktop_save_file"
+  | "desktop_taught_tasks"
+  | "desktop_replay_task"
   // Orchestration tools
   | "orchestrate_agents"
   // QA tools (Playwright visual QA)
@@ -1993,6 +1995,9 @@ export const TOOL_RISK_LEVELS: Record<ToolType, ToolRiskLevel> = {
   // though it runs in the container, since it can reach the network with the bot's sign-ins.
   desktop_run: "destructive",
   desktop_save_file: "write",
+  desktop_taught_tasks: "read",
+  // Replays the person's own recorded clicks and typing on the bot's desktop, like desktop_click.
+  desktop_replay_task: "write",
   // Orchestration
   orchestrate_agents: "write",
   // Meta
@@ -3251,6 +3256,13 @@ export interface QuotedAssistantMessage {
 }
 
 /** Follow-up payload sent to an existing task. */
+/** Where a user message came from when the desktop app sent it on the user's behalf. */
+export type MessageSurfaceOrigin = "answer" | "page" | "code_block";
+
+export function isMessageSurfaceOrigin(value: unknown): value is MessageSurfaceOrigin {
+  return value === "answer" || value === "page" || value === "code_block";
+}
+
 export interface TaskFollowUpInput {
   /** Captured user preference, applied at a turn boundary. */
   interactionMode?: import("./interaction-mode").InteractionModeSelection;
@@ -3288,9 +3300,10 @@ export interface TaskFollowUpInput {
   /**
    * The user sent this exact text by approving an action in an interactive answer: a
    * button the model wrote ("answer") or a request from page code in an HTML frame
-   * ("page"). Set only by the desktop app's own send path.
+   * ("page"), or the output of a shell code block the user ran from an answer
+   * ("code_block"). Set only by the desktop app's own send path.
    */
-  surfaceOrigin?: "answer" | "page";
+  surfaceOrigin?: MessageSurfaceOrigin;
 }
 
 export type AgentMessageDeliveryStatus =
@@ -4378,6 +4391,32 @@ export interface TerminalTabOutputEvent {
   cwd?: string;
   status?: ShellSessionStatus;
   timestamp: number;
+}
+
+/** Run a shell code block from an assistant answer in the task's terminal tab. */
+export interface TerminalBlockRunRequest {
+  /** Renderer-chosen id that tags the streamed output events for this run. */
+  runId: string;
+  workspaceId: string;
+  taskId: string;
+  command: string;
+}
+
+export interface TerminalBlockRunResult {
+  runId: string;
+  tabId: string;
+  /** Output between the command start and its finish, with terminal escapes kept. */
+  output: string;
+  /** The output was longer than the capture limit; only its tail is kept. */
+  truncated: boolean;
+  exitCode: number | null;
+  terminationReason: CommandTerminationReason;
+}
+
+export interface TerminalBlockOutputEvent {
+  runId: string;
+  tabId: string;
+  output: string;
 }
 
 export type GithubReviewThreadState = "open" | "resolved" | "outdated" | "unknown";
@@ -7945,6 +7984,9 @@ export const IPC_CHANNELS = {
   TERMINAL_TAB_STOP: "terminalTab:stop",
   TERMINAL_TAB_CLOSE: "terminalTab:close",
   TERMINAL_TAB_OUTPUT: "terminalTab:output",
+  TERMINAL_BLOCK_RUN: "terminalBlock:run",
+  TERMINAL_BLOCK_STOP: "terminalBlock:stop",
+  TERMINAL_BLOCK_OUTPUT: "terminalBlock:output",
   SPREADSHEET_OPEN_WORKBOOK: "spreadsheet:openWorkbook",
   SPREADSHEET_GET_VIEWPORT: "spreadsheet:getViewport",
   SPREADSHEET_APPLY_PATCHES: "spreadsheet:applyPatches",
@@ -8716,6 +8758,10 @@ export const IPC_CHANNELS = {
   COMPUTER_VIEW_STOP_DESKTOP: "computerView:stopDesktop",
   COMPUTER_VIEW_DESKTOP_FILES: "computerView:desktopFiles",
   COMPUTER_VIEW_REVEAL_DESKTOP_FILE: "computerView:revealDesktopFile",
+  COMPUTER_VIEW_START_RECORDING: "computerView:startRecording",
+  COMPUTER_VIEW_FINISH_RECORDING: "computerView:finishRecording",
+  COMPUTER_VIEW_TAUGHT_TASKS: "computerView:taughtTasks",
+  COMPUTER_VIEW_DELETE_TAUGHT_TASK: "computerView:deleteTaughtTask",
 
   // Tray (Menu Bar)
   TRAY_GET_SETTINGS: "tray:getSettings",
@@ -9634,8 +9680,8 @@ export interface LLMSettingsData {
   };
   /** Text-to-video generation settings. Provider-specific config + routing. */
   videoGeneration?: {
-    defaultProvider?: "openai" | "azure" | "gemini" | "vertex" | "kling";
-    fallbackProvider?: "openai" | "azure" | "gemini" | "vertex" | "kling";
+    defaultProvider?: "openai" | "azure" | "gemini" | "vertex" | "kling" | "local";
+    fallbackProvider?: "openai" | "azure" | "gemini" | "vertex" | "kling" | "local";
     openai?: {
       defaultModel?: string;
       defaultDuration?: number;
@@ -9673,6 +9719,13 @@ export interface LLMSettingsData {
       model?: string;
       defaultDuration?: number;
       defaultAspectRatio?: "16:9" | "9:16" | "1:1";
+    };
+    /** Open model run on this machine (Wan 2.2 via mlx-video). */
+    local?: {
+      pythonPath?: string;
+      modelDir?: string;
+      steps?: number;
+      maxMinutes?: number;
     };
   };
   // Cached models from API (populated when user refreshes)
