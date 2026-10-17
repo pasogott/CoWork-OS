@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import type { LLMProviderType, LLMSettingsData, PersonaId } from "../../shared/types";
 import { recommendChatGPTModelForPlan } from "../../shared/chatgpt-plan";
 import { GEMINI_DEFAULT_MODEL, OPENROUTER_FREE_MODEL_ID } from "../../shared/llm-provider-catalog";
+import { KIMI_DEFAULT_MODEL } from "../../shared/kimi-models";
 import {
   deriveOnboardingPersonalityPreset,
   deriveOnboardingPersona,
@@ -323,7 +324,7 @@ export const ONBOARDING_CUSTOM_PROVIDERS: Partial<
 > = {
   "nano-gpt": { baseUrl: "https://nano-gpt.com/api/v1", model: "minimax/minimax-m2.7" },
   "opencode-go": { baseUrl: "https://opencode.ai/zen/go/v1", model: "qwen3.7-plus" },
-  zai: { baseUrl: "https://api.z.ai/api/paas/v4", model: "glm-5.1" },
+  zai: { baseUrl: "https://api.z.ai/api/paas/v4", model: "glm-5.3" },
   minimax: { baseUrl: "https://api.minimax.io/v1", model: "MiniMax-M2.7" },
 };
 
@@ -362,7 +363,7 @@ export function getOnboardingDefaultModel(provider: LLMProviderType): string {
     case "deepseek":
       return "deepseek-chat";
     case "kimi":
-      return "kimi-k2.5";
+      return KIMI_DEFAULT_MODEL;
     default:
       return "sonnet-4";
   }
