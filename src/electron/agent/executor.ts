@@ -793,6 +793,17 @@ function isFeatureEnabled(envName: string, defaultValue = true): boolean {
   return defaultValue;
 }
 
+/** Successful calls that change the Live Canvas page or write its export. */
+const CANVAS_MUTATION_TOOL_NAMES = new Set([
+  "canvas_create",
+  "canvas_push",
+  "canvas_add_asset",
+  "canvas_export",
+]);
+
+export const CANVAS_EXPORT_STEP_DESCRIPTION =
+  "Show every finished picture and clip in the Live Canvas page (canvas_add_asset for any not shown yet), then export the page with canvas_export.";
+
 class TurnLimitExceededError extends Error {
   readonly code = TASK_ERROR_CODES.TURN_LIMIT_EXCEEDED;
 
@@ -8878,7 +8889,9 @@ ${transcript}
 
     if (
       !this.task.parentTaskId &&
-      TaskStrategyService.hasExplicitDelegationRequest(this.getContractPrompt())
+      TaskStrategyService.hasExplicitDelegationRequest(
+        this.lastUserMessage || this.getContractPrompt(),
+      )
     ) {
       lines.push(
         "The user explicitly requested delegation. Use actual spawn_agent or orchestrate_agents calls and collect the child results before reconciling them. Serial research passes are not separate agents. Assign public official-source research to web_researcher, local inspection to researcher, and scoped writing to implementer. If delegation is unavailable, report the concrete blocker instead of silently substituting a solo run.",
@@ -12426,6 +12439,8 @@ ${transcript}
       canonical === "create_diagram" ||
       canonical === "canvas_create" ||
       canonical === "canvas_push" ||
+      canonical === "canvas_add_asset" ||
+      canonical === "canvas_export" ||
       canonical === "create_document" ||
       canonical === "generate_document" ||
       canonical === "compile_latex" ||
@@ -13505,6 +13520,27 @@ ${transcript}
       });
     }
 
+    // A Live Canvas page that shows generated pictures or clips must end up
+    // exported. Models tend to fold this into a media step and then skip it, so
+    // it becomes its own step whose contract requires canvas_export.
+    if (
+      this.planBuildsCanvasWithMedia(nextPlan.steps) &&
+      !nextPlan.steps.some((step) => /\bcanvas_export\b/.test(String(step.description || "")))
+    ) {
+      const exportStep: PlanStep = {
+        id: this.nextPlanStepId(nextPlan.steps),
+        description: CANVAS_EXPORT_STEP_DESCRIPTION,
+        kind: "primary",
+        status: "pending",
+      };
+      const lastStep = nextPlan.steps[nextPlan.steps.length - 1];
+      if (lastStep && this.isVerificationStep(lastStep)) {
+        nextPlan.steps.splice(nextPlan.steps.length - 1, 0, exportStep);
+      } else {
+        nextPlan.steps.push(exportStep);
+      }
+    }
+
     // A research answer the user asked to be linked or sourced ends with a
     // check of its links, so the verification repair pass can fix unlinked
     // facts. Plans that already end with a check keep it.
@@ -13576,6 +13612,21 @@ ${transcript}
       });
     }
     return nextPlan;
+  }
+
+  /** A plan that builds a Live Canvas page and also makes pictures or clips for it. */
+  private planBuildsCanvasWithMedia(steps: PlanStep[]): boolean {
+    const texts = steps.map((step) => String(step.description || "").toLowerCase());
+    // The in-app Live Canvas only: an HTML <canvas> in an app being coded is not it.
+    const buildsCanvas = texts.some((text) =>
+      /\b(?:live\s+canvas|in-app\s+canvas|canvas_create|canvas_push|canvas_add_asset)\b/.test(text),
+    );
+    const makesMedia = texts.some((text) =>
+      /\b(?:pictures?|images?|illustrations?|videos?|clips?|animat(?:e|ed|ion|ions)|generate_image|generate_video)\b/.test(
+        text,
+      ),
+    );
+    return buildsCanvas && makesMedia;
   }
 
   private stepRequiresImageVerification(step: PlanStep): boolean {
@@ -13860,8 +13911,18 @@ ${transcript}
         desc,
       );
     if (canvasIntent) {
-      required.add(canonicalizeToolNameUtil("canvas_push"));
-      required.add(canonicalizeToolNameUtil("canvas_create"));
+      const taskHasCanvas =
+        typeof this.toolRegistry?.getLatestCanvasSessionId === "function" &&
+        Boolean(this.toolRegistry.getLatestCanvasSessionId());
+      if (/\bcanvas_export\b/.test(desc)) {
+        // Exporting works on the page the task already has: no new page, and no
+        // push when there is nothing new to add.
+        required.add(canonicalizeToolNameUtil("canvas_export"));
+      } else {
+        required.add(canonicalizeToolNameUtil("canvas_push"));
+        // Later steps update the existing page instead of creating a second one.
+        if (!taskHasCanvas) required.add(canonicalizeToolNameUtil("canvas_create"));
+      }
     }
 
     const inlineDiagramIntent = this.stepIndicatesInlineDiagramIntent(desc);
@@ -13968,6 +14029,16 @@ ${transcript}
       addRequiredToolIfKnown("screen_context_resolve");
     }
 
+    // A step that works through canvas tools writes the page with them. A file it
+    // names ("add scene.png to the page") is an input, not a file to write, unless
+    // the step also says to write or save one.
+    if (
+      /\b(?:canvas_create|canvas_push|canvas_add_asset|canvas_export)\b/.test(desc) &&
+      !/\b(?:write|save)\b[^.!?\n]{0,60}\.[a-z0-9]{2,5}\b/.test(desc)
+    ) {
+      required.delete(canonicalizeToolNameUtil("write_file"));
+      required.delete(canonicalizeToolNameUtil("edit_file"));
+    }
     return required;
   }
 
@@ -20253,7 +20324,9 @@ ${transcript}
     );
     if (
       !this.task.parentTaskId &&
-      TaskStrategyService.hasExplicitDelegationRequest(this.getContractPrompt())
+      TaskStrategyService.hasExplicitDelegationRequest(
+        this.lastUserMessage || this.getContractPrompt(),
+      )
     ) {
       for (const name of [
         "spawn_agent",
@@ -20698,9 +20771,9 @@ ${transcript}
 
   private hasExplicitBotTeamDelegationRequest(context?: string): boolean {
     if (this.task.agentConfig?.botConversation !== true) return false;
-    const delegationContext = [context, this.task.title, this.task.prompt, this.lastUserMessage]
-      .filter(Boolean)
-      .join("\n");
+    // The latest user turn supersedes the original prompt. Step descriptions and
+    // titles are model-authored or historical and cannot authorize a new handoff.
+    const delegationContext = this.lastUserMessage || this.task.userPrompt || this.task.prompt;
     return hasBotTeamDelegationRequest(
       delegationContext,
       this.daemon.getBotTeamPromptContext?.(this.task.id),
@@ -37505,7 +37578,7 @@ Return ONLY a JSON object:
                               });
                             }
                           }
-                          if (content.name === "canvas_create" || content.name === "canvas_push") {
+                          if (CANVAS_MUTATION_TOOL_NAMES.has(content.name)) {
                             stepSucceededWithCanvasMutation = true;
                             foundCanvasEvidence = true;
                             this.canvasEvidenceObserved = true;
@@ -38919,7 +38992,7 @@ Return ONLY a JSON object:
                     });
                   }
                 }
-                if (content.name === "canvas_create" || content.name === "canvas_push") {
+                if (CANVAS_MUTATION_TOOL_NAMES.has(content.name)) {
                   stepSucceededWithCanvasMutation = true;
                   foundCanvasEvidence = true;
                   this.canvasEvidenceObserved = true;
@@ -41172,8 +41245,8 @@ Return ONLY a JSON object:
     >,
   ): Promise<void> {
     try {
-      if (!this.plan) {
-        if (recoveredBotHandoff?.message && recoveredBotHandoff.messageSource === "agent") {
+      if (!this.plan || recoveredBotHandoff?.messageSource === "user") {
+        if (recoveredBotHandoff?.message) {
           // A bot handoff may already be durably delivered when the process
           // exits. In that case the queue receipt is terminal, but the
           // receiver still needs one fresh execution turn after restart. Do
@@ -41183,19 +41256,45 @@ Return ONLY a JSON object:
             `${this.logTag} Replaying the latest delivered teammate handoff after restart`,
           );
           this.emitEvent("log", {
-            message: "Replaying the latest delivered teammate handoff after restart.",
+            message:
+              recoveredBotHandoff.messageSource === "user"
+                ? "Resuming the latest unfinished bot user turn after restart."
+                : "Replaying the latest delivered teammate handoff after restart.",
             messageId: recoveredBotHandoff.messageId,
             senderTaskId: recoveredBotHandoff.senderTaskId,
-            recovery: "bot_handoff",
+            recovery:
+              recoveredBotHandoff.messageSource === "user" ? "bot_user_turn" : "bot_handoff",
           });
           await this.sendMessageUnlocked(recoveredBotHandoff.message, undefined, undefined, {
-            messageSource: "agent",
+            messageSource: recoveredBotHandoff.messageSource,
             messageId: recoveredBotHandoff.messageId,
             senderTaskId: recoveredBotHandoff.senderTaskId,
             senderLabel: recoveredBotHandoff.senderLabel,
             inReplyToMessageId: recoveredBotHandoff.inReplyToMessageId,
             inReplyToTaskId: recoveredBotHandoff.inReplyToTaskId,
             suppressUserMessageEvent: true,
+            transcriptAlreadyContainsMessage:
+              recoveredBotHandoff.messageSource === "user" &&
+              this.conversationHistory.some((entry) => {
+                if (entry.role !== "user") return false;
+                const text =
+                  typeof entry.content === "string"
+                    ? entry.content
+                    : entry.content
+                        .filter((block) => block.type === "text")
+                        .map((block) => (block as { text: string }).text)
+                        .join("\n");
+                return text.includes(recoveredBotHandoff.message);
+              }),
+          });
+          return;
+        }
+        if (this.task.agentConfig?.botConversation === true) {
+          // An empty/finished bot has no runnable initial task. Its synthetic
+          // seed is UI metadata, never an instruction to execute on recovery.
+          this.daemon.updateTaskStatus(this.task.id, "pending");
+          this.emitEvent("log", {
+            message: "Bot recovery has no unfinished turn; conversation remains idle.",
           });
           return;
         }
@@ -43565,6 +43664,14 @@ Return ONLY a JSON object:
       memoryFeatures: memoryFeatureSettings,
       turnGuidancePrompt: followUpTurnGuidance,
     });
+    const roleContextPreserved = !roleContext || builtPrompt.prompt.includes(roleContext.trim());
+    if (!roleContextPreserved) {
+      throw new Error("Saved role instructions were not preserved in the execution prompt.");
+    }
+    logger.info(`${this.logTag} Role instruction delivery`, {
+      roleContextChars: roleContext.length,
+      roleContextPreserved,
+    });
     this.systemPrompt = this.setPromptCacheContext({
       surface: "followUps",
       systemBlocks: builtPrompt.systemBlocks,
@@ -43573,6 +43680,8 @@ Return ONLY a JSON object:
     });
     this.emitEvent("log", {
       message: "Follow-up prompt built",
+      roleContextChars: roleContext.length,
+      roleContextPreserved,
       droppedSections: builtPrompt.droppedSections,
       truncatedSections: builtPrompt.truncatedSections,
       totalTokens: builtPrompt.totalTokens,
@@ -45048,7 +45157,7 @@ Return ONLY a JSON object:
                             );
                           }
                           this.recordToolResult(content.name, result, content.input);
-                          if (content.name === "canvas_create" || content.name === "canvas_push") {
+                          if (CANVAS_MUTATION_TOOL_NAMES.has(content.name)) {
                             this.canvasEvidenceObserved = true;
                           }
                           const currentFailures =

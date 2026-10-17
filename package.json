@@ -2,7 +2,7 @@
   "name": "cowork-os",
   "version": "0.5.60",
   "private": false,
-  "description": "Free, open-source AI super app and multi-provider agent harness for coding, knowledge work, documents, communication, automation, and everyday tasks",
+  "description": "Rent the model. Own everything else. Free, open-source AI app and multi-provider agent harness for coding, knowledge work, documents, and automation",
   "keywords": [
     "agent-harness",
     "agentic-os",
@@ -229,6 +229,7 @@
     "exceljs": "npm:devextreme-exceljs-fork@4.4.13",
     "grammy": "^1.39.3",
     "highlight.js": "^11.11.1",
+    "js-yaml": "^4.1.1",
     "jszip": "^3.10.1",
     "lucide-react": "^1.47.0",
     "mammoth": "^1.11.0",
@@ -258,6 +259,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
+    "@types/js-yaml": "^4.0.9",
     "@types/mime-types": "^3.0.1",
     "@types/node": "^26.6.2",
     "@types/pdf-parse": "^1.1.5",
