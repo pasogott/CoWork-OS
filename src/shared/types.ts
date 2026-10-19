@@ -673,6 +673,7 @@ export type EventType =
   | "annotation_updated"
   | "annotation_addressing_started"
   | "annotation_addressed"
+  | "annotation_change_undone" // The change that addressed an annotation was reverted
   | "annotation_resolved"
   | "annotation_dismissed"
   | "command_output"
@@ -715,6 +716,7 @@ export type EventType =
   | "worktree_merge_start" // Merge to base branch started
   | "worktree_merged" // Successfully merged to base branch
   | "worktree_conflict" // Merge conflict detected
+  | "resource_conflict" // Another task in the same folder is changing this file (write refused)
   | "worktree_cleaned" // Worktree removed after completion
   // Collaborative Thoughts events (team multi-agent thinking)
   | "agent_thought" // Agent sharing analysis/reasoning with team
@@ -2501,6 +2503,17 @@ export interface AgentConfig {
   /** Existing local branch to base a new isolated checkout on; omit for HEAD. */
   worktreeBaseBranch?: string;
   /**
+   * Exact commit (40-hex SHA) to start the isolated checkout from. Build Compare pins every
+   * variant to the same commit so they differ only in what each task did.
+   */
+  worktreeBaseCommit?: string;
+  /** Build Compare: the variants of one request share this id. */
+  compareGroupId?: string;
+  /** Build Compare: this variant's number, from 1. */
+  compareVariant?: number;
+  /** Build Compare: the check every variant runs before it finishes (a shell command). */
+  compareCheckCommand?: string;
+  /**
    * Optional allow-list of approval types that may be auto-approved when
    * autonomousMode is enabled. Omit to preserve legacy "approve all" behavior.
    */
@@ -2930,6 +2943,60 @@ export interface WorktreeInfo {
   lastCommitSha?: string; // SHA of the last auto-commit
   lastCommitMessage?: string;
   mergeResult?: MergeResult;
+}
+
+/** One task holding a claim on a resource it is changing (shared-change coordination, WP11). */
+export interface ResourceClaimHolder {
+  taskId: string;
+  title: string;
+  /** The task works in its own worktree, so its change meets others only at merge. */
+  isolated: boolean;
+  status: string;
+}
+
+/** A resource two or more tasks are changing. */
+export interface ResourceOverlap {
+  workspaceId: string;
+  resourceKey: string;
+  /** Workspace-relative path for files. */
+  label: string;
+  holders: ResourceClaimHolder[];
+}
+
+export interface MergeReviewTask {
+  taskId: string;
+  title: string;
+  branch: string;
+  status: string;
+  worktreeStatus?: string;
+  /** Build Compare variant number, from 1. */
+  variant?: number;
+  /** The latest result of the task's check command, when it has one. */
+  check?: { passed: boolean; message?: string };
+  diff: { files: number; additions: number; deletions: number };
+  changedFiles: string[];
+}
+
+/** Tasks that want the same thing: one Compare request, or tasks with the same title. */
+export interface MergeReviewGroup {
+  intent: string;
+  compareGroupId?: string;
+  tasks: MergeReviewTask[];
+}
+
+/**
+ * Worktree changes waiting to merge into one workspace, grouped by intent, with checks on
+ * the combined state: files changed by more than one group, and pairs that would conflict.
+ */
+export interface MergeReview {
+  workspaceId: string;
+  groups: MergeReviewGroup[];
+  checks: {
+    overlaps: Array<{ path: string; taskIds: string[] }>;
+    conflicts: Array<{ taskIds: [string, string]; files: string[] }>;
+    /** False when git could not compute merges (git older than 2.38). */
+    conflictCheckAvailable: boolean;
+  };
 }
 
 export interface MergeResult {
@@ -4955,6 +5022,21 @@ export interface AnnotationStylePatch {
   notes?: string;
 }
 
+/** What the user wants at the place they pointed to. */
+export type AnnotationIntent = "change" | "comment" | "question";
+
+/**
+ * Values at an annotation's anchor, by key: a style property, `text`, or a cell's A1 address.
+ * Bounded when stored (50 keys, 2,000 characters a value).
+ */
+export type AnnotationValues = Record<string, string>;
+
+/**
+ * A user pointing at a result: where (`targetRef`, the anchor), what they want (`intent`,
+ * `body`), the values there and the ones asked for (`before`, `after`), and, for a file, the
+ * revision they pointed at and the revision that addressed it. While `undoToken` is present the
+ * change can be undone by restoring `artifactRevisionId`.
+ */
 export interface Annotation {
   id: string;
   taskId: string;
@@ -4972,6 +5054,17 @@ export interface Annotation {
   updatedAt: number;
   resolvedAt?: number;
   resolvedByEventId?: string;
+  intent?: AnnotationIntent;
+  before?: AnnotationValues;
+  after?: AnnotationValues;
+  /** The file the change is expected in, when it is not the target file (a new version). */
+  outputPath?: string;
+  /** The revision of the target file the user pointed at. */
+  artifactRevisionId?: string;
+  /** The revision that addressed this annotation. */
+  resultRevisionId?: string;
+  /** Present while the change can be undone; required to undo it. */
+  undoToken?: string;
 }
 
 export interface AnnotationCreateInput {
@@ -4985,6 +5078,18 @@ export interface AnnotationCreateInput {
   artifactId?: string;
   screenshotPath?: string;
   createdBy?: Annotation["createdBy"];
+  intent?: AnnotationIntent;
+  before?: AnnotationValues;
+  after?: AnnotationValues;
+  outputPath?: string;
+}
+
+/** The result of undoing the change that addressed an annotation. */
+export interface AnnotationUndoResult {
+  ok: boolean;
+  annotation?: Annotation;
+  /** Why the change could not be undone. */
+  error?: string;
 }
 
 export interface AnnotationListQuery {
@@ -8279,6 +8384,7 @@ export const IPC_CHANNELS = {
   ANNOTATION_UPDATE: "annotation:update",
   ANNOTATION_RESOLVE: "annotation:resolve",
   ANNOTATION_DISMISS: "annotation:dismiss",
+  ANNOTATION_UNDO: "annotation:undo",
   YOUTUBE_INGEST_VIDEO: "youtube:ingestVideo",
   YOUTUBE_ASK_VIDEO: "youtube:askVideo",
   YOUTUBE_SEARCH_SEGMENTS: "youtube:searchSegments",
@@ -9356,6 +9462,8 @@ export const IPC_CHANNELS = {
   WORKTREE_MERGE: "worktree:merge",
   WORKTREE_CLEANUP: "worktree:cleanup",
   WORKTREE_GET_DIFF: "worktree:getDiff",
+  WORKTREE_RESOLVE_BASE_COMMIT: "worktree:resolveBaseCommit",
+  WORKTREE_MERGE_REVIEW: "worktree:mergeReview",
   WORKTREE_GET_SETTINGS: "worktree:getSettings",
   WORKTREE_SAVE_SETTINGS: "worktree:saveSettings",
 

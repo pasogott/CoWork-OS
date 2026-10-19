@@ -501,6 +501,43 @@ export class WorkSessionContractService {
     });
   }
 
+  /**
+   * A revision of a file that is not (or not yet) a task artifact: the file a user pointed at,
+   * the result of addressing that, or a restore.
+   */
+  recordFileRevision(
+    taskId: string,
+    input: {
+      path: string;
+      sha256: string;
+      size: number;
+      mimeType?: string;
+      parentRevisionId?: string;
+      createdBy: "user" | "agent";
+      metadata?: Record<string, unknown>;
+      idempotencyKey: string;
+    },
+  ): ArtifactRevision | undefined {
+    const result = this.getForTask(taskId);
+    if (!result) return undefined;
+    return this.repository.createArtifactRevision({
+      sessionId: result.session.id,
+      taskId,
+      path: input.path,
+      mimeType: input.mimeType || "application/octet-stream",
+      sha256: input.sha256,
+      size: input.size,
+      ...(input.parentRevisionId ? { parentRevisionId: input.parentRevisionId } : {}),
+      createdBy: input.createdBy,
+      metadata: input.metadata,
+      idempotencyKey: input.idempotencyKey,
+    });
+  }
+
+  getArtifactRevision(revisionId: string): ArtifactRevision | undefined {
+    return this.repository.getArtifactRevisionById(revisionId);
+  }
+
   recordArtifactByPath(
     taskId: string,
     path: string,
@@ -720,6 +757,18 @@ export class WorkSessionContractService {
     if (!task) return {};
     const result = this.getForTask(task.id);
     if (!result) return {};
+    // Waits that only make sense while the task runs end with it: a wait_for_event wait (its
+    // temporary trigger is removed by the sweep) and a write refused because another task was
+    // changing the file.
+    for (const wait of this.repository.listWaitStates(result.session.id, { status: "pending" })) {
+      if (
+        wait.kind === "external" &&
+        (wait.requestId?.startsWith("event_wait:") ||
+          wait.requestId?.startsWith("resource_conflict:"))
+      ) {
+        this.repository.resolveWaitState(wait.id, "cancelled", { reason: "task_ended" });
+      }
+    }
     const outcome = taskOutcome(task);
     let contract = result.contract;
     if (contract && outcome) {

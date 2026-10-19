@@ -195,6 +195,7 @@ import { DurableContextService } from "./memory/DurableContextService";
 import { BoxBrainService } from "./memory/BoxBrainService";
 import { MemoryRetentionService } from "./memory/MemoryRetentionService";
 import { CuratedMemoryService } from "./memory/CuratedMemoryService";
+import { MemorySourceRecheckService } from "./memory/MemorySourceRecheckService";
 import { startMemoryEngine } from "./memory/memory-engine-bootstrap";
 import { startMemoryRepo, stopMemoryRepo } from "./memory/repo/memory-repo-bootstrap";
 import { getMemoryRepoDreamer } from "./memory/repo/MemoryRepoDreamer";
@@ -2552,6 +2553,10 @@ if (isMacSafeStorageMigrationWorker) {
         // Quiet mode starts no background jobs: no periodic cleanup or deferred archive cleanup.
         MemoryService.initialize(dbManager, { backgroundJobs: !startupQuietMode });
         CuratedMemoryService.initialize(dbManager);
+        // Memories whose source file or record changed (WP15): flags for recall and prompts.
+        void MemorySourceRecheckService.getDefault()
+          .load()
+          .catch((error) => logger.warn("Could not load memory source flags:", error));
         // Memory engine (docs/memory-engine.md): memory_items is the only store of facts
         // about the user. The retired legacy lanes are copied in once, awaited here, before
         // queue recovery and IPC can read memory.
@@ -4063,10 +4068,13 @@ if (isMacSafeStorageMigrationWorker) {
                 logger.warn("[EventTriggers] Could not record routine trigger fire:", error);
               });
             },
+            onEventWaitFired: (params) => agentDaemon.resumeAfterEventWait(params),
           },
           db,
         );
         const currentTriggerService = eventTriggerService;
+        // wait_for_event parks tasks on temporary triggers in this engine.
+        agentDaemon.setEventWaitRegistry?.(currentTriggerService);
         const mcpClientManager = MCPClientManager.getInstance();
         const syncMcpTriggerSubscriptions = async (): Promise<void> => {
           const subscriptions = currentTriggerService
@@ -4110,6 +4118,12 @@ if (isMacSafeStorageMigrationWorker) {
             void currentTriggerService
               .evaluateEvent(triggerEvent)
               .catch((error) => logger.warn("Connector trigger event failed:", error));
+          }
+          // A connector record changed: memories saved from it are flagged (WP15).
+          if (event.type === "resource_updated" && event.resourceUri) {
+            void MemorySourceRecheckService.getDefault()
+              .onConnectorRecordChanged(event.resourceUri)
+              .catch((error) => logger.debug("Memory source recheck failed:", error));
           }
         });
         void syncMcpTriggerSubscriptions();
@@ -4315,6 +4329,21 @@ if (isMacSafeStorageMigrationWorker) {
           },
           emitTrigger: (event) => {
             void currentTriggerService.evaluateEvent(event);
+            // A workspace file changed: memories saved from it are flagged (WP15).
+            const workspaceId = String(event.fields.workspaceId ?? "");
+            const relPath = String(event.fields.path ?? "");
+            if (event.source === "file_change" && workspaceId && relPath) {
+              const workspacePath = workspaceRepo.findById(workspaceId)?.path;
+              if (workspacePath) {
+                void MemorySourceRecheckService.getDefault()
+                  .onFileChanged({
+                    workspaceId,
+                    relPath,
+                    absolutePath: path.join(workspacePath, relPath),
+                  })
+                  .catch((error) => logger.debug("Memory source recheck failed:", error));
+              }
+            }
           },
           wakeHeartbeats: ({ text, mode, workspaceId, category }) => {
             void submitHeartbeatSignalForAll({
@@ -5780,8 +5809,23 @@ if (isMacSafeStorageMigrationWorker) {
         screenshotPath: typeof data.screenshotPath === "string" ? data.screenshotPath : undefined,
         createdBy:
           data.createdBy === "agent" || data.createdBy === "review" ? data.createdBy : "user",
+        intent:
+          data.intent === "change" || data.intent === "comment" || data.intent === "question"
+            ? data.intent
+            : undefined,
+        // Bounded by the store: string values only, 50 keys.
+        before: data.before && typeof data.before === "object" ? data.before : undefined,
+        after: data.after && typeof data.after === "object" ? data.after : undefined,
       });
       logAnnotationEvent("annotation_created", annotation);
+      // A file target: record the revision the user pointed at, so the change can be undone.
+      if (surfaceType === "file" || surfaceType === "artifact" || surfaceType === "diff") {
+        try {
+          return (await agentDaemon.pinAnnotationTarget(annotation.id)) ?? annotation;
+        } catch (error) {
+          console.warn("[Annotations] Could not record the pointed-at revision:", error);
+        }
+      }
       return annotation;
     });
 
@@ -5818,6 +5862,14 @@ if (isMacSafeStorageMigrationWorker) {
       });
       if (annotation) logAnnotationEvent("annotation_resolved", annotation);
       return annotation || null;
+    });
+
+    ipcMain.handle(IPC_CHANNELS.ANNOTATION_UNDO, async (_event, data: Any) => {
+      const id = typeof data?.id === "string" ? data.id.trim() : "";
+      const undoToken = typeof data?.undoToken === "string" ? data.undoToken.trim() : "";
+      if (!id) throw new Error("Annotation id is required");
+      if (!undoToken) throw new Error("Undo token is required");
+      return await agentDaemon.undoAnnotationChange(id, undoToken);
     });
 
     ipcMain.handle(IPC_CHANNELS.ANNOTATION_DISMISS, async (_event, data: Any) => {

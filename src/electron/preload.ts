@@ -175,6 +175,7 @@ import type {
   Annotation,
   AnnotationCreateInput,
   AnnotationListQuery,
+  AnnotationUndoResult,
   AnnotationUpdateInput,
   BrowserAnnotationTargetRef,
   BrowserAnnotationTargetResolveResult,
@@ -2534,6 +2535,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
       success: boolean;
       settings?: BrowserSettingsState;
     }>,
+  resolveWorktreeBaseCommit: (data: { workspaceId: string; branch?: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.WORKTREE_RESOLVE_BASE_COMMIT, data) as Promise<{
+      commit: string;
+    }>,
+  getMergeReview: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.WORKTREE_MERGE_REVIEW, workspaceId) as Promise<MergeReview>,
   getHygieneReport: (data?: { includeAll?: boolean }) =>
     ipcRenderer.invoke(IPC_CHANNELS.LIFECYCLE_HYGIENE_REPORT, data) as Promise<HygieneReport>,
   retireLifecycleItem: (data: { kind: LifecycleKind; id: string }) =>
@@ -2672,6 +2679,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
     }) as Promise<Annotation | null>,
   dismissAnnotation: (id: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.ANNOTATION_DISMISS, { id }) as Promise<Annotation | null>,
+  undoAnnotationChange: (id: string, undoToken: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.ANNOTATION_UNDO, {
+      id,
+      undoToken,
+    }) as Promise<AnnotationUndoResult>,
   onBrowserWorkbenchOpenRequest: (callback: (request: BrowserWorkbenchOpenRequest) => void) => {
     const handler = (_: Any, request: BrowserWorkbenchOpenRequest) => callback(request);
     ipcRenderer.on(IPC_CHANNELS.BROWSER_WORKBENCH_OPEN_REQUEST, handler);
@@ -6244,6 +6256,7 @@ export type BrowserSettings = import("../shared/browser-settings").BrowserSettin
 export type BrowserSettingsState = import("../shared/browser-settings").BrowserSettingsState;
 export type BrowserDataType = import("../shared/browser-settings").BrowserDataType;
 export type HygieneReport = import("../shared/types").HygieneReport;
+export type MergeReview = import("../shared/types").MergeReview;
 export type LifecycleKind = import("../shared/types").LifecycleKind;
 export type LifecycleMetaInput = {
   kind: LifecycleKind;
@@ -6689,6 +6702,13 @@ export interface ElectronAPI {
   saveBrowserSettings: (
     settings: Partial<BrowserSettings>,
   ) => Promise<{ success: boolean; settings?: BrowserSettingsState }>;
+  /** Build Compare: the commit a branch points to now, so every variant starts from it. */
+  resolveWorktreeBaseCommit: (data: {
+    workspaceId: string;
+    branch?: string;
+  }) => Promise<{ commit: string }>;
+  /** Worktree changes waiting to merge, grouped by intent, with combined-state checks. */
+  getMergeReview: (workspaceId: string) => Promise<MergeReview>;
   /** Mission Control > Operations > Hygiene: unused, ownerless and broken generated software. */
   getHygieneReport: (data?: { includeAll?: boolean }) => Promise<HygieneReport>;
   /** Archive or disable the item where its store can, and mark it retired. Nothing is deleted. */
@@ -6808,6 +6828,7 @@ export interface ElectronAPI {
   updateAnnotation: (id: string, patch: AnnotationUpdateInput) => Promise<Annotation | null>;
   resolveAnnotation: (id: string, resolvedByEventId?: string) => Promise<Annotation | null>;
   dismissAnnotation: (id: string) => Promise<Annotation | null>;
+  undoAnnotationChange: (id: string, undoToken: string) => Promise<AnnotationUndoResult>;
   onBrowserWorkbenchOpenRequest: (
     callback: (request: BrowserWorkbenchOpenRequest) => void,
   ) => () => void;

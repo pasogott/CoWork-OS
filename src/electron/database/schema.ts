@@ -20,6 +20,7 @@ import { createLogger } from "../utils/logger";
 import { runMemoryPayloadMigration } from "../memory/memory-payload-migration-sql";
 import { ensureMemoryItemsSchema } from "../memory/memory-items-sql";
 import { ensureMemoryCurationSchema } from "../memory/memory-curation-log-sql";
+import { ensureMemorySourcesSchema } from "../memory/memory-source-sql";
 import { ensureKnowledgeGraphQualitySchema } from "../knowledge-graph/knowledge-graph-maintenance-sql";
 import type { DatabaseClient } from "./async/DatabaseClient";
 import { ensureSecureSettingsSchema } from "./secure-settings-sql";
@@ -3532,6 +3533,14 @@ export class DatabaseManager {
     for (const statement of [
       "ALTER TABLE work_session_artifact_revisions ADD COLUMN idempotency_key TEXT",
       "ALTER TABLE work_session_wait_states ADD COLUMN idempotency_key TEXT",
+      // Point at the result: an annotation's intent, values, and the revisions it links.
+      "ALTER TABLE annotations ADD COLUMN intent TEXT",
+      "ALTER TABLE annotations ADD COLUMN before_json TEXT",
+      "ALTER TABLE annotations ADD COLUMN after_json TEXT",
+      "ALTER TABLE annotations ADD COLUMN output_path TEXT",
+      "ALTER TABLE annotations ADD COLUMN artifact_revision_id TEXT",
+      "ALTER TABLE annotations ADD COLUMN result_revision_id TEXT",
+      "ALTER TABLE annotations ADD COLUMN undo_token TEXT",
     ]) {
       try {
         this.db.exec(statement);
@@ -3672,6 +3681,25 @@ export class DatabaseManager {
 
         CREATE INDEX IF NOT EXISTS idx_lifecycle_meta_retired
           ON lifecycle_meta(kind, retired_at);
+
+        -- Shared-change coordination: which task is changing which file (WP11).
+        CREATE TABLE IF NOT EXISTS resource_claims (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          workspace_id TEXT NOT NULL,
+          resource_key TEXT NOT NULL,
+          resource_label TEXT NOT NULL,
+          intent TEXT,
+          isolated INTEGER NOT NULL DEFAULT 0,
+          family_root TEXT NOT NULL,
+          claimed_at INTEGER NOT NULL,
+          UNIQUE (task_id, resource_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_resource_claims_resource
+          ON resource_claims(workspace_id, resource_key);
+        CREATE INDEX IF NOT EXISTS idx_resource_claims_claimed_at
+          ON resource_claims(claimed_at);
 
         CREATE TABLE IF NOT EXISTS work_session_rollout_config (
           id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -8301,6 +8329,12 @@ export class DatabaseManager {
       ensureMemoryCurationSchema(this.db);
     } catch (error) {
       schemaLogger.warn("[DatabaseManager] memory curation schema initialization failed:", error);
+    }
+    // WP15: where a memory came from, so a changed source flags it for a recheck.
+    try {
+      ensureMemorySourcesSchema(this.db);
+    } catch (error) {
+      schemaLogger.warn("[DatabaseManager] memory sources schema initialization failed:", error);
     }
   }
 
