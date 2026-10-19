@@ -1,4 +1,5 @@
 import "./utils/node-tls-bootstrap";
+import { createRequire } from "node:module";
 import {
   configureBrowserCredentialService,
   getBrowserCredentialService,
@@ -243,10 +244,8 @@ import { sanitizeTaskMessageParams } from "./control-plane/sanitize";
 import {
   getArgValue,
   getControlPlaneAllowedOriginsFromEnv,
-  getControlPlaneBindContextFromEnv,
   getEnvSettingsImportModeFromArgsOrEnv,
   isHeadlessMode,
-  shouldAllowInsecureControlPlanePublicBindFromEnv,
   shouldEnableControlPlaneFromArgsOrEnv,
   shouldImportEnvSettingsFromArgsOrEnv,
   shouldPrintControlPlaneTokenFromArgsOrEnv,
@@ -272,6 +271,7 @@ import {
   createBrowserHistoryRecorder,
   registerBrowserPlatformIpc,
 } from "./browser/browser-platform-ipc";
+import { registerLifecycleIpc } from "./lifecycle/lifecycle-ipc";
 import {
   registerBrowserCredentialsIpc,
   shredFileOnDisk,
@@ -1691,9 +1691,10 @@ async function runCliDirectMode(): Promise<void> {
         `CoWork CLI runtime is missing at ${directRunPath}. Run npm run build:cli or reinstall CoWork OS.`,
       );
     }
-    // oxlint-disable-next-line typescript-eslint(no-require-imports)
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const directRun = require(directRunPath) as { main: (argv: string[]) => Promise<number> };
+
+    const directRun = createRequire(__filename)(directRunPath) as {
+      main: (argv: string[]) => Promise<number>;
+    };
     const code = await directRun.main(getCliDirectRunArgv());
     app.quit();
     process.exit(code);
@@ -2161,7 +2162,7 @@ if (isMacSafeStorageMigrationWorker) {
         });
       };
 
-      const resolvedUserDataDir = startupUserDataDir || applyStableUserDataPath();
+      void (startupUserDataDir || applyStableUserDataPath());
       const activeProfileId = getActiveProfileId();
       if (hasNonDefaultProfile()) {
         logger.info(`Active profile: ${activeProfileId}`);
@@ -2950,8 +2951,8 @@ if (isMacSafeStorageMigrationWorker) {
               }
             }
 
-            // Custom overlay notification is shown automatically via
-            // notificationService.add() -> onEvent -> NotificationOverlayManager
+            // The system notification is shown automatically via
+            // notificationService.add() -> onEvent -> showDesktopNotification
           }
         };
 
@@ -4720,8 +4721,7 @@ if (isMacSafeStorageMigrationWorker) {
             }
           },
           getRendererPath: () => {
-            // oxlint-disable-next-line typescript-eslint(no-require-imports)
-            const { app } = require("electron");
+            const { app } = createRequire(__filename)("electron");
             return path.join(app.getAppPath(), "dist", "renderer");
           },
           log: (...args: unknown[]) => console.log("[WebAccess]", ...args),
@@ -5401,6 +5401,28 @@ if (isMacSafeStorageMigrationWorker) {
       service: getBrowserWorkbenchService(),
       downloads: getBrowserDownloadManager(),
       sessionFromPartition: (partition) => session.fromPartition(partition),
+      confirmAgentKeyRotation: async () => {
+        const options: Electron.MessageBoxOptions = {
+          type: "warning",
+          buttons: ["Create new key", "Cancel"],
+          defaultId: 1,
+          cancelId: 1,
+          message: "Create a new agent identity key?",
+          detail:
+            "Sites verify CoWork's signatures with the key in your published directory. Publish the new directory before sites see the new key; the old key stays listed for 7 days.",
+        };
+        const result =
+          mainWindow && !mainWindow.isDestroyed()
+            ? await dialog.showMessageBox(mainWindow, options)
+            : await dialog.showMessageBox(options);
+        return result.response === 0;
+      },
+    });
+    registerLifecycleIpc({
+      ipcMain,
+      getDatabase: () => dbManager.getDatabase(),
+      getCronService: () => cronService,
+      getTriggerService: () => eventTriggerService,
     });
     const isVaultOwner = (event: Any) =>
       Boolean(

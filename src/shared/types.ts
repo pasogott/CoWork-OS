@@ -51,8 +51,6 @@ export interface AppearanceSettings {
 }
 
 // Tray (Menu Bar) Settings
-export type DesktopNotificationStyle = "system" | "near-dock";
-
 export interface TraySettings {
   enabled: boolean;
   showDockIcon: boolean;
@@ -60,7 +58,6 @@ export interface TraySettings {
   closeToTray: boolean;
   showNotifications: boolean;
   showApprovalSavedNotifications: boolean;
-  notificationStyle?: DesktopNotificationStyle;
 }
 
 /** One team memory repo: a local folder (a memory repo), optionally for some workspaces only. */
@@ -1328,11 +1325,135 @@ export type ToolResultEnvelopeStatus =
   | "cancelled"
   | "discarded";
 
+/** Whether a tool call can change something outside the conversation. */
+export type ToolAttemptEffect = "read" | "write" | "unknown";
+
+/**
+ * How a durable tool attempt ended. `unknown`: dispatched, then a timeout, lost transport or
+ * stop left its effect unknown. `checked`: an unknown attempt whose target was read back.
+ */
+export type ToolAttemptStatus =
+  | "started"
+  | "completed"
+  | "failed"
+  | "unknown"
+  | "cancelled"
+  | "checked";
+
+/** One dispatched call of a tool that writes or whose effect is unknown. */
+export interface ToolAttempt {
+  id: string;
+  taskId: string;
+  stepId?: string;
+  toolName: string;
+  argsHash: string;
+  /** Stable across retries and restarts: derived from task, step, tool and canonical args. */
+  idempotencyKey: string;
+  effect: Exclude<ToolAttemptEffect, "read">;
+  /** File, path or URL the call acts on, when its input names one. */
+  target?: string;
+  status: ToolAttemptStatus;
+  reason?: string;
+  startedAt: number;
+  finishedAt?: number;
+}
+
+/**
+ * Generated software whose use, ownership and dependencies are tracked (agent-first roadmap WP9):
+ * user and agent skills, playbook entries, scheduled automations, event triggers and curated rules.
+ */
+export type LifecycleKind = "skill" | "playbook" | "automation" | "trigger" | "rule";
+
+/** Something an item depends on: another tracked item, or the workspace it runs in. */
+export interface LifecycleRef {
+  kind: LifecycleKind | "workspace";
+  id: string;
+}
+
+/** The `lifecycle_meta` row of one item. Usage the item's own store already keeps is not copied. */
+export interface LifecycleMeta {
+  kind: LifecycleKind;
+  id: string;
+  owner?: string;
+  createdByTask?: string;
+  lastUsedAt?: number;
+  useCount: number;
+  dependsOn: LifecycleRef[];
+  /** Rules: the decision the rule protects (a constraint ledger entry id or free text). */
+  protects?: string;
+  /** Rules: the eval case, fixture or task id of the failure the rule prevents. */
+  evidence?: string;
+  retiredAt?: number;
+  /** Set by "Keep": the idle timer counts from here. */
+  keptAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/**
+ * Why an item is listed in Hygiene. `unused_60` / `unused_90`: no use for that many days (an
+ * automation with a next scheduled run never is); `rule_without_evidence`: a rule unused for
+ * 90 days that names no failure it prevents.
+ */
+export type HygieneFlag =
+  | "unused_60"
+  | "unused_90"
+  | "ownerless"
+  | "broken_dependency"
+  | "rule_without_evidence";
+
+export interface HygieneItem {
+  kind: LifecycleKind;
+  id: string;
+  name: string;
+  workspaceId?: string;
+  owner?: string;
+  lastUsedAt?: number;
+  useCount: number;
+  nextRunAt?: number;
+  idleDays?: number;
+  dependsOn: LifecycleRef[];
+  brokenDependencies: LifecycleRef[];
+  protects?: string;
+  evidence?: string;
+  flags: HygieneFlag[];
+}
+
+export interface HygieneReport {
+  generatedAt: number;
+  items: HygieneItem[];
+  /** Items checked, listed or not. */
+  checked: number;
+}
+
+/** A call that was running when a task was stopped (`agent_interrupt_confirmed.inFlight`). */
+export interface InterruptInFlightCall {
+  toolName: string;
+  attemptId: string;
+  idempotencyKey: string;
+  effect: Exclude<ToolAttemptEffect, "read">;
+  outcome: "unknown" | "completed" | "cancelled";
+  target?: string;
+}
+
 export interface ToolResultEvidence {
   type: "file" | "command" | "url" | "artifact" | "runtime_log";
   label: string;
   value: string;
   extra?: Record<string, unknown>;
+}
+
+/**
+ * How much of the asked-for scope a search, list or query result covers. `partial`: some of it
+ * was not checked (a limit, a time budget, a filter, another page), so "nothing found" does not
+ * mean "absent". Absent when the tool does not say.
+ */
+export type ToolCoverageStatus = "complete" | "partial" | "unknown";
+
+export interface ToolCoverage {
+  status: ToolCoverageStatus;
+  reason?: string;
+  window?: { from?: number; to?: number };
 }
 
 export interface ToolResultEnvelope {
@@ -1348,6 +1469,11 @@ export interface ToolResultEnvelope {
   contextMutation?: Record<string, unknown> | null;
   uiHints?: Record<string, unknown>;
   telemetry?: Record<string, unknown>;
+  coverage?: ToolCoverage;
+  /** When the underlying data was last updated, when the tool knows it (not the query time). */
+  dataAsOf?: number;
+  /** When the tool ran the query. */
+  queriedAt?: number;
 }
 
 export interface EvidenceRef {
@@ -1540,6 +1666,8 @@ export type ApprovalType =
   | "run_command"
   | "risk_gate"
   | "computer_use"
+  /** In-app browser site, upload, download, and developer-access requests. */
+  | "browser"
   | "protected_credential";
 
 // ============ Security Tool Groups & Risk Levels ============
@@ -2032,15 +2160,29 @@ export const CONTEXT_TOOL_RESTRICTIONS: Record<
   group: {
     deniedGroups: ["group:memory"],
     // swarm_note writes the owner's memory folder. It is not in group:memory (read-only
-    // helpers keep it), so shared contexts deny it by name.
-    deniedTools: ["read_clipboard", "write_clipboard", "swarm_note"],
+    // helpers keep it), so shared contexts deny it by name. The owner's terminal tabs are
+    // private to them like the clipboard: an answer in a shared chat must not quote them.
+    deniedTools: [
+      "read_clipboard",
+      "write_clipboard",
+      "swarm_note",
+      "list_terminal_tabs",
+      "read_terminal",
+    ],
     requireApprovalFor: ["delete_file"],
   },
   public: {
     deniedGroups: ["group:memory"],
     // swarm_note writes the owner's memory folder. It is not in group:memory (read-only
-    // helpers keep it), so shared contexts deny it by name.
-    deniedTools: ["read_clipboard", "write_clipboard", "swarm_note"],
+    // helpers keep it), so shared contexts deny it by name. The owner's terminal tabs are
+    // private to them like the clipboard: an answer in a shared chat must not quote them.
+    deniedTools: [
+      "read_clipboard",
+      "write_clipboard",
+      "swarm_note",
+      "list_terminal_tabs",
+      "read_terminal",
+    ],
     requireApprovalFor: ["delete_file"],
   },
 };
@@ -3602,7 +3744,10 @@ export type WorkSessionReplayFixtureKind =
   | "approval"
   | "credential"
   | "policy_revocation"
-  | "child_session";
+  | "child_session"
+  | "unknown_outcome"
+  | "stop_in_flight"
+  | "handoff";
 
 export interface WorkSessionReplayFixture {
   id: string;
@@ -3742,6 +3887,11 @@ export type EvidenceManifestSourceType =
   | "task_event"
   | "child_session";
 export type EvidenceManifestEntryStatus = "supporting" | "contradicting" | "neutral" | "stale";
+/**
+ * How the claim was established: `observed` (read or measured directly from the source),
+ * `inferred` (concluded by a model from other material), `unknown` (not recorded).
+ */
+export type EvidenceBasis = "observed" | "inferred" | "unknown";
 
 export interface EvidenceManifestEntry {
   id: string;
@@ -3758,6 +3908,9 @@ export interface EvidenceManifestEntry {
   contradictionGroup?: string;
   itemId?: string;
   artifactRevisionId?: string;
+  basis?: EvidenceBasis;
+  /** When the source data was last updated, separate from `capturedAt` (when it was read). */
+  dataAsOf?: number;
   createdAt: number;
 }
 
@@ -4409,6 +4562,8 @@ export interface TerminalBlockRunRequest {
 export interface TerminalBlockRunResult {
   runId: string;
   tabId: string;
+  /** The tab's working directory when the run finished; the tab is named after its last part. */
+  cwd: string;
   /** Output between the command start and its finish, with terminal escapes kept. */
   output: string;
   /** The output was longer than the capture limit; only its tail is kept. */
@@ -4422,6 +4577,33 @@ export interface TerminalBlockOutputEvent {
   tabId: string;
   output: string;
 }
+
+/**
+ * A background process the agent started (run_command background: true), shown as a
+ * read-only tab in the task's terminal panel. Its id is the process id, which answers
+ * link to as `[title](#terminal/<id>)`.
+ */
+export interface AgentTerminalTab {
+  id: string;
+  taskId: string;
+  title: string;
+  command: string;
+  cwd: string;
+  status: "running" | "exited" | "stopped";
+  exitCode: number | null;
+  startedAt: number;
+}
+
+export interface AgentTerminalTabRequest {
+  taskId: string;
+  tabId: string;
+}
+
+/** Output, status changes and removals of a task's agent terminal tabs. */
+export type AgentTerminalEvent =
+  | { kind: "output"; taskId: string; tabId: string; output: string }
+  | { kind: "status"; taskId: string; tab: AgentTerminalTab }
+  | { kind: "removed"; taskId: string; tabId: string };
 
 export type GithubReviewThreadState = "open" | "resolved" | "outdated" | "unknown";
 
@@ -6602,6 +6784,29 @@ export interface ManagedSessionCreateInput {
   };
 }
 
+/** Result of exporting a session handoff package (`cowork.session-handoff`). */
+export interface SessionHandoffExportResult {
+  packageId: string;
+  packageDir: string;
+  manifestPath: string;
+  /** Files copied into the package after their checksum still matched the session record. */
+  artifactsCopied: number;
+  warnings: string[];
+}
+
+/** Result of importing a session handoff package into a new managed session. */
+export interface SessionHandoffImportResult {
+  /** Absent for a dry run, which writes nothing and creates no session. */
+  session?: ManagedSession;
+  packageId: string;
+  /** Files restored (or, for a dry run, that would be restored). */
+  restoredPaths: string[];
+  skipped: string[];
+  /** The checksum guards against damage; who exported the package is not verified. */
+  originVerified: false;
+  dryRun?: boolean;
+}
+
 export interface ManagedSessionUserMessageRequest {
   sessionId: string;
   content: ManagedSessionInputContent[];
@@ -6653,7 +6858,9 @@ export type ManagedSessionEventType =
   | "input.requested"
   | "input.received"
   | "session.completed"
-  | "session.failed";
+  | "session.failed"
+  | "handoff.exported"
+  | "handoff.imported";
 
 export interface ManagedSessionEvent {
   id: string;
@@ -7991,6 +8198,11 @@ export const IPC_CHANNELS = {
   TERMINAL_BLOCK_RUN: "terminalBlock:run",
   TERMINAL_BLOCK_STOP: "terminalBlock:stop",
   TERMINAL_BLOCK_OUTPUT: "terminalBlock:output",
+  AGENT_TERMINAL_LIST: "agentTerminal:list",
+  AGENT_TERMINAL_READ: "agentTerminal:read",
+  AGENT_TERMINAL_STOP: "agentTerminal:stop",
+  AGENT_TERMINAL_CLOSE: "agentTerminal:close",
+  AGENT_TERMINAL_EVENT: "agentTerminal:event",
   SPREADSHEET_OPEN_WORKBOOK: "spreadsheet:openWorkbook",
   SPREADSHEET_GET_VIEWPORT: "spreadsheet:getViewport",
   SPREADSHEET_APPLY_PATCHES: "spreadsheet:applyPatches",
@@ -8053,6 +8265,8 @@ export const IPC_CHANNELS = {
   BROWSER_WORKBENCH_CLEAR_DATA: "browserWorkbench:clearData",
   BROWSER_SETTINGS_GET: "browserSettings:get",
   BROWSER_SETTINGS_SAVE: "browserSettings:save",
+  AGENT_IDENTITY_DIRECTORY_GET: "agentIdentity:directoryGet",
+  AGENT_IDENTITY_KEY_ROTATE: "agentIdentity:keyRotate",
   BROWSER_SITE_PERMISSIONS_LIST: "browserSettings:sitePermissionsList",
   BROWSER_SITE_PERMISSIONS_RESET: "browserSettings:sitePermissionsReset",
   BROWSER_SITE_PERMISSIONS_SET: "browserSettings:sitePermissionsSet",
@@ -8222,6 +8436,11 @@ export const IPC_CHANNELS = {
   MC_COMPANY_LIST: "missionControl:companyList",
   MC_COMPANY_GET: "missionControl:companyGet",
   MC_COMMAND_CENTER_SUMMARY: "missionControl:commandCenterSummary",
+  // Lifecycle hygiene (WP9): list candidates, retire, keep, and edit owner/dependencies/evidence
+  LIFECYCLE_HYGIENE_REPORT: "lifecycle:hygieneReport",
+  LIFECYCLE_RETIRE: "lifecycle:retire",
+  LIFECYCLE_KEEP: "lifecycle:keep",
+  LIFECYCLE_SET_META: "lifecycle:setMeta",
   MC_GOAL_LIST: "missionControl:goalList",
   MC_GOAL_GET: "missionControl:goalGet",
   MC_GOAL_CREATE: "missionControl:goalCreate",
@@ -8867,6 +9086,7 @@ export const IPC_CHANNELS = {
   MANAGED_SESSION_EVENTS_LIST_IPC: "managedSession:eventsListIpc",
   MANAGED_SESSION_WORKPAPER_GET_IPC: "managedSession:workpaperGetIpc",
   MANAGED_SESSION_GENERATE_AUDIO_SUMMARY: "managedSession:generateAudioSummary",
+  SESSION_HANDOFF_EXPORT_IPC: "sessionHandoff:exportIpc",
   WORK_CONTEXT_LIST_IPC: "workContext:listIpc",
   WORK_CONTEXT_GET_IPC: "workContext:getIpc",
   WORK_CONTEXT_CREATE_IPC: "workContext:createIpc",

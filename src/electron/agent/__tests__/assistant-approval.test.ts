@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ASSISTANT_APPROVAL_QUESTION_ID,
+  buildAssistantApprovalMessage,
   buildAssistantApprovalRequest,
   isAssistantApprovalInputRequest,
   isHighImpactApprovalDecision,
@@ -143,6 +144,28 @@ describe("assistant mediated approvals", () => {
   });
 });
 
+it("points the transcript at the card instead of repeating its explanation", () => {
+  const description =
+    "Approve this shell command and its potential network access for this invocation.";
+  const details = {
+    command: "python3 check_totals.py vendor-totals.xlsx",
+    permissionPrompt: { scopePreview: 'commands starting with "python3 check_totals.py"' },
+  };
+  const message = buildAssistantApprovalMessage("run_command", description, details);
+  const card = buildAssistantApprovalRequest("run_command", description, details).questions[0];
+  expect(card.question).toContain(description);
+  expect(message).not.toContain(description);
+  expect(message).not.toContain("Scope:");
+  expect(message).toBe(
+    "I need your decision before I can continue. Choose **Deny** or **Allow once** below.",
+  );
+  expect(
+    buildAssistantApprovalMessage("external_service", 'Use "Calculator"?', {
+      taskConsentScope: "reading and clicking in Calculator",
+    }),
+  ).toContain("Choose **Deny** or **Allow for this task** below.");
+});
+
 it("makes the duration and app scope explicit while keeping Deny first", () => {
   const request = buildAssistantApprovalRequest("external_service", 'Use "Calculator"?', {
     taskConsentScope: "reading, clicking, typing, and dragging in Calculator",
@@ -162,6 +185,24 @@ it("labels native background app permission with the actual task duration", () =
     taskConsentScope: "background observation, clicking and typing in com.apple.calculator",
   });
   expect(request.questions[0].question).toContain("com.apple.calculator");
+  expect(request.questions[0].question).toContain("until this task ends");
+  expect(request.questions[0].options.map((option) => option.label)).toEqual([
+    "Deny",
+    "Allow for this task",
+  ]);
+});
+
+it("offers a task-scoped consent for reading one terminal tab", () => {
+  const request = buildAssistantApprovalRequest(
+    "data_export",
+    'Let the agent read the recent output of your terminal tab "cowork" (/Users/almarion/cowork)?',
+    {
+      taskConsentScope:
+        'reading the recent output of your terminal tab "cowork" (/Users/almarion/cowork)',
+      taskConsentLabel: "Allow for this task",
+    },
+  );
+  expect(request.questions[0].question).toContain('terminal tab "cowork"');
   expect(request.questions[0].question).toContain("until this task ends");
   expect(request.questions[0].options.map((option) => option.label)).toEqual([
     "Deny",

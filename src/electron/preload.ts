@@ -224,6 +224,7 @@ import type {
   ManagedEnvironment,
   ManagedSession,
   ManagedSessionCreateInput,
+  SessionHandoffExportResult,
   ManagedSessionEvent,
   ManagedSessionRequirementCorrectionRequest,
   ManagedSessionUserMessageRequest,
@@ -284,6 +285,9 @@ import type {
   TerminalBlockRunRequest,
   TerminalBlockRunResult,
   TerminalBlockOutputEvent,
+  AgentTerminalTab,
+  AgentTerminalTabRequest,
+  AgentTerminalEvent,
   MessageSurfaceOrigin,
   LLMRoutingRuntimeState,
   AgentMailApiKeySummary,
@@ -2308,6 +2312,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on(IPC_CHANNELS.TERMINAL_BLOCK_OUTPUT, handler);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.TERMINAL_BLOCK_OUTPUT, handler);
   },
+  listAgentTerminalTabs: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TERMINAL_LIST, { taskId }) as Promise<AgentTerminalTab[]>,
+  readAgentTerminalTab: (data: AgentTerminalTabRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TERMINAL_READ, data) as Promise<{
+      output: string;
+      truncated: boolean;
+    }>,
+  stopAgentTerminalTab: (data: AgentTerminalTabRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TERMINAL_STOP, data) as Promise<AgentTerminalTab>,
+  closeAgentTerminalTab: (data: AgentTerminalTabRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENT_TERMINAL_CLOSE, data) as Promise<{ success: boolean }>,
+  onAgentTerminalEvent: (callback: (event: AgentTerminalEvent) => void) => {
+    const handler = (_: Any, event: AgentTerminalEvent) => callback(event);
+    ipcRenderer.on(IPC_CHANNELS.AGENT_TERMINAL_EVENT, handler);
+    return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_TERMINAL_EVENT, handler);
+  },
   listLocalPreviewTemplates: () =>
     ipcRenderer.invoke(IPC_CHANNELS.LOCAL_PREVIEW_TEMPLATES) as Promise<
       LocalPreviewCommandTemplate[]
@@ -2514,6 +2534,28 @@ contextBridge.exposeInMainWorld("electronAPI", {
       success: boolean;
       settings?: BrowserSettingsState;
     }>,
+  getHygieneReport: (data?: { includeAll?: boolean }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.LIFECYCLE_HYGIENE_REPORT, data) as Promise<HygieneReport>,
+  retireLifecycleItem: (data: { kind: LifecycleKind; id: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.LIFECYCLE_RETIRE, data) as Promise<{
+      success: boolean;
+      error?: string;
+    }>,
+  keepLifecycleItem: (data: { kind: LifecycleKind; id: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.LIFECYCLE_KEEP, data) as Promise<{ success: boolean }>,
+  setLifecycleMeta: (data: LifecycleMetaInput) =>
+    ipcRenderer.invoke(IPC_CHANNELS.LIFECYCLE_SET_META, data) as Promise<{
+      success: boolean;
+      error?: string;
+    }>,
+  getAgentIdentityDirectory: () =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.AGENT_IDENTITY_DIRECTORY_GET,
+    ) as Promise<AgentIdentityDirectoryResult>,
+  rotateAgentIdentityKey: () =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.AGENT_IDENTITY_KEY_ROTATE,
+    ) as Promise<AgentIdentityDirectoryResult>,
   listBrowserSitePermissions: (data: { workspaceId: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.BROWSER_SITE_PERMISSIONS_LIST, data) as Promise<
       BrowserSitePermissionEntry[]
@@ -3717,6 +3759,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.MANAGED_SESSION_CANCEL_IPC, sessionId) as Promise<
       ManagedSession | undefined
     >,
+  exportSessionHandoff: (request: { sessionId?: string; taskId?: string }) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.SESSION_HANDOFF_EXPORT_IPC,
+      request,
+    ) as Promise<SessionHandoffExportResult>,
   listWorkContexts: (params?: {
     workspaceId?: string;
     includeArchived?: boolean;
@@ -6196,6 +6243,18 @@ export interface BrowserWorkbenchUserNavigateResult {
 export type BrowserSettings = import("../shared/browser-settings").BrowserSettings;
 export type BrowserSettingsState = import("../shared/browser-settings").BrowserSettingsState;
 export type BrowserDataType = import("../shared/browser-settings").BrowserDataType;
+export type HygieneReport = import("../shared/types").HygieneReport;
+export type LifecycleKind = import("../shared/types").LifecycleKind;
+export type LifecycleMetaInput = {
+  kind: LifecycleKind;
+  id: string;
+  owner?: string | null;
+  protects?: string | null;
+  evidence?: string | null;
+  dependsOn?: import("../shared/types").LifecycleRef[];
+};
+export type AgentIdentityDirectoryResult =
+  import("../shared/browser-settings").AgentIdentityDirectoryResult;
 export type BrowserSitePermissionEntry =
   import("../shared/browser-settings").BrowserSitePermissionEntry;
 
@@ -6456,6 +6515,15 @@ export type {
 };
 
 export interface ElectronAPI {
+  listHubFiles: (
+    options: import("./file-hub/types").FileHubListOptions,
+  ) => Promise<import("./file-hub/types").UnifiedFile[]>;
+  searchHubFiles: (
+    query: string,
+    sources?: import("./file-hub/types").FileHubSource[],
+  ) => Promise<import("./file-hub/types").FileHubSearchResult[]>;
+  getRecentHubFiles: (limit?: number) => Promise<import("./file-hub/types").UnifiedFile[]>;
+  getHubSources: () => Promise<import("./file-hub/types").FileHubSource[]>;
   selectFolder: (defaultPath?: string) => Promise<string | null>;
   selectFiles: (defaultPath?: string) => Promise<
     Array<{
@@ -6621,6 +6689,23 @@ export interface ElectronAPI {
   saveBrowserSettings: (
     settings: Partial<BrowserSettings>,
   ) => Promise<{ success: boolean; settings?: BrowserSettingsState }>;
+  /** Mission Control > Operations > Hygiene: unused, ownerless and broken generated software. */
+  getHygieneReport: (data?: { includeAll?: boolean }) => Promise<HygieneReport>;
+  /** Archive or disable the item where its store can, and mark it retired. Nothing is deleted. */
+  retireLifecycleItem: (data: {
+    kind: LifecycleKind;
+    id: string;
+  }) => Promise<{ success: boolean; error?: string }>;
+  /** Keep the item: its idle timer restarts. */
+  keepLifecycleItem: (data: { kind: LifecycleKind; id: string }) => Promise<{ success: boolean }>;
+  setLifecycleMeta: (data: LifecycleMetaInput) => Promise<{ success: boolean; error?: string }>;
+  /** The public key directory (JWK Set) to host for declared agent identity. */
+  getAgentIdentityDirectory: () => Promise<AgentIdentityDirectoryResult>;
+  /**
+   * Replace the declared-identity key after a native confirmation; null when the user cancels.
+   * The hosted directory must then be updated.
+   */
+  rotateAgentIdentityKey: () => Promise<AgentIdentityDirectoryResult>;
   listBrowserSitePermissions: (data: {
     workspaceId: string;
   }) => Promise<BrowserSitePermissionEntry[]>;
@@ -7293,6 +7378,14 @@ export interface ElectronAPI {
   runTerminalBlock: (data: TerminalBlockRunRequest) => Promise<TerminalBlockRunResult>;
   stopTerminalBlock: (data: { runId: string }) => Promise<{ stopped: boolean }>;
   onTerminalBlockOutput: (callback: (event: TerminalBlockOutputEvent) => void) => () => void;
+  /** The agent's background processes of a task, as read-only terminal panel tabs. */
+  listAgentTerminalTabs: (taskId: string) => Promise<AgentTerminalTab[]>;
+  readAgentTerminalTab: (
+    data: AgentTerminalTabRequest,
+  ) => Promise<{ output: string; truncated: boolean }>;
+  stopAgentTerminalTab: (data: AgentTerminalTabRequest) => Promise<AgentTerminalTab>;
+  closeAgentTerminalTab: (data: AgentTerminalTabRequest) => Promise<{ success: boolean }>;
+  onAgentTerminalEvent: (callback: (event: AgentTerminalEvent) => void) => () => void;
   createWorkspace: (data: Any) => Promise<Workspace>;
   listWorkspaces: () => Promise<Workspace[]>;
   selectWorkspace: (id: string) => Promise<Workspace>;
@@ -7464,6 +7557,11 @@ export interface ElectronAPI {
     sessionId: string,
   ) => Promise<{ resumed: boolean; session?: ManagedSession }>;
   cancelManagedSession: (sessionId: string) => Promise<ManagedSession | undefined>;
+  /** Write a handoff package for a managed session or a task under its workspace. */
+  exportSessionHandoff: (request: {
+    sessionId?: string;
+    taskId?: string;
+  }) => Promise<SessionHandoffExportResult>;
   listWorkContexts: (params?: {
     workspaceId?: string;
     includeArchived?: boolean;

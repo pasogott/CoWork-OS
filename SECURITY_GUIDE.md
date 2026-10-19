@@ -201,6 +201,13 @@ where your data is stored and what leaves your machine.
 
 ---
 
+## How CoWork Identifies Itself to Websites
+
+Off by default. Settings > Browser > Agent identity makes CoWork send an honest `CoWork-OS`
+user agent on the requests it makes for you, and sign them (Web Bot Auth, RFC 9421) with a key
+whose public half you publish. The private key stays in the encrypted settings store. See
+[Security Guide](docs/security-guide.md#how-cowork-identifies-itself-to-websites).
+
 ## Data Storage
 
 ### Encrypted Settings Storage (SecureSettingsRepository)
@@ -599,8 +606,8 @@ SkillHub includes multiple security measures to prevent attacks via malicious sk
 ### Running Security Tests
 
 ```bash
-npm run test                # Full suite (~4,583 passing tests; includes security)
-npx vitest run tests/security   # Security-focused tests only (135 tests)
+npm run test                # Full suite (17,018 tests: 16,998 passed, 18 skipped, 2 todo; includes security)
+npx vitest run tests/security   # Security-focused tests only (160 tests)
 npm run test:coverage       # With coverage report
 ```
 

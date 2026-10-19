@@ -180,6 +180,7 @@ import { NativeAppTools, NATIVE_APP_TOOL } from "./native-app-tools";
 import { AndroidPhoneTools, ANDROID_PHONE_TOOLS } from "./android-phone-tools";
 import { BatchImageTools } from "./batch-image-tools";
 import { ScratchpadTools } from "./scratchpad-tools";
+import { TERMINAL_TAB_TOOL_NAMES, TerminalTabTools } from "./terminal-tab-tools";
 import { ComputerHandoffTools } from "./computer-handoff-tools";
 import { BotDesktopTools } from "./bot-desktop-tools";
 import { QATools } from "./qa-tools";
@@ -196,7 +197,6 @@ import { isThirdPartyGatewayTask } from "../../gateway/gateway-sender-identity";
 import { rememberPreferredNameInFolder } from "../../memory/repo/memory-repo-producers";
 import { createLogger } from "../../utils/logger";
 import { CitationTracker } from "../citation/CitationTracker";
-import { OrchestrationRepository } from "../orchestration-repository-facades";
 import {
   canonicalizeToolName as canonicalizeToolNameUtil,
   getToolSemantics as getToolSemanticsUtil,
@@ -617,6 +617,22 @@ const registryLogger = createLogger("ToolRegistry");
 /** Servers exposing more tools than this load them through tool_search instead of every request. */
 export const MCP_DEFERRED_SERVER_TOOL_THRESHOLD = 25;
 
+/** The executor's tool attempt from the runtime context, when it is well formed. */
+function readToolAttempt(
+  runtime: Record<string, unknown> | undefined,
+): { idempotencyKey: string; attemptId: string } | undefined {
+  const value = runtime?.toolAttempt as
+    | { idempotencyKey?: unknown; attemptId?: unknown }
+    | undefined;
+  return value &&
+    typeof value.idempotencyKey === "string" &&
+    value.idempotencyKey &&
+    typeof value.attemptId === "string" &&
+    value.attemptId
+    ? { idempotencyKey: value.idempotencyKey, attemptId: value.attemptId }
+    : undefined;
+}
+
 export class ToolRegistry {
   private static mermaidValidationInitialized = false;
   private fileTools: FileTools;
@@ -669,6 +685,7 @@ export class ToolRegistry {
   private swarmToolsAvailable = false;
   private documentTools: DocumentTools;
   private scratchpadTools: ScratchpadTools;
+  private terminalTabTools: TerminalTabTools;
   private computerHandoffTools: ComputerHandoffTools;
   private botDesktopTools: BotDesktopTools;
   private qaTools: QATools;
@@ -764,6 +781,7 @@ export class ToolRegistry {
       (tid, filePath, operation) => daemon.consumeExternalFileApproval(tid, filePath, operation),
     );
     this.scratchpadTools = new ScratchpadTools(taskId, workspace);
+    this.terminalTabTools = new TerminalTabTools(workspace, daemon, taskId);
     this.computerHandoffTools = new ComputerHandoffTools(taskId, daemon as Any);
     this.botDesktopTools = new BotDesktopTools(daemon as Any, taskId, () => this.workspace);
     this.qaTools = new QATools(workspace, daemon, taskId);
@@ -1257,6 +1275,7 @@ export class ToolRegistry {
     this.swarmTools.setWorkspace(workspace);
     this.documentTools.setWorkspace(workspace);
     this.scratchpadTools.setWorkspace(workspace);
+    this.terminalTabTools.setWorkspace(workspace);
     // Profile changes cancel remote work before discarding its adapter.
     // The adapter journals and completes its independent cleanup.
     if (codeScopeChanged) {
@@ -1327,6 +1346,7 @@ export class ToolRegistry {
         env: input.env,
         signal,
         startupWaitMs: input.startup_wait_ms,
+        title: input.title,
       });
     }
     return this.shellTools.runCommand(input.command, {
@@ -1393,11 +1413,23 @@ export class ToolRegistry {
   private isDeniedByTaskRestrictions(toolName: string): boolean {
     if (this.denyAllTools || this.deniedTools.has(toolName)) return true;
     if (this.isBlockedByBotWorksOn(toolName)) return true;
+    if (TERMINAL_TAB_TOOL_NAMES.has(toolName) && this.isTerminalTabReadDenied()) return true;
     for (const groupName of this.deniedGroups) {
       const tools = TOOL_GROUPS[groupName] as readonly string[] | undefined;
       if (tools && tools.includes(toolName)) return true;
     }
     return false;
+  }
+
+  /**
+   * The user's own terminal tabs: never read for someone else's channel message, and only
+   * where this task may run commands (a task-level run_command restriction covers them too).
+   */
+  private isTerminalTabReadDenied(): boolean {
+    return (
+      isThirdPartyGatewayTask(this.daemon.getTask?.(this.taskId)) ||
+      this.isDeniedByTaskRestrictions("run_command")
+    );
   }
 
   isToolAllowed(toolName: string): boolean {
@@ -1406,6 +1438,7 @@ export class ToolRegistry {
       isThirdPartyGatewayTask(this.daemon.getTask?.(this.taskId))
     )
       return false;
+    if (TERMINAL_TAB_TOOL_NAMES.has(toolName) && this.isTerminalTabReadDenied()) return false;
     if (this.denyAllTools) {
       return false;
     }
@@ -1533,6 +1566,8 @@ export class ToolRegistry {
     // Only add shell tool if workspace has shell permission
     if (this.workspace.permissions.shell) {
       allTools.push(...this.getShellToolDefinitions());
+      // The user's own terminal tabs: read-only, offered with the shell tools (isToolAllowedQuick).
+      allTools.push(...TerminalTabTools.getToolDefinitions());
       // Git tools: available in git repos with shell permission
       allTools.push(...GitTools.getToolDefinitions());
     }
@@ -2159,6 +2194,8 @@ export class ToolRegistry {
     if (canonicalToolName === "analyze_image" || canonicalToolName === "read_pdf_visual") {
       return "data_export";
     }
+    // The user's own terminal output goes to the model; TerminalTabTools asks once per tab.
+    if (canonicalToolName === "read_terminal") return "data_export";
     if (canonicalToolName === "git_commit" || canonicalToolName === "git_merge_to_base") {
       return "risk_gate";
     }
@@ -2727,41 +2764,50 @@ export class ToolRegistry {
             pipeline.approvalSource !== "semantic_review" &&
             pipeline.approvalSource !== "workspace_policy" &&
             !browserUseApproval;
+          // One consent per terminal tab for the task, naming the tab, instead of a prompt per read.
+          const terminalReadConsent =
+            context.request.name === "read_terminal" &&
+            pipeline.approvalSource !== "semantic_review";
           const approved = chatWebConsent
             ? await this.requestChatWebConsent(context.request.name, options.signal)
-            : codexServer
-              ? await this.requestCodexTaskConsent(
-                  `Allow ${codexServer.name} computer-use engine for this task?`,
-                  {
-                    tool: context.request.name,
-                    serverName: codexServer.name,
-                    params: {
-                      serverId: codexServer.id,
-                      configuration: createHash("sha256")
-                        .update(JSON.stringify(codexServer))
-                        .digest("hex"),
-                    },
-                    taskConsentScope:
-                      "calls to this computer-use engine; each app requires separate consent",
-                  },
+            : terminalReadConsent
+              ? await this.terminalTabTools.requestReadConsent(
+                  context.request.input,
                   options.signal,
                 )
-              : typeof authorizer === "function"
-                ? await authorizer.call(this.daemon, this.taskId, {
-                    toolName: context.request.name,
-                    approvalType: effectiveApprovalType || "external_service",
-                    description,
-                    details,
-                    ...options,
-                  })
-                : await requester.call(
-                    this.daemon,
-                    this.taskId,
-                    effectiveApprovalType || "external_service",
-                    description,
-                    details,
-                    options,
-                  );
+              : codexServer
+                ? await this.requestCodexTaskConsent(
+                    `Allow ${codexServer.name} computer-use engine for this task?`,
+                    {
+                      tool: context.request.name,
+                      serverName: codexServer.name,
+                      params: {
+                        serverId: codexServer.id,
+                        configuration: createHash("sha256")
+                          .update(JSON.stringify(codexServer))
+                          .digest("hex"),
+                      },
+                      taskConsentScope:
+                        "calls to this computer-use engine; each app requires separate consent",
+                    },
+                    options.signal,
+                  )
+                : typeof authorizer === "function"
+                  ? await authorizer.call(this.daemon, this.taskId, {
+                      toolName: context.request.name,
+                      approvalType: effectiveApprovalType || "external_service",
+                      description,
+                      details,
+                      ...options,
+                    })
+                  : await requester.call(
+                      this.daemon,
+                      this.taskId,
+                      effectiveApprovalType || "external_service",
+                      description,
+                      details,
+                      options,
+                    );
           if (approved !== true) {
             throw Object.assign(new Error(`Tool "${context.request.name}" approval denied`), {
               policyTrace: pipeline.trace,
@@ -3191,6 +3237,20 @@ export class ToolRegistry {
       "stop_process",
       async ({ request }) => this.shellTools.stopBackgroundProcess(request.input),
       exclusiveSchedulerSpec,
+    );
+    register(
+      "list_terminal_tabs",
+      async () => this.terminalTabTools.listTerminalTabs(),
+      readParallelSchedulerSpec,
+    );
+    register(
+      "read_terminal",
+      async ({ request }) =>
+        this.terminalTabTools.readTerminal(
+          request.input,
+          request.runtime?.signal instanceof AbortSignal ? request.runtime.signal : undefined,
+        ),
+      readParallelSchedulerSpec,
     );
     register("git_status", async () => this.gitTools.gitStatus());
     register("git_diff", async ({ request }) => this.gitTools.gitDiff(request.input));
@@ -4723,7 +4783,9 @@ Web Search (for finding URLs, not reading them):
 Shell Commands:
 - run_command: Execute commands within the active access profile. Use background: true for dev servers and watchers.
 - process_output: Read output and status of a background process
-- stop_process: Stop a background process and everything it started`;
+- stop_process: Stop a background process and everything it started
+- list_terminal_tabs: List the user's own terminal tabs (link one as [label](#terminal/<id>))
+- read_terminal: Read recent output of one of the user's terminal tabs, secrets redacted`;
     }
 
     descriptions += `
@@ -5331,6 +5393,12 @@ ${skillDescriptions}`;
         _runtime?.signal instanceof AbortSignal ? _runtime.signal : undefined,
       );
     if (name === "stop_process") return await this.shellTools.stopBackgroundProcess(input);
+    if (name === "list_terminal_tabs") return this.terminalTabTools.listTerminalTabs();
+    if (name === "read_terminal")
+      return await this.terminalTabTools.readTerminal(
+        input,
+        _runtime?.signal instanceof AbortSignal ? _runtime.signal : undefined,
+      );
 
     // Git tools
     if (name === "git_status") return await this.gitTools.gitStatus();
@@ -5835,7 +5903,7 @@ ${skillDescriptions}`;
     }
 
     // MCP tools (prefixed with mcp_ by default)
-    const mcpToolResult = await this.tryExecuteMCPTool(name, input);
+    const mcpToolResult = await this.tryExecuteMCPTool(name, input, _runtime);
     if (mcpToolResult !== null) {
       return mcpToolResult;
     }
@@ -5998,9 +6066,14 @@ ${skillDescriptions}`;
 
     try {
       const signal = runtime?.signal instanceof AbortSignal ? runtime.signal : undefined;
+      const toolAttempt = readToolAttempt(runtime);
       const result = await mcpManager.callTool(mcpToolName, input, {
         signal,
         beforeSend,
+        // The same call retried carries the same key, so the server can avoid acting twice.
+        ...(toolAttempt
+          ? { idempotencyKey: toolAttempt.idempotencyKey, attemptId: toolAttempt.attemptId }
+          : {}),
         onElicitation: async (request) => {
           const server = request.computerUseApp ? this.getCodexConsentServer(name) : null;
           if (server && request.computerUseApp) {
@@ -6072,6 +6145,19 @@ ${skillDescriptions}`;
           return approved === true ? { action: "accept", content: {} } : { action: "decline" };
         },
       });
+      // A write the server could not confirm (an error result with `status: "unknown"`, the
+      // connector contract in docs/enterprise-connectors.md) is an unknown outcome: recorded as
+      // such and checked before any retry. Read calls carry no attempt, so their data is untouched.
+      const structured = result?.structuredContent as
+        | { status?: unknown; message?: unknown }
+        | undefined;
+      if (toolAttempt && result?.isError === true && structured?.status === "unknown") {
+        const detail =
+          typeof structured.message === "string"
+            ? structured.message.slice(0, 300)
+            : "the server could not confirm the write";
+        throw new Error(`Outcome unknown: ${detail}`);
+      }
       // Format MCP result and process any generated files
       return await this.formatMCPResult(result, mcpToolName, input);
     } catch (error: Any) {
@@ -9935,6 +10021,11 @@ ${skillDescriptions}`;
               type: "number",
               description:
                 "With background: true, how long to wait for a ready line (for example 'Local: http://localhost:5173') or an early exit before returning (default 5000, max 30000).",
+            },
+            title: {
+              type: "string",
+              description:
+                "With background: true, a short name (2-4 words, e.g. 'dev server', 'https tunnel') for the terminal tab where the user can watch the process. Link it in your reply as [title](#terminal/<process_id>).",
             },
           },
           required: ["command"],
@@ -14925,7 +15016,7 @@ ${skillDescriptions}`;
     await agentRoleRepo.updateHeartbeatConfig(role.id, config);
 
     // Notify the HeartbeatService singleton to cancel or reschedule
-    // oxlint-disable-next-line typescript-eslint(no-require-imports)
+    // oxlint-disable-next-line typescript/no-require-imports
     const { getHeartbeatService } = require("../../agents/HeartbeatService");
     const heartbeatService = getHeartbeatService();
     if (heartbeatService) {

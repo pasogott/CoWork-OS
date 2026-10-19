@@ -22,6 +22,7 @@ import {
   FileSpreadsheet,
   FileText,
   Folder,
+  Terminal as TerminalIcon,
 } from "lucide-react";
 
 import { getEmojiIcon } from "../utils/emoji-icon-map";
@@ -32,10 +33,13 @@ import { useFileActionMenu } from "./FileActionMenu";
 import { LazyHighlightedCodeBlock } from "./lazy-renderers";
 import { RunnableCodeBlock } from "./RunnableCodeBlock";
 import {
+  OPEN_TERMINAL_TAB_EVENT,
   canRunCodeBlocks,
   isRunnableShellLanguage,
   useCodeBlockRunScope,
+  type OpenTerminalTabRequest,
 } from "../utils/code-block-runs";
+import { parseTerminalTabHref, terminalTabHref } from "../../shared/terminal-tab-links";
 
 type CodeBlockProps = HTMLAttributes<HTMLElement> & {
   children?: ReactNode;
@@ -80,6 +84,7 @@ type MarkdownImageProps = ImgHTMLAttributes<HTMLImageElement> & {
 
 let mermaidLastTheme: boolean | null = null;
 let mermaidApiPromise: Promise<typeof import("mermaid").default> | null = null;
+type MermaidRenderingApi = Pick<typeof import("mermaid").default, "initialize" | "render">;
 
 function loadMermaid() {
   mermaidApiPromise ??= import("mermaid").then((module) => module.default);
@@ -99,7 +104,7 @@ if (typeof document !== "undefined") {
   });
 }
 
-function initMermaid(mermaid: typeof import("mermaid").default) {
+function initMermaid(mermaid: MermaidRenderingApi) {
   const isDark = !document.documentElement.classList.contains("theme-light");
   if (mermaidLastTheme === isDark) return;
   mermaidLastTheme = isDark;
@@ -107,6 +112,7 @@ function initMermaid(mermaid: typeof import("mermaid").default) {
   mermaid.initialize({
     startOnLoad: false,
     securityLevel: "strict",
+    suppressErrorRendering: true,
     htmlLabels: false,
     theme: "base",
     themeVariables: {
@@ -128,6 +134,21 @@ function initMermaid(mermaid: typeof import("mermaid").default) {
       edgeLabelBackground: isDark ? "#363754" : "#fff4dd",
     },
   });
+}
+
+/** Give Mermaid a measurement container we own, including on rejected renders. */
+export async function renderMermaidChart(mermaid: MermaidRenderingApi, id: string, chart: string) {
+  initMermaid(mermaid);
+  const target = document.createElement("div");
+  target.setAttribute("aria-hidden", "true");
+  target.style.cssText =
+    "position:absolute;top:0;left:0;width:100%;visibility:hidden;pointer-events:none";
+  document.body.appendChild(target);
+  try {
+    return await mermaid.render(id, chart, target);
+  } finally {
+    target.remove();
+  }
 }
 
 function sanitizeMermaidSvg(svgMarkup: string): SVGSVGElement | null {
@@ -189,8 +210,7 @@ export function MermaidDiagram({ chart }: { chart: string }) {
     loadMermaid()
       .then((mermaid) => {
         if (cancelled) return null;
-        initMermaid(mermaid);
-        return mermaid.render(idRef.current, chart);
+        return renderMermaidChart(mermaid, idRef.current, chart);
       })
       .then((result) => {
         if (!cancelled && result?.svg) setSvg(result.svg);
@@ -629,6 +649,32 @@ const CITATION_REF_REGEX = /\[(\d+)\]/g;
 /** Set inside a rendered link so inline `code` in its label is not turned into a second chip. */
 const InsideMarkdownLinkContext = createContext(false);
 
+/** `[title](#terminal/<tab id>)`: a chip that opens that tab of the task's terminal panel. */
+function MarkdownTerminalLink({ tabId, children }: { tabId: string; children?: ReactNode }) {
+  const label = getTextContent(children).trim() || "terminal";
+  return (
+    <a
+      href={terminalTabHref(tabId)}
+      className="terminal-tab-link"
+      title={`Open ${label} in the terminal panel`}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        window.dispatchEvent(
+          new CustomEvent<OpenTerminalTabRequest>(OPEN_TERMINAL_TAB_EVENT, { detail: { tabId } }),
+        );
+      }}
+    >
+      <span className="terminal-tab-link-icon" aria-hidden="true">
+        <TerminalIcon size={13} strokeWidth={2} />
+      </span>
+      <span className="terminal-tab-link-label">
+        <InsideMarkdownLinkContext.Provider value>{children}</InsideMarkdownLinkContext.Provider>
+      </span>
+    </a>
+  );
+}
+
 function MarkdownFileLink({
   href,
   filePath,
@@ -734,6 +780,11 @@ export function buildMarkdownComponents(options: MarkdownComponentsOptions) {
   const MarkdownLink = ({ href, children, node, ...props }: MarkdownAnchorProps) => {
     if (!href) {
       return <a {...props}>{children}</a>;
+    }
+
+    const terminalTabId = parseTerminalTabHref(href);
+    if (terminalTabId) {
+      return <MarkdownTerminalLink tabId={terminalTabId}>{children}</MarkdownTerminalLink>;
     }
 
     const linkText = getTextContent(children);

@@ -9,6 +9,7 @@ import type {
 import type { MissionControlData, OpsSubTab } from "./useMissionControlData";
 import { hasHostMethod, hasHostMethods } from "../../host/browser-capabilities";
 import { botIconText } from "../../../shared/bot-mascots";
+import { OpsHygiene } from "./MCOpsHygiene";
 
 interface MCOpsTabProps {
   data: MissionControlData;
@@ -22,6 +23,7 @@ const OPS_TABS: { id: OpsSubTab; label: string }[] = [
   { id: "execution", label: "Execution Map" },
   { id: "planner", label: "Planner" },
   { id: "automation", label: "Automation" },
+  { id: "hygiene", label: "Hygiene" },
 ];
 
 export function MCOpsTab({ data }: MCOpsTabProps) {
@@ -60,7 +62,8 @@ export function MCOpsTab({ data }: MCOpsTabProps) {
     formatRelativeTime,
   } = data;
 
-  if (!selectedCompany && opsSubTab !== "harness") {
+  // Core Harness and Hygiene cover the whole profile, not one company.
+  if (!selectedCompany && opsSubTab !== "harness" && opsSubTab !== "hygiene") {
     return <div className="mc-v2-empty">Loading operations...</div>;
   }
 
@@ -148,6 +151,7 @@ export function MCOpsTab({ data }: MCOpsTabProps) {
             retryAutomationOutcome={retryAutomationOutcome}
           />
         )}
+        {opsSubTab === "hygiene" && <OpsHygiene formatRelativeTime={formatRelativeTime} />}
       </div>
     </div>
   );
@@ -284,7 +288,7 @@ function OpsHarness({
 }
 
 // ── Ops Overview ──
-function OpsOverview({ summary }: { summary: any }) {
+function OpsOverview({ summary }: { summary: MissionControlData["commandCenterSummary"] }) {
   if (!summary) return <div className="mc-v2-empty">Loading operations data...</div>;
   return (
     <div className="mc-v2-ops-kpis">
@@ -313,10 +317,10 @@ function OpsAutomation({
   setDetailPanel,
   retryAutomationOutcome,
 }: {
-  outcomes: any[];
-  summary: any;
+  outcomes: MissionControlData["automationOutcomes"];
+  summary: MissionControlData["automationOutcomeSummary"];
   formatRelativeTime: (t?: number) => string;
-  setDetailPanel: (panel: any) => void;
+  setDetailPanel: MissionControlData["setDetailPanel"];
   retryAutomationOutcome: MissionControlData["retryAutomationOutcome"];
 }) {
   const [retryingOutcomeId, setRetryingOutcomeId] = useState<string | null>(null);
@@ -371,7 +375,10 @@ function OpsAutomation({
                     <button
                       type="button"
                       className="mc-v2-ops-row-main"
-                      onClick={() => setDetailPanel({ kind: "task", taskId: outcome.taskId })}
+                      onClick={() => {
+                        if (outcome.taskId)
+                          setDetailPanel({ kind: "task", taskId: outcome.taskId });
+                      }}
                     >
                       <div className="mc-v2-ops-row-title">{outcome.title}</div>
                       <div className="mc-v2-ops-row-subtitle">
@@ -428,13 +435,13 @@ function OpsOperators({
   operators,
   formatRelativeTime,
 }: {
-  operators: any[];
+  operators: MissionControlData["commandCenterOperators"];
   formatRelativeTime: (t?: number) => string;
 }) {
   if (operators.length === 0) return <div className="mc-v2-empty">No operator agents yet.</div>;
   return (
     <div className="mc-v2-ops-operators">
-      {operators.map((op: any) => (
+      {operators.map((op) => (
         <div key={op.agentRoleId} className="mc-v2-ops-row">
           <div>
             <div className="mc-v2-ops-row-title">
@@ -471,7 +478,14 @@ function OpsOutputs({
   setDetailPanel,
   formatRelativeTime,
   selectedIssueId,
-}: any) {
+}: {
+  outputs: MissionControlData["commandCenterOutputs"];
+  reviewQueue: MissionControlData["commandCenterReviewQueue"];
+  setSelectedIssueId: MissionControlData["setSelectedIssueId"];
+  setDetailPanel: MissionControlData["setDetailPanel"];
+  formatRelativeTime: MissionControlData["formatRelativeTime"];
+  selectedIssueId: MissionControlData["selectedIssueId"];
+}) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
       <div>
@@ -493,7 +507,7 @@ function OpsOutputs({
               No valuable outputs yet.
             </div>
           ) : (
-            outputs.map((output: any) => (
+            outputs.map((output) => (
               <button
                 key={output.id}
                 type="button"
@@ -550,7 +564,7 @@ function OpsOutputs({
               No human review gates queued.
             </div>
           ) : (
-            reviewQueue.map((item: any) => (
+            reviewQueue.map((item) => (
               <button
                 key={item.id}
                 type="button"
@@ -592,12 +606,17 @@ function OpsExecutionMap({
   setSelectedIssueId,
   setDetailPanel,
   selectedIssueId,
-}: any) {
+}: {
+  executionMap: MissionControlData["commandCenterExecutionMap"];
+  setSelectedIssueId: MissionControlData["setSelectedIssueId"];
+  setDetailPanel: MissionControlData["setDetailPanel"];
+  selectedIssueId: MissionControlData["selectedIssueId"];
+}) {
   if (executionMap.length === 0)
     return <div className="mc-v2-empty">No execution lineage yet.</div>;
   return (
     <div className="mc-v2-ops-execution-map">
-      {executionMap.slice(0, 20).map((entry: any) => (
+      {executionMap.slice(0, 20).map((entry) => (
         <button
           key={entry.issueId}
           type="button"
@@ -658,7 +677,28 @@ function OpsPlanner({
   setDetailPanel,
   formatRelativeTime,
   selectedIssueId,
-}: any) {
+}: {
+  config: MissionControlData["plannerConfig"];
+  runs: MissionControlData["plannerRuns"];
+  running: MissionControlData["plannerRunning"];
+  saving: MissionControlData["plannerSaving"];
+  loading: MissionControlData["plannerLoading"];
+  selectedRunId: MissionControlData["selectedPlannerRunId"];
+  setSelectedRunId: MissionControlData["setSelectedPlannerRunId"];
+  selectedRun: MissionControlData["selectedPlannerRun"];
+  runIssues: MissionControlData["plannerRunIssues"];
+  workspaces: MissionControlData["workspaces"];
+  agents: MissionControlData["agents"];
+  onConfigChange: MissionControlData["handlePlannerConfigChange"];
+  onRun: MissionControlData["handleRunPlanner"];
+  setSelectedIssueId: MissionControlData["setSelectedIssueId"];
+  setDetailPanel: MissionControlData["setDetailPanel"];
+  formatRelativeTime: MissionControlData["formatRelativeTime"];
+  selectedIssueId: MissionControlData["selectedIssueId"];
+  canEditConfig: boolean;
+  canRun: boolean;
+  canReadRuns: boolean;
+}) {
   return (
     <div className="mc-v2-planner-config">
       <div className="mc-v2-planner-status-row">
@@ -721,7 +761,7 @@ function OpsPlanner({
               onChange={(e) => void onConfigChange({ planningWorkspaceId: e.target.value || null })}
             >
               <option value="">None</option>
-              {workspaces.map((w: any) => (
+              {workspaces.map((w) => (
                 <option key={w.id} value={w.id}>
                   {w.name}
                 </option>
@@ -737,8 +777,8 @@ function OpsPlanner({
             >
               <option value="">Auto-pick</option>
               {agents
-                .filter((a: any) => a.isActive)
-                .map((a: any) => (
+                .filter((a) => a.isActive)
+                .map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.displayName}
                   </option>
@@ -750,7 +790,11 @@ function OpsPlanner({
             <select
               disabled={!canEditConfig || saving}
               value={config.approvalPreset}
-              onChange={(e) => void onConfigChange({ approvalPreset: e.target.value })}
+              onChange={(e) => {
+                const value = e.target.value;
+                if (value === "manual" || value === "safe_autonomy" || value === "founder_edge")
+                  void onConfigChange({ approvalPreset: value });
+              }}
             >
               <option value="manual">Manual</option>
               <option value="safe_autonomy">Safe autonomy</option>
@@ -782,14 +826,18 @@ function OpsPlanner({
               No planner runs yet.
             </div>
           ) : (
-            runs.map((run: any) => (
+            runs.map((run) => (
               <button
                 key={run.id}
                 className={`mc-v2-planner-run ${selectedRunId === run.id ? "selected" : ""}`}
                 onClick={() => {
                   setSelectedRunId(run.id);
-                  const md = run.metadata as any;
-                  const nextId = md?.createdIssueIds?.[0] || md?.updatedIssueIds?.[0];
+                  const md = run.metadata;
+                  const created = Array.isArray(md?.createdIssueIds) ? md.createdIssueIds : [];
+                  const updated = Array.isArray(md?.updatedIssueIds) ? md.updatedIssueIds : [];
+                  const nextId = [...created, ...updated].find(
+                    (id): id is string => typeof id === "string" && id.length > 0,
+                  );
                   if (nextId) {
                     setSelectedIssueId(nextId);
                     setDetailPanel({ kind: "issue", issueId: nextId });
@@ -842,7 +890,7 @@ function OpsPlanner({
                 No issue details for this planner cycle.
               </div>
             ) : (
-              runIssues.map((issue: any) => (
+              runIssues.map((issue) => (
                 <button
                   key={issue.id}
                   type="button"

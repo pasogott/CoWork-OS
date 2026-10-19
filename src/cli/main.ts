@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { Methods } from "../electron/control-plane/protocol";
 import fs from "node:fs/promises";
@@ -39,6 +40,12 @@ import {
   type WorkspaceLike,
 } from "./format";
 import { discoverLocalControlPlane } from "./local-control-plane-discovery";
+import { loadDrillFixture, replayInterruptDrill, runLiveInterruptDrill } from "./drill";
+import {
+  compareInterruptDrill,
+  renderInterruptDrillReport,
+  type InterruptDrillReport,
+} from "../shared/interrupt-drill";
 import {
   buildDirectRuntimeLaunch,
   resolveChildProcessExitCode,
@@ -46,7 +53,7 @@ import {
 } from "./direct-runtime";
 import { promptMarker, renderWelcomeScreen } from "./terminal-ui";
 
-type Any = Record<string, any>;
+type Payload = Record<string, unknown>;
 
 interface ParsedArgs {
   command: string;
@@ -82,6 +89,7 @@ const VALUE_FLAGS = new Set([
   "--workspace-id",
   "--workspace",
   "--cwd",
+  "--timeout-ms",
   "--limit",
   "--model",
   "--api-key",
@@ -266,6 +274,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         return await openCommand(ctx);
       case "pact":
         return await pactCommand(ctx);
+      case "handoff":
+        return await handoffCommand(ctx);
+      case "drill":
+        return await drillCommand(ctx);
       default:
         process.stderr.write(`Unknown command: ${parsed.command}\n\n`);
         usage();
@@ -355,7 +367,7 @@ function getCliVersion(): string {
   ];
   for (const packageJsonPath of candidates) {
     try {
-      const pkg = require(packageJsonPath) as { version?: string };
+      const pkg = JSON.parse(fsSync.readFileSync(packageJsonPath, "utf8")) as { version?: string };
       if (pkg.version) return pkg.version;
     } catch {
       // Try the next layout; source and dist have different __dirname depth.
@@ -706,7 +718,7 @@ async function workspace(ctx: CommandContext): Promise<number> {
       const name = getFlag(ctx.parsed, "--name") || path.basename(resolved) || "Workspace";
       const payload = await client.request(METHODS.WORKSPACE_CREATE, { name, path: resolved });
       printLinesOrJson(ctx, payload, [
-        `Created workspace: ${formatWorkspace((payload as Any).workspace || {})}`,
+        `Created workspace: ${formatWorkspace((payload as Payload).workspace || {})}`,
       ]);
       return 0;
     }
@@ -757,8 +769,8 @@ async function runTask(ctx: CommandContext): Promise<number> {
         : {}),
     };
     const created = await client.request(METHODS.TASK_CREATE, params, 30000);
-    const task = ((created as Any).task || {}) as TaskLike;
-    const taskId = String((created as Any).taskId || task.id || "");
+    const task = ((created as Payload).task || {}) as TaskLike;
+    const taskId = String((created as Payload).taskId || task.id || "");
     if (ctx.json || hasFlag(ctx.parsed, "--no-follow")) {
       printJson(created);
       return 0;
@@ -888,7 +900,7 @@ function resolveDirectRuntime(): DirectRuntime {
   const scriptPath = path.join(__dirname, "direct-run.js");
   const appPath = path.resolve(__dirname, "..", "..", "..");
   try {
-    const electronBinary = require("electron");
+    const electronBinary: unknown = createRequire(__filename)("electron");
     if (typeof electronBinary === "string" && electronBinary.trim()) {
       return { executable: electronBinary, scriptPath, appPath, usesElectron: true };
     }
@@ -1256,7 +1268,8 @@ async function providers(ctx: CommandContext): Promise<number> {
   try {
     if (sub === "list" || sub === "status") {
       const config = await client.request(METHODS.CONFIG_GET);
-      const llm = (config as Any).llm || {};
+      const rawLlm = (config as Payload).llm;
+      const llm = rawLlm && typeof rawLlm === "object" ? (rawLlm as Payload) : {};
       printLinesOrJson(ctx, llm, formatProviders(llm));
       return 0;
     }
@@ -1285,6 +1298,136 @@ async function providers(ctx: CommandContext): Promise<number> {
   } finally {
     client.close();
   }
+}
+
+/**
+ * `cowork drill interrupt <fixture>`: stop a task halfway and show what actually changed. A
+ * fixture with recorded events replays without a daemon and is checked against its `expected`
+ * block (exit 1 on a difference); `--live` runs its prompt through the control plane.
+ */
+async function drillCommand(ctx: CommandContext): Promise<number> {
+  const usageText =
+    "Usage: cowork drill interrupt <fixture name | path.json> [--live [--workspace <id>] [--timeout-ms <ms>] [--check]] [--json]";
+  const fixtureArg = ctx.parsed.rest[1];
+  if (ctx.parsed.rest[0] !== "interrupt" || !fixtureArg) return usageError(usageText);
+  const fixture = await loadDrillFixture(fixtureArg);
+  const live = hasFlag(ctx.parsed, "--live");
+  let report: InterruptDrillReport;
+  if (live) {
+    const client = await connectedClient(ctx);
+    try {
+      const workspaceId =
+        getFlag(ctx.parsed, "--workspace") ||
+        (await resolveWorkspaceId(
+          client,
+          ctx,
+          path.resolve(getFlag(ctx.parsed, "--cwd") || process.cwd()),
+        ));
+      const timeoutMs = Number(getFlag(ctx.parsed, "--timeout-ms"));
+      report = await runLiveInterruptDrill(client, {
+        workspaceId,
+        fixture,
+        ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
+      });
+    } finally {
+      client.close();
+    }
+  } else {
+    report = replayInterruptDrill(fixture);
+  }
+  // A recorded drill is a check; a live one only when asked, since a model's path varies.
+  const problems =
+    fixture.expected && (!live || hasFlag(ctx.parsed, "--check"))
+      ? compareInterruptDrill(report, fixture.expected)
+      : [];
+  if (ctx.json) {
+    printJson({ fixture: fixture.id, mode: live ? "live" : "replay", report, problems });
+  } else {
+    process.stdout.write(`${renderInterruptDrillReport(report).join("\n")}\n`);
+    if (problems.length > 0) {
+      process.stdout.write(
+        `\nDiffers from fixture ${fixture.id}:\n${problems.map((line) => `  - ${line}`).join("\n")}\n`,
+      );
+    }
+  }
+  return problems.length > 0 ? 1 : 0;
+}
+
+/**
+ * `cowork handoff export|import`: move an in-progress session between sessions or installations
+ * as a versioned package under `<workspace>/.cowork/handoffs/`.
+ */
+async function handoffCommand(ctx: CommandContext): Promise<number> {
+  const sub = ctx.parsed.rest[0];
+  const exportUsage =
+    "Usage: cowork handoff export <managedSessionId> | --task <taskId> [--out <dir in workspace>]";
+  const importUsage =
+    "Usage: cowork handoff import <package dir in .cowork/handoffs/> --environment <environmentId> [--agent <agentId>] [--title <title>] [--message <text>] [--dry-run]";
+  if (sub === "export") {
+    const sessionId = ctx.parsed.rest[1];
+    const taskId = getFlag(ctx.parsed, "--task");
+    if (Boolean(sessionId) === Boolean(taskId)) return usageError(exportUsage);
+    const targetDir = getFlag(ctx.parsed, "--out");
+    const client = await connectedClient(ctx);
+    try {
+      const result = (await client.request(Methods.MANAGED_SESSION_EXPORT_HANDOFF, {
+        ...(sessionId ? { sessionId } : { taskId }),
+        ...(targetDir ? { targetDir: path.resolve(targetDir) } : {}),
+      })) as Payload;
+      const warnings = Array.isArray(result.warnings) ? (result.warnings as string[]) : [];
+      printLinesOrJson(ctx, result, [
+        `Exported handoff package ${String(result.packageId)}`,
+        `  manifest: ${String(result.manifestPath)}`,
+        `  files copied: ${String(result.artifactsCopied)}`,
+        ...warnings.map((warning) => `  note: ${warning}`),
+        "Copy the package folder into the target workspace's .cowork/handoffs/ and run:",
+        `  cowork handoff import <path>/${String(result.packageId)} --environment <environmentId>`,
+      ]);
+      return 0;
+    } finally {
+      client.close();
+    }
+  }
+  if (sub === "import") {
+    const manifestPath = ctx.parsed.rest[1];
+    const environmentId = getFlag(ctx.parsed, "--environment");
+    if (!manifestPath || !environmentId) return usageError(importUsage);
+    const agentId = getFlag(ctx.parsed, "--agent");
+    const title = getFlag(ctx.parsed, "--title");
+    const message = getFlag(ctx.parsed, "--message");
+    const client = await connectedClient(ctx);
+    try {
+      const dryRun = hasFlag(ctx.parsed, "--dry-run");
+      const result = (await client.request(Methods.MANAGED_SESSION_IMPORT_HANDOFF, {
+        manifestPath: path.resolve(manifestPath),
+        environmentId,
+        ...(agentId ? { agentId } : {}),
+        ...(title ? { title } : {}),
+        ...(message ? { message } : {}),
+        ...(dryRun ? { dryRun: true } : {}),
+      })) as Payload;
+      const session = (result.session || {}) as Payload;
+      const restored = Array.isArray(result.restoredPaths)
+        ? (result.restoredPaths as string[])
+        : [];
+      const skipped = Array.isArray(result.skipped) ? (result.skipped as string[]) : [];
+      printLinesOrJson(ctx, result, [
+        dryRun
+          ? `Dry run of handoff ${String(result.packageId)}: nothing was written`
+          : `Continued handoff ${String(result.packageId)} as managed session ${String(session.id)}`,
+        `  files ${dryRun ? "to restore" : "restored"}: ${restored.length}`,
+        ...restored.map((entry) => `    ${entry}`),
+        ...skipped.map((entry) => `  not restored: ${entry}`),
+        "The checksum only detects damage; who exported the package is not verified.",
+        "Approvals the earlier session was waiting for are not granted; the new session asks again.",
+      ]);
+      return 0;
+    } finally {
+      client.close();
+    }
+  }
+  process.stderr.write(`${exportUsage}\n${importUsage}\n`);
+  return 1;
 }
 
 async function sessions(ctx: CommandContext): Promise<number> {
@@ -1919,7 +2062,7 @@ async function resolveWorkspaceId(
     name: named || path.basename(cwd) || "Workspace",
     path: cwd,
   });
-  const workspace = (created as Any).workspace as WorkspaceLike | undefined;
+  const workspace = (created as Payload).workspace as WorkspaceLike | undefined;
   if (!workspace?.id)
     throw new Error("Workspace creation succeeded but no workspace id was returned.");
   process.stdout.write(`Created workspace: ${formatWorkspace(workspace)}\n`);
@@ -1987,7 +2130,7 @@ function formatConfigWarnings(config: unknown): string[] {
   return ["- warnings:", ...warnings.map((warning) => `  - ${warning}`)];
 }
 
-function formatProviders(llm: Any): string[] {
+function formatProviders(llm: Payload): string[] {
   const providers = Array.isArray(llm.providers) ? llm.providers : [];
   const lines = [
     `Current provider: ${llm.currentProvider || "unknown"}`,
@@ -2001,12 +2144,6 @@ function formatProviders(llm: Any): string[] {
 
 function parseLimit(ctx: CommandContext, fallback: number, flag = "--limit"): number {
   return sanitizeLimit(Number(getFlag(ctx.parsed, flag) || fallback), fallback);
-}
-
-function parseDays(ctx: CommandContext, fallback: number): number {
-  const value = Number(getFlag(ctx.parsed, "--days") || fallback);
-  if (!Number.isFinite(value)) return fallback;
-  return Math.max(1, Math.min(36500, Math.floor(value)));
 }
 
 function sessionPruneDirectArgs(ctx: CommandContext): string[] {
@@ -2063,6 +2200,7 @@ const RESERVED_RUN_PROMPTS = new Set([
   "provider",
   "sessions",
   "session",
+  "handoff",
   "logs",
   "log",
   "tools",
@@ -2124,6 +2262,7 @@ function renderCompletions(shell: string): string {
     "reject",
     "providers",
     "sessions",
+    "handoff",
     "tasks",
     "logs",
     "tools",
@@ -2213,6 +2352,9 @@ function usage(): void {
       "  cowork providers configure <provider> [--api-key <key>] [--model <model>]",
       "  cowork providers fallback list|add|remove",
       "  cowork sessions list|show|export|rename|archive|delete|prune",
+      "  cowork handoff export <managedSessionId> | --task <taskId> [--out <dir>]",
+      "  cowork handoff import <package> --environment <environmentId> [--agent <agentId>] [--dry-run]",
+      "  cowork drill interrupt <fixture> [--live [--workspace <id>] [--check]] [--json]",
       "  cowork logs latest|tail|grep",
       "  cowork tools list|info|enable|disable",
       "  cowork mcp list|add|remove|enable|disable|test",

@@ -26,7 +26,8 @@ function inspect(input: BotArtifactCheckInput): Promise<BotWorkResult["outputs"]
       settled = true;
       clearTimeout(timer);
       void worker.terminate();
-      error ? reject(error) : resolve(value!);
+      if (error) reject(error);
+      else resolve(value!);
     };
     worker.once("message", (value) => finish(undefined, value));
     worker.once("error", (error) =>
@@ -167,12 +168,14 @@ export class BotWorkResultService {
         check,
         reason,
       })),
-      evidence: evidence.map(({ id, claim, sourceType, capturedAt, status }) => ({
+      evidence: evidence.map(({ id, claim, sourceType, capturedAt, status, basis, dataAsOf }) => ({
         id,
         claim,
         sourceType,
         capturedAt,
         status,
+        ...(basis ? { basis } : {}),
+        ...(dataAsOf !== undefined ? { dataAsOf } : {}),
       })),
       truncated: manifest.truncated,
       issues,

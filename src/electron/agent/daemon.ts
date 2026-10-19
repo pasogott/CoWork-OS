@@ -30,9 +30,11 @@ import {
   ArtifactRepository,
   InputRequestRepository,
   storageStatements,
-  TaskSessionMetadataRepository,
+  ToolAttemptRepository,
+  LifecycleMetaRepository,
   WorkspacePermissionRuleRepository,
 } from "../database/repository-facades";
+import { describeUnverifiedAttempts, unresolvedUnknownAttempts } from "./runtime/tool-attempts";
 import {
   FOLLOW_UP_RECOVERY_TASK_STATUSES,
   hasUnstartedFollowUpReceipt,
@@ -79,7 +81,6 @@ import {
   TaskStore,
   TaskEventRepository,
   WorkspaceStore,
-  MemoryType,
   withTaskRowReadScope,
   TaskSessionMetadataStore,
   ApprovalStore,
@@ -191,6 +192,9 @@ import {
   WorkerRoleKind,
   VerificationVerdict,
   LLMProviderType,
+  InterruptInFlightCall,
+  ToolAttempt,
+  LifecycleKind,
 } from "../../shared/types";
 import { parseSpawnAgentCount } from "../../shared/spawn-intent-detection";
 import { isAutomatedTaskLike } from "../../shared/automated-task-detection";
@@ -224,7 +228,7 @@ import { createTimelineEmitter } from "./timeline-emitter";
 import { TaskExecutor } from "./executor";
 import { APPROVAL_REQUEST_TIMEOUT_MS } from "./approval-timeouts";
 import { approvalPromptsDisabled, canAnswerInlineApproval } from "./approval-policy";
-import { isVisualAnalysisConsentRequest } from "./visual-consent-policy";
+import { isExplicitExportConsentRequest } from "./visual-consent-policy";
 import { isHeadlessMode } from "../utils/runtime-mode";
 import {
   buildAssistantApprovalMessage,
@@ -268,7 +272,7 @@ import {
   filterTrustedManifestRules,
   loadWorkspacePermissionManifest,
 } from "../security/workspace-permission-manifest";
-import { permissionScopeFingerprint, summarizePermissionScope } from "../security/permission-utils";
+import { permissionScopeFingerprint } from "../security/permission-utils";
 import { buildPermissionSecurityContext } from "./security/export-permission-context";
 import { evaluateNetworkPolicy } from "../security/network-policy";
 import { PlaybookService } from "../memory/PlaybookService";
@@ -751,7 +755,7 @@ interface PendingApprovalEntry {
 function getAllElectronWindows(): Any[] {
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    // oxlint-disable-next-line typescript-eslint(no-require-imports)
+    // oxlint-disable-next-line typescript/no-require-imports
     const electron = require("electron") as Any;
     const BrowserWindow = electron?.BrowserWindow;
     if (BrowserWindow?.getAllWindows) {
@@ -1111,6 +1115,106 @@ export class AgentDaemon extends EventEmitter {
   /** Return the durable Phase 4 contracts/evidence/lineage service. */
   getWorkSessionContractService(): WorkSessionContractService {
     return this.workSessionContractService;
+  }
+
+  private toolAttemptRepository?: ToolAttemptRepository;
+  private lifecycleMetaRepository?: LifecycleMetaRepository;
+  /** Tasks with a call whose outcome became unknown; only these read attempts at completion. */
+  private tasksWithUnknownToolOutcomes?: Set<string>;
+
+  noteToolOutcomeUnknown(taskId: string): void {
+    (this.tasksWithUnknownToolOutcomes ??= new Set()).add(taskId);
+  }
+
+  /**
+   * Count one use of generated software (a skill applied, a playbook entry recalled) for the
+   * Hygiene tab. Fire-and-forget: it never delays or fails the caller.
+   */
+  recordLifecycleUse(kind: LifecycleKind, id: string): void {
+    if (!id) return;
+    try {
+      this.lifecycleMetaRepository ??= new LifecycleMetaRepository(this.getDatabase());
+      void this.lifecycleMetaRepository
+        .recordUse({ kind, id, at: Date.now() })
+        .catch((error) => log.debug(`Could not record a use of ${kind} ${id}:`, error));
+    } catch (error) {
+      log.debug(`Could not record a use of ${kind} ${id}:`, error);
+    }
+  }
+
+  /** Durable attempts of tool calls that write or whose effect is unknown. */
+  getToolAttemptRepository(): ToolAttemptRepository {
+    this.toolAttemptRepository ??= new ToolAttemptRepository(this.getDatabase());
+    return this.toolAttemptRepository;
+  }
+
+  /** Calls a previous process left `started` can no longer report: their outcome is unknown. */
+  private async recoverInterruptedToolAttempts(): Promise<void> {
+    try {
+      const repository = this.getToolAttemptRepository();
+      const running = [...this.activeTasks.keys()];
+      // Each round is bounded; a crash leaves at most a handful of open calls per task.
+      for (let round = 0; round < 20; round += 1) {
+        const taskIds = await repository.recoverStartedAttempts(running, Date.now());
+        if (taskIds.length === 0) break;
+        for (const taskId of taskIds) this.noteToolOutcomeUnknown(taskId);
+      }
+    } catch (error) {
+      log.warn("Could not recover interrupted tool attempts:", error);
+    }
+  }
+
+  /** Write or unknown-effect calls of a task whose outcome is still unknown. */
+  private async findUnverifiedToolAttempts(taskId: string): Promise<ToolAttempt[]> {
+    try {
+      return unresolvedUnknownAttempts(await this.getToolAttemptRepository().listForTask(taskId));
+    } catch (error) {
+      log.warn(`Could not read tool attempts for ${taskId}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Calls that were running when a stop was requested. Calls still open become `unknown`:
+   * the executor stopped, so nothing will report their result.
+   */
+  private async collectInFlightToolCalls(
+    taskId: string,
+    requestedAt: number,
+  ): Promise<InterruptInFlightCall[]> {
+    try {
+      const repository = this.getToolAttemptRepository();
+      const closed = await repository.markStartedUnknown(
+        taskId,
+        "stopped_while_running",
+        Date.now(),
+      );
+      if (closed.length > 0) this.noteToolOutcomeUnknown(taskId);
+      const attempts = await repository.listForTask(taskId);
+      return attempts
+        .filter(
+          (attempt) =>
+            attempt.startedAt <= requestedAt &&
+            (attempt.finishedAt === undefined || attempt.finishedAt >= requestedAt),
+        )
+        .slice(-20)
+        .map((attempt) => ({
+          toolName: attempt.toolName,
+          attemptId: attempt.id,
+          idempotencyKey: attempt.idempotencyKey,
+          effect: attempt.effect,
+          outcome:
+            attempt.status === "completed"
+              ? "completed"
+              : attempt.status === "unknown" || attempt.status === "checked"
+                ? "unknown"
+                : "cancelled",
+          ...(attempt.target ? { target: attempt.target } : {}),
+        }));
+    } catch (error) {
+      log.warn(`Could not read in-flight tool calls for ${taskId}:`, error);
+      return [];
+    }
   }
 
   getApplicationExecutionService(): ApplicationExecutionService {
@@ -1747,7 +1851,7 @@ export class AgentDaemon extends EventEmitter {
       try {
         const stored = this.taskRepo.findById(task.id);
         if (stored) {
-          const storedConfig: AgentConfig = { ...(stored.agentConfig ?? {}) };
+          const storedConfig: AgentConfig = { ...stored.agentConfig };
           if (ceiling) storedConfig.accessCeilingProfileId = ceiling;
           else delete storedConfig.accessCeilingProfileId;
           this.taskRepo.update(task.id, { agentConfig: storedConfig });
@@ -2434,6 +2538,9 @@ export class AgentDaemon extends EventEmitter {
     // runs off the host thread; its tasks are recovered with the delayed resume.
     const followUpRecoveryCandidates = this.scanUnstartedUserFollowUps();
 
+    // Tool calls a previous process left running can no longer report their result.
+    void this.recoverInterruptedToolAttempts();
+
     // Recover stale retry tasks that were incorrectly persisted as executing.
     // These should re-enter the queue on startup so retries can continue.
     const staleTransientRetryTasks = this.taskRepo
@@ -2812,7 +2919,7 @@ export class AgentDaemon extends EventEmitter {
     // Also remove oldest completed executors if we have too many
     if (completedCount > MAX_CACHED_EXECUTORS) {
       const completedTasks = Array.from(this.activeTasks.entries())
-        .filter(([_, cached]) => cached.status === "completed")
+        .filter(([, cached]) => cached.status === "completed")
         .sort((a, b) => a[1].lastAccessed - b[1].lastAccessed);
 
       const excessCount = completedCount - MAX_CACHED_EXECUTORS;
@@ -5696,7 +5803,7 @@ export class AgentDaemon extends EventEmitter {
         // or inherit a broad settings default that the parent had overridden.
         task: {
           agentConfig: {
-            ...(params.agentConfig || {}),
+            ...params.agentConfig,
             ...(mergedPermissionMode ? { permissionMode: mergedPermissionMode } : {}),
           },
         },
@@ -6131,7 +6238,7 @@ export class AgentDaemon extends EventEmitter {
     }
 
     const nextAgentConfig: AgentConfig = {
-      ...(parentTask.agentConfig || {}),
+      ...parentTask.agentConfig,
       collaborativeMode: true,
       childAgentCollaborativeRun: true,
     };
@@ -6673,9 +6780,17 @@ export class AgentDaemon extends EventEmitter {
     ).catch((error) => {
       log.error(`[cancel] Graph cancellation failed for ${taskId}:`, error);
     });
+    const inFlight = await this.collectInFlightToolCalls(taskId, input.requestedAt);
+    const unverified = inFlight.filter((call) => call.outcome === "unknown");
+    const message =
+      unverified.length > 0
+        ? `${input.message}. ${unverified.length === 1 ? "1 call was" : `${unverified.length} calls were`} in flight and not verified: ${unverified
+            .map((call) => (call.target ? `${call.toolName} on ${call.target}` : call.toolName))
+            .join("; ")}`
+        : input.message;
     // Persist cancellation for running tasks too (important for remote clients querying task status).
-    if (controlAuthority) this.cancelTaskRecord(taskId, input.message, { controlAuthority });
-    else this.cancelTaskRecord(taskId, input.message);
+    if (controlAuthority) this.cancelTaskRecord(taskId, message, { controlAuthority });
+    else this.cancelTaskRecord(taskId, message);
     this.logEvent(taskId, "agent_interrupt_confirmed", {
       taskId,
       reason: "cancel",
@@ -6683,6 +6798,7 @@ export class AgentDaemon extends EventEmitter {
       requestedAt: input.requestedAt,
       confirmedAt: Date.now(),
       status: "cancelled",
+      ...(inFlight.length > 0 ? { inFlight } : {}),
     });
 
     // Always notify queue manager to remove from running set
@@ -7882,7 +7998,11 @@ export class AgentDaemon extends EventEmitter {
   async getTaskConsentAuthority(
     taskId: string,
     details: Any,
-    approvalType: "external_service" | "network_access" | "computer_use" = "external_service",
+    approvalType:
+      | "external_service"
+      | "network_access"
+      | "computer_use"
+      | "data_export" = "external_service",
   ): Promise<string | null> {
     const task = this.taskRepo.findById(taskId);
     if (!task || isTerminalTaskStatus(deriveCanonicalTaskStatus(task))) return null;
@@ -7892,7 +8012,13 @@ export class AgentDaemon extends EventEmitter {
       this.getTaskWithTransientAgentConfig(task),
       permission.workspace,
     );
-    if (permission.evaluation.decision === "deny" || profile.definition.approval === "never")
+    // A profile that never asks grants no task consent, except the export consents that
+    // still ask in Full access (isExplicitExportConsentRequest).
+    if (
+      permission.evaluation.decision === "deny" ||
+      (profile.definition.approval === "never" &&
+        !isExplicitExportConsentRequest(details?.tool, approvalType))
+    )
       return null;
     return authorizationFingerprint({
       authority: permission.authorizationKey,
@@ -7915,7 +8041,7 @@ export class AgentDaemon extends EventEmitter {
     },
   ): Promise<boolean> {
     if (request.signal?.aborted) throw new Error("Tool authorization cancelled");
-    const details = { ...(request.details || {}), tool: request.toolName };
+    const details = { ...request.details, tool: request.toolName };
     const permission = await this.evaluateToolPermission(taskId, {
       toolName: request.toolName,
       approvalType: request.approvalType,
@@ -9029,13 +9155,13 @@ export class AgentDaemon extends EventEmitter {
         },
       };
     }
-    const interactiveVisualConsent =
-      isVisualAnalysisConsentRequest(enrichedDetails.tool, type) &&
+    const interactiveExportConsent =
+      isExplicitExportConsentRequest(enrichedDetails.tool, type) &&
       canAnswerInlineApproval(task, { headless: isHeadlessMode() });
     if (
       accessProfile.definition.approval === "never" &&
       permission.evaluation.decision === "ask" &&
-      !interactiveVisualConsent
+      !interactiveExportConsent
     ) {
       this.logEvent(taskId, "log", {
         type: "tool_authorization",
@@ -9572,13 +9698,13 @@ export class AgentDaemon extends EventEmitter {
       typeof (this as Any).getTaskWithTransientAgentConfig === "function"
         ? this.getTaskWithTransientAgentConfig(task)
         : task;
-    const interactiveVisualConsent =
-      isVisualAnalysisConsentRequest(details.tool, approval.type) &&
+    const interactiveExportConsent =
+      isExplicitExportConsentRequest(details.tool, approval.type) &&
       canAnswerInlineApproval(currentTask, { headless: isHeadlessMode() });
     if (
       current.workspace?.permissions.accessApprovalPolicy === "never" &&
       current.evaluation.decision !== "allow" &&
-      !interactiveVisualConsent
+      !interactiveExportConsent
     )
       return false;
     const expectedKey = details.authorization?.key;
@@ -10937,11 +11063,10 @@ export class AgentDaemon extends EventEmitter {
     // Event-driven captures can run after the executor has paused or finished.
     // Resolve the live task profile here so automatic memory mirroring cannot
     // use stale workspace permissions or bypass a newly gated network mode.
-    let effectiveMemoryWorkspace: Workspace | undefined;
     try {
-      effectiveMemoryWorkspace = this.getEffectiveWorkspaceForTask(taskId);
+      this.getEffectiveWorkspaceForTask(taskId);
     } catch {
-      effectiveMemoryWorkspace = undefined;
+      // Capture continues through the existing workspace-specific policy checks.
     }
     const workspace = this.workspaceRepo.findById(task.workspaceId);
     if (!workspace?.path) return;
@@ -12230,11 +12355,10 @@ export class AgentDaemon extends EventEmitter {
     )
       return;
 
-    let effectiveMemoryWorkspace: Workspace | undefined;
     try {
-      effectiveMemoryWorkspace = this.getEffectiveWorkspaceForTask(taskId);
+      this.getEffectiveWorkspaceForTask(taskId);
     } catch {
-      effectiveMemoryWorkspace = undefined;
+      // Capture continues through the existing workspace-specific policy checks.
     }
 
     // Memory retention:
@@ -12892,7 +13016,7 @@ export class AgentDaemon extends EventEmitter {
     return {
       ...task,
       agentConfig: {
-        ...(task.agentConfig || {}),
+        ...task.agentConfig,
         ...override,
       },
     };
@@ -15295,6 +15419,27 @@ export class AgentDaemon extends EventEmitter {
       }
     }
 
+    // A write whose outcome stayed unknown (timeout, lost transport) and was never read back or
+    // repeated successfully: the work cannot count as done until someone checks it.
+    const unverifiedToolCalls = this.tasksWithUnknownToolOutcomes?.delete(taskId)
+      ? await this.findUnverifiedToolAttempts(taskId)
+      : [];
+    if (unverifiedToolCalls.length > 0) {
+      const note = describeUnverifiedAttempts(unverifiedToolCalls);
+      resultSummary =
+        typeof resultSummary === "string" && resultSummary.trim()
+          ? `${resultSummary.trim()}\n\n${note}`
+          : note;
+      const current = metadata?.terminalStatus;
+      if (current === undefined || current === "ok" || current === "partial_success") {
+        metadata = {
+          ...metadata,
+          terminalStatus: "needs_user_action",
+          terminalStatusReason: "tool_outcome_unknown",
+        };
+      }
+    }
+
     this.cleanupPendingApprovalsForTask(
       taskId,
       "Task ended before the approval request was resolved.",
@@ -17254,7 +17399,7 @@ export class AgentDaemon extends EventEmitter {
       if (status === "failed") {
         const retryAt = Date.now();
         const retryPayload: Record<string, unknown> = {
-          ...(payload || {}),
+          ...payload,
           status: "queued",
           deliveryStatus: "queued",
           queuedAt: retryAt,
@@ -18016,7 +18161,7 @@ export class AgentDaemon extends EventEmitter {
           : undefined;
         if (senderEvent) {
           const senderPayload = {
-            ...((senderEvent.payload as Record<string, unknown> | undefined) || {}),
+            ...(senderEvent.payload as Record<string, unknown> | undefined),
             status: "delivered",
             deliveryStatus: "delivered",
             deliveredAt,
@@ -18133,7 +18278,7 @@ export class AgentDaemon extends EventEmitter {
         });
       if (!senderEvent) return;
       const senderPayload: Record<string, unknown> = {
-        ...((senderEvent.payload as Record<string, unknown> | undefined) || {}),
+        ...(senderEvent.payload as Record<string, unknown> | undefined),
         status,
         deliveryStatus: status,
         ...(status === "started" ? { startedAt: timestamp } : {}),

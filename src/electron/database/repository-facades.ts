@@ -46,6 +46,8 @@ import type { ComposerDraftStore } from "./composer-draft-repository";
 import type { TaskLabelStore } from "./TaskLabelRepository";
 import type { BrowserHistoryStore } from "./BrowserHistoryRepository";
 import type { DeviceProfileStore } from "./DeviceProfileRepository";
+import type { ToolAttemptStore } from "./tool-attempt-sql";
+import type { LifecycleMetaStore } from "./lifecycle-meta-sql";
 import type { WorkSessionProtocolRepository } from "./WorkSessionProtocolRepository";
 import type { STORAGE_UNITS } from "./storage-units";
 
@@ -106,6 +108,42 @@ export const TaskSessionMetadataRepository = repositoryFacade<
   TaskSessionMetadataStore,
   (typeof TASKSESSIONMETADATA_METHODS)[number]
 >("taskSessionMetadata_", TASKSESSIONMETADATA_METHODS);
+
+const TOOL_ATTEMPT_METHODS = [
+  "begin",
+  "finish",
+  "listForTask",
+  "markStartedUnknown",
+  "recoverStartedAttempts",
+] as const;
+export type ToolAttemptRepository = AsyncStore<
+  ToolAttemptStore,
+  (typeof TOOL_ATTEMPT_METHODS)[number]
+>;
+/** Durable attempts of tool calls that write or whose effect is unknown (WP4). */
+export const ToolAttemptRepository = repositoryFacade<
+  ToolAttemptStore,
+  (typeof TOOL_ATTEMPT_METHODS)[number]
+>("toolAttempt_", TOOL_ATTEMPT_METHODS);
+
+const LIFECYCLE_META_METHODS = [
+  "recordUse",
+  "get",
+  "list",
+  "listRetiredIds",
+  "setMeta",
+  "retire",
+  "keep",
+] as const;
+export type LifecycleMetaRepository = AsyncStore<
+  LifecycleMetaStore,
+  (typeof LIFECYCLE_META_METHODS)[number]
+>;
+/** Lifecycle of generated software: owner, use, dependencies, retire and keep (WP9). */
+export const LifecycleMetaRepository = repositoryFacade<
+  LifecycleMetaStore,
+  (typeof LIFECYCLE_META_METHODS)[number]
+>("lifecycleMeta_", LIFECYCLE_META_METHODS);
 
 const TASK_ADMISSION_METHODS = ["admit", "findByOperationKey"] as const;
 export type TaskAdmissionRepository = AsyncStore<
