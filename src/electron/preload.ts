@@ -1,5 +1,10 @@
 import type { ComputerViewState } from "../shared/computer-view";
 import {
+  BROWSER_TOOLBAR_MENU_POPUP,
+  type BrowserToolbarMenuAction,
+  type BrowserToolbarMenuRequest,
+} from "../shared/browser-toolbar-menu";
+import {
   BROWSER_VAULT_IPC,
   type BrowserVaultItem,
   type BrowserVaultAnswer,
@@ -1717,6 +1722,10 @@ interface AgentRoleData {
   worksOn?: import("../shared/bot-computer").BotWorksOn;
   desktopHost?: string;
   desktopGroup?: string;
+  /** Which files runs nobody started by hand work on; unset means its own folder. */
+  fileAccess?: import("../shared/bot-containment").BotFileAccess;
+  /** What its own desktop may reach on the network; unset means internet only. */
+  desktopNetwork?: import("../shared/bot-computer").BotDesktopNetwork;
   soul?: string;
   heartbeatPolicy?: import("../shared/types").HeartbeatPolicy;
   heartbeatEnabled?: boolean;
@@ -1761,6 +1770,8 @@ interface CreateAgentRoleRequest {
   worksOn?: import("../shared/bot-computer").BotWorksOn;
   desktopHost?: string;
   desktopGroup?: string;
+  fileAccess?: import("../shared/bot-containment").BotFileAccess;
+  desktopNetwork?: import("../shared/bot-computer").BotDesktopNetwork;
   soul?: string;
   operatorMandate?: string;
   allowedLoopTypes?: import("../shared/types").CompanyLoopType[];
@@ -1796,6 +1807,8 @@ interface UpdateAgentRoleRequest {
   worksOn?: import("../shared/bot-computer").BotWorksOn | null;
   desktopHost?: string | null;
   desktopGroup?: string | null;
+  fileAccess?: import("../shared/bot-containment").BotFileAccess | null;
+  desktopNetwork?: import("../shared/bot-computer").BotDesktopNetwork | null;
   soul?: string;
   operatorMandate?: string;
   allowedLoopTypes?: import("../shared/types").CompanyLoopType[];
@@ -2704,6 +2717,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on(IPC_CHANNELS.BROWSER_WORKBENCH_TAB_COMMAND, handler);
     return () => ipcRenderer.removeListener(IPC_CHANNELS.BROWSER_WORKBENCH_TAB_COMMAND, handler);
   },
+  popupBrowserToolbarMenu: (data: BrowserToolbarMenuRequest) =>
+    ipcRenderer.invoke(
+      BROWSER_TOOLBAR_MENU_POPUP,
+      data,
+    ) as Promise<BrowserToolbarMenuAction | null>,
   // Native tab views (browser engine "native"): the main process owns each tab's page.
   openBrowserTabView: (data: {
     taskId: string;
@@ -6843,6 +6861,9 @@ export interface ElectronAPI {
     callback: (event: BrowserWorkbenchNavigationBlockedEvent) => void,
   ) => () => void;
   /** A page asks to share a screen or window: the picker's choices. */
+  popupBrowserToolbarMenu: (
+    data: BrowserToolbarMenuRequest,
+  ) => Promise<BrowserToolbarMenuAction | null>;
   /** Native tab views (browser engine "native"); see src/electron/browser/browser-tab-views.ts. */
   openBrowserTabView: (data: {
     taskId: string;
