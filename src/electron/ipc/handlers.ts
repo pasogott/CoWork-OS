@@ -5,6 +5,8 @@ import {
 } from "../agents/collaborative-execution";
 import { closeBrowserTabViewsForTask } from "../browser/browser-tab-views";
 import { ComposerPredictionCoordinator } from "../agent/ComposerPredictionCoordinator";
+import { composerFollowUpProvenance } from "../agent/follow-up-provenance";
+import { USER_TYPED_TASK_PROMPT } from "../agent/task-prompt-provenance";
 import {
   COMPOSER_PREDICTION_CHANNEL,
   COMPOSER_PREDICTION_CANCEL_CHANNEL,
@@ -5178,6 +5180,9 @@ export async function setupIpcHandlers(
       budgetCost,
       agentConfig: normalizedAgentConfig,
       assignedAgentRoleId,
+      // The owner typed this prompt into the desktop composer, so it may expose the admin-lane
+      // tools (Task.promptProvenance). Set here, never read from the renderer's payload.
+      ...USER_TYPED_TASK_PROMPT,
     });
 
     if (generateTitle && !normalizedAgentConfig?.botConversation) {
@@ -6073,6 +6078,9 @@ export async function setupIpcHandlers(
         validated.initialMessage.trim().length > 0
           ? { initialMessage: validated.initialMessage.trim() }
           : {}),
+        // The owner forked this in the desktop app: the fork may keep the source task's prompt
+        // provenance (Task.promptProvenance).
+        keepPromptProvenance: true,
       });
       if (forkedTask) {
         try {
@@ -6601,7 +6609,16 @@ export async function setupIpcHandlers(
           ...(validated.integrationMentions !== undefined
             ? { integrationMentions: validated.integrationMentions }
             : {}),
-          ...(validated.surfaceOrigin ? { surfaceOrigin: validated.surfaceOrigin } : {}),
+          // Typed into the composer unless an answer surface sent it (model-written button,
+          // page code, shell output); only typed text can expose the admin-lane tools. A
+          // collaborator who may contribute to this session is someone else: the admin lane
+          // changes the owner's agent for every later task, so only the local owner counts.
+          ...(authorization.actor.principalId ===
+          sessionMembershipService.getLocalPrincipal().principalId
+            ? composerFollowUpProvenance(validated.surfaceOrigin)
+            : validated.surfaceOrigin
+              ? { surfaceOrigin: validated.surfaceOrigin }
+              : {}),
         },
       );
       // If the message was queued for a running executor, the executor owns

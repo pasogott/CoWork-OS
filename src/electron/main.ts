@@ -127,6 +127,8 @@ import { RecurringApprovalService } from "./security/recurring-approval-reposito
 import { ProactiveSuggestionsService } from "./agent/ProactiveSuggestionsService";
 import { AgentDaemon } from "./agent/daemon";
 import { approvalPromptsDisabled } from "./agent/approval-policy";
+import { composerFollowUpProvenance } from "./agent/follow-up-provenance";
+import { USER_TYPED_TASK_PROMPT } from "./agent/task-prompt-provenance";
 
 import { CoreMemoryCandidateService } from "./core/CoreMemoryCandidateService";
 
@@ -4600,6 +4602,9 @@ if (isMacSafeStorageMigrationWorker) {
                   workspaceId,
                   ...(accessProfileId ? { agentConfig: { accessProfileId } } : {}),
                   source: "api",
+                  // Web Access is the owner's composer in a browser: the prompt is typed and may
+                  // expose the admin-lane tools (Task.promptProvenance).
+                  ...USER_TYPED_TASK_PROMPT,
                 });
               }
               case "task:get": {
@@ -4625,6 +4630,8 @@ if (isMacSafeStorageMigrationWorker) {
                       | "accessProfileId"
                       | "integrationMentions"
                       | "expectedTurnId"
+                      | "surfaceOrigin"
+                      | "textProvenance"
                     >
                   | undefined;
                 try {
@@ -4649,6 +4656,9 @@ if (isMacSafeStorageMigrationWorker) {
                     ...(sanitized.integrationMentions !== undefined
                       ? { integrationMentions: sanitized.integrationMentions }
                       : {}),
+                    // Web Access is the owner's composer in a browser: typed unless an answer
+                    // surface sent it. Only typed text can expose the admin-lane tools.
+                    ...composerFollowUpProvenance(sanitized.surfaceOrigin),
                   };
                 } catch (err) {
                   throw new Error(

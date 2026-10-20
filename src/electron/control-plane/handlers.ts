@@ -117,6 +117,8 @@ import {
 import { ManagedAccountManager } from "../accounts/managed-account-manager";
 import { ManagedSessionService } from "../managed/ManagedSessionService";
 import { normalizeImagesForRemote, sanitizeTaskMessageParams } from "./sanitize";
+import { composerFollowUpProvenance } from "../agent/follow-up-provenance";
+import { USER_TYPED_TASK_PROMPT } from "../agent/task-prompt-provenance";
 import { applyDefaultAccessProfile } from "../security/access-profile-resolver";
 import { PermissionSettingsManager } from "../security/permission-settings-manager";
 import { taskAgentConfigForCreation } from "../../shared/security/task-entrypoint";
@@ -1508,6 +1510,7 @@ async function routeLocalDeviceProxyRequest(method: string, params?: unknown): P
         accessProfileId,
         shellAccess,
         integrationMentions,
+        surfaceOrigin,
       } = sanitizeTaskMessageParams(params);
       const result = await controlPlaneDeps.agentDaemon.sendMessage(
         taskId,
@@ -1524,6 +1527,9 @@ async function routeLocalDeviceProxyRequest(method: string, params?: unknown): P
           ...(accessProfileId ? { accessProfileId } : {}),
           ...(shellAccess !== undefined ? { shellAccess } : {}),
           ...(integrationMentions !== undefined ? { integrationMentions } : {}),
+          // The desktop composer's device view of this machine: typed unless an answer
+          // surface sent it. Only typed text can expose the admin-lane tools.
+          ...composerFollowUpProvenance(surfaceOrigin),
         },
       );
       return { ok: true, ...result };
@@ -3419,6 +3425,9 @@ export function registerTaskAndWorkspaceMethods(
           ? { assignedAgentRoleId: validated.assignedAgentRoleId }
           : undefined,
         boardColumn: validated.assignedAgentRoleId ? "todo" : undefined,
+        // An admin client is the owner's own composer on another device (remote view, web UI,
+        // CLI), as for task.sendMessage: the prompt is typed and may expose the admin-lane tools.
+        ...USER_TYPED_TASK_PROMPT,
         requestIdentity: {
           title: validated.title,
           prompt: validated.prompt,
@@ -3480,6 +3489,8 @@ export function registerTaskAndWorkspaceMethods(
       agentConfig: taskAgentConfig,
       budgetTokens: validated.budgetTokens,
       budgetCost: validated.budgetCost,
+      // The owner's own composer on another device, as above.
+      ...USER_TYPED_TASK_PROMPT,
     });
 
     if (shouldGenerateTaskTitle(validated.title, validated.prompt, validated.generateTitle)) {
@@ -3605,6 +3616,7 @@ export function registerTaskAndWorkspaceMethods(
       accessProfileId,
       shellAccess,
       integrationMentions,
+      surfaceOrigin,
     } = sanitizeTaskMessageParams(params);
     const result = await agentDaemon.sendMessage(taskId, message, images, quotedAssistantMessage, {
       ...(expectedTurnId ? { expectedTurnId } : {}),
@@ -3616,6 +3628,9 @@ export function registerTaskAndWorkspaceMethods(
       ...(accessProfileId ? { accessProfileId } : {}),
       ...(shellAccess !== undefined ? { shellAccess } : {}),
       ...(integrationMentions !== undefined ? { integrationMentions } : {}),
+      // An admin client is the owner's composer on another device (remote view, web UI):
+      // typed unless an answer surface sent it. Only typed text can expose the admin-lane tools.
+      ...composerFollowUpProvenance(surfaceOrigin),
     });
     return { ok: true, ...result };
   });

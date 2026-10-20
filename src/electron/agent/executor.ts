@@ -140,6 +140,7 @@ function withSurfaceOriginNote(
 import { hasAnswerSurfaceBlock } from "../../shared/answer-surfaces/blocks";
 import { AnswerSurfaceStateStore } from "../answer-surfaces/AnswerSurfaceStateStore";
 import { buildUserMessageAttachmentMetadata } from "../../shared/user-message-attachments";
+import { textBeforeAttachedFiles } from "../../shared/attachment-summary";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -219,6 +220,7 @@ import {
   LLMImageContent,
   LLMImageMimeType,
   LLMSystemBlock,
+  LLMTextContent,
   PromptCacheProviderFamily,
   StreamProgressCallback,
 } from "./llm";
@@ -273,6 +275,11 @@ import { getCustomSkillLoader } from "./custom-skill-loader";
 import { MemoryService } from "../memory/MemoryService";
 import { taskDisablesMemoryCapture } from "../memory/no-memory-directive";
 import { runWithMemoryRepoAccess } from "../security/memory-repo-access";
+import {
+  resolveSkillPackReadGrant,
+  runWithSkillPackReadAccess,
+  type SkillPackReadGrant,
+} from "../security/skill-pack-read-access";
 import { DurableContextService } from "../memory/DurableContextService";
 import { PlaybookService, type PlaybookCaptureResult } from "../memory/PlaybookService";
 import { SessionRecallService } from "../memory/SessionRecallService";
@@ -445,9 +452,12 @@ import {
   hasPdfVisualIntent,
   hasNativeDesktopGuiIntent,
   isMcpComputerUseRuntime,
+  isUserIntentOnlyTool,
   normalizeExecutionMode,
   normalizeTaskDomain,
 } from "./tool-policy-engine";
+import { userTypedFollowUpText } from "./follow-up-provenance";
+import { isTaskPromptFromUser } from "./task-prompt-provenance";
 
 const DEFAULT_FAILOVER_PRIMARY_RETRY_COOLDOWN_MS = 60_000;
 const VALID_LLM_PROVIDER_TYPES = new Set<string>(LLM_PROVIDER_TYPES as readonly string[]);
@@ -468,7 +478,13 @@ type TaskExecutorFollowUpOptions = Pick<
   | "inReplyToMessageId"
   | "inReplyToTaskId"
   | "surfaceOrigin"
+  | "textProvenance"
 > & {
+  /**
+   * The part of the message the user typed, when the daemon added text they did not type
+   * (open annotations quote the result they point at). Unset: the whole message.
+   */
+  typedText?: string;
   /** Called after transcript and queue state are durably persisted. */
   onAccepted?: () => void | Promise<void>;
   /** Called once the follow-up is admitted and the task has started processing it. */
@@ -614,6 +630,8 @@ import {
   extractArtifactPathAlternativeGroups,
   hasArtifactExtensionMention,
   isReadOnlyConstraintOnlyStep,
+  isReadOnlyInspectionStep,
+  stripNegatedClauses,
   type StepContractEnforcementLevel,
   type StepContractMode,
 } from "./step-contract";
@@ -1243,6 +1261,22 @@ export class TaskExecutor {
   } | null = null;
   private readonly promptSectionCache = new Map<string, string | null>();
   private lastUserMessage: string;
+  /**
+   * The words the user typed in the latest message to this task, or "" when that message was
+   * injected: an automation, heartbeat, trigger or webhook follow-up, another agent's message,
+   * an update forwarded from another task, page code or an answer button. Set from the
+   * message's textProvenance (follow-up-provenance.ts), never from what the text says. Not
+   * saved in snapshots, so after a restart only the task's own words (userAuthoredTaskText)
+   * count until the user writes again. Read by getUserAuthoredToolIntentText.
+   */
+  private lastUserTypedText = "";
+  /**
+   * The task's title and prompt as the user wrote them, captured when the executor starts, or
+   * "" when they are not marked as typed by the user (Task.promptProvenance). Not read from
+   * task.prompt later: a follow-up that resumes a paused task is appended there as
+   * "USER UPDATE", whoever sent it.
+   */
+  private userAuthoredTaskText = "";
   /**
    * The task's swarm while its `swarm` layer is on and it is not a verifier (phase 5 §2):
    * swarm_note is offered and may cross the plan gate. Updated with every policy decision.
@@ -5481,6 +5515,8 @@ export class TaskExecutor {
   /**
    * Replace embedded image blocks in conversation history with compact placeholders.
    * This preserves conversational context while dropping base64 payloads from in-memory history.
+   * Screenshots attached to tool results (`companion_user_content`) are compacted too, since
+   * some providers re-send them from the tool result on every turn.
    */
   private sanitizeConversationMessages(messages: LLMMessage[]): LLMMessage[] {
     return messages.map((message) => {
@@ -5488,34 +5524,50 @@ export class TaskExecutor {
         return message;
       }
 
-      const compactedContent = (message.content as Array<LLMContent>).map((block) => {
-        if (!isLLMImageContent(block)) {
-          return block;
-        }
+      const compactedContent = (message.content as Array<LLMContent | LLMToolResult>).map(
+        (block) => {
+          if (block.type === "tool_result") {
+            if (!Array.isArray(block.companion_user_content)) {
+              return block;
+            }
+            return {
+              ...block,
+              companion_user_content: block.companion_user_content.map((companion) =>
+                isLLMImageContent(companion) ? this.compactImageBlock(companion) : companion,
+              ),
+            };
+          }
 
-        const mimeType =
-          typeof block.mimeType === "string" && block.mimeType.length > 0
-            ? block.mimeType
-            : "unknown";
-        const approxSizeBytes =
-          typeof block.originalSizeBytes === "number" && Number.isFinite(block.originalSizeBytes)
-            ? block.originalSizeBytes
-            : typeof block.data === "string" && block.data.length > 0
-              ? Math.ceil((block.data.length * 3) / 4)
-              : null;
-        const sizeText = approxSizeBytes ? ` (~${Math.ceil(approxSizeBytes / 1024)}KB)` : "";
+          if (!isLLMImageContent(block)) {
+            return block;
+          }
 
-        return {
-          type: "text" as const,
-          text: `[Image attachment removed from conversation memory: ${mimeType}${sizeText}]`,
-        };
-      });
+          return this.compactImageBlock(block);
+        },
+      );
 
       return {
         ...message,
         content: compactedContent as LLMContent[],
       };
     });
+  }
+
+  private compactImageBlock(block: LLMImageContent): LLMTextContent {
+    const mimeType =
+      typeof block.mimeType === "string" && block.mimeType.length > 0 ? block.mimeType : "unknown";
+    const approxSizeBytes =
+      typeof block.originalSizeBytes === "number" && Number.isFinite(block.originalSizeBytes)
+        ? block.originalSizeBytes
+        : typeof block.data === "string" && block.data.length > 0
+          ? Math.ceil((block.data.length * 3) / 4)
+          : null;
+    const sizeText = approxSizeBytes ? ` (~${Math.ceil(approxSizeBytes / 1024)}KB)` : "";
+
+    return {
+      type: "text" as const,
+      text: `[Image attachment removed from conversation memory: ${mimeType}${sizeText}]`,
+    };
   }
 
   private sanitizeConversationHistoryForRuntime(messages: LLMMessage[]): LLMMessage[] {
@@ -8629,6 +8681,7 @@ ${transcript}
     this.guardrailPhaseBEnabled = isFeatureEnabled("COWORK_GUARDRAIL_PHASE_B", true);
     const canonicalPrompt = this.getContractPrompt();
     this.lastUserMessage = canonicalPrompt;
+    this.captureUserAuthoredTaskText();
     this.getSessionRuntime().setRecoveryRequestActive(this.isRecoveryIntent(this.lastUserMessage));
     this.capabilityUpgradeRequested = this.isCapabilityUpgradeIntent(this.lastUserMessage);
     this.requiresTestRun = this.detectTestRequirement(`${task.title}\n${canonicalPrompt}`);
@@ -11852,6 +11905,12 @@ ${transcript}
             ?.botFile(this.task.assignedAgentRoleId)
             .catch(() => null)
         : null;
+    // File tools read an applied directory-backed skill's own plugin pack, read-only.
+    const skillPackReadGrants = this.getAppliedSkillPackReadGrants();
+    const runInToolFileScopes = <T>(fn: () => T): T =>
+      runWithMemoryRepoAccess({ readAllowed: memoryRepoReadAllowed, swarmPrefix, botFile }, () =>
+        runWithSkillPackReadAccess(skillPackReadGrants, fn),
+      );
 
     // Written before dispatch, so a timeout, lost transport, stop or crash leaves a record of a
     // call whose effect is unknown instead of nothing.
@@ -11864,7 +11923,7 @@ ${transcript}
     );
     try {
       const coordinated = await withTimeout(
-        runWithMemoryRepoAccess({ readAllowed: memoryRepoReadAllowed, swarmPrefix, botFile }, () =>
+        runInToolFileScopes(() =>
           this.toolExecutionCoordinator.executeTool(
             toolName,
             input as Any,
@@ -14497,17 +14556,24 @@ ${transcript}
       isReadOnlyConstraintOnlyStep(descriptionRaw) ||
       this.promptHasReadOnlyConstraint(`${this.task?.title || ""}\n${this.getContractPrompt()}`);
     const artifactPreparationDeferred = this.isArtifactPreparationDeferredToLaterWrite(step);
+    // "Read X", "Inspect A, B, and C": the files a read-only step names are its
+    // inputs. Forcing a write there made the model touch them or bootstrap a stub.
+    // A tool the step names explicitly (`edit_file`) still applies.
+    const readOnlyInspectionStep =
+      !verificationStep &&
+      isReadOnlyInspectionStep(descriptionRaw) &&
+      !this.isSinglePlanStepForTaskArtifactOutput(step);
+    if (readOnlyInspectionStep) {
+      for (const name of ["write_file", "edit_file", "create_directory"])
+        if (!new RegExp(`\\b${name}\\b`).test(description)) requiredTools.delete(name);
+    }
     // Mutation constraints such as "Do not create or modify the target before
     // the wait" describe when a write must happen, not a separate edit action.
     // Keep those negated clauses out of the direct-edit tool inference so a
     // shell write is not followed by a spurious required edit_file call.
-    const positiveMutationDescription = description.replace(
-      // Continue through dots inside filenames ("package.json") so the
-      // extension of a protected file does not leak into the positive text.
-      /\b(?:do\s+not|don't|must\s+not|should\s+not|never|no\s+need\s+to|without)\b(?:[^,.;!?\n]|\.(?=[A-Za-z0-9_/-]))*/gi,
-      " ",
-    );
+    const positiveMutationDescription = stripNegatedClauses(description);
     const applicationWriteIntent =
+      !readOnlyInspectionStep &&
       !nativePresentation &&
       !nativeUiOperation &&
       hasNativeApplicationOutputIntent(this.getContractPrompt()) &&
@@ -14527,7 +14593,7 @@ ${transcript}
       }
     }
     const requiresArtifactEvidence =
-      hasReadOnlyConstraint || nativeUiOperation
+      hasReadOnlyConstraint || nativeUiOperation || readOnlyInspectionStep
         ? false
         : artifactPreparationDeferred
           ? false
@@ -14538,8 +14604,9 @@ ${transcript}
     const artifactWriteRequired = artifactContractMode === "artifact_write_required";
     const softwareArtifactExtensionMentioned = hasArtifactExtensionMention(description);
     const scaffoldIntent = descriptionHasScaffoldIntent(description);
-    const hasWriteIntent = descriptionHasWriteIntent(description);
+    const hasWriteIntent = !readOnlyInspectionStep && descriptionHasWriteIntent(description);
     const directFileMutationIntent =
+      !readOnlyInspectionStep &&
       !nativePresentation &&
       !nativeUiOperation &&
       !applicationWriteIntent &&
@@ -14771,6 +14838,7 @@ ${transcript}
     const inferredCues = {
       hasWriteIntent: descriptionHasWriteIntent(description),
       hasReadOnlyIntent: descriptionHasReadOnlyIntent(description),
+      readOnlyInspection: isReadOnlyInspectionStep(description),
       hasSummaryCue: descriptionHasSummaryCue(description),
       scaffoldIntent: descriptionHasScaffoldIntent(description),
       hasArtifactCue: descriptionHasArtifactCue(description),
@@ -15916,6 +15984,25 @@ ${transcript}
       sections.push(appliedSkillContext);
     }
     return sections.filter((section) => String(section || "").trim().length > 0).join("\n\n");
+  }
+
+  /**
+   * Read grants for the plugin packs of this task's applied directory-backed skills. Resolved
+   * against the skill loader on every tool call, so a pack disabled or shadowed since the
+   * skill was applied no longer grants anything.
+   */
+  private getAppliedSkillPackReadGrants(): SkillPackReadGrant[] {
+    const appliedSkills = Array.isArray(this.appliedSkills) ? this.appliedSkills : [];
+    if (appliedSkills.length === 0) return [];
+    try {
+      const loader = getCustomSkillLoader();
+      return appliedSkills
+        .map((application) => resolveSkillPackReadGrant(loader.getSkill(application.skillId)))
+        .filter((grant): grant is SkillPackReadGrant => grant !== null);
+    } catch {
+      // No loader, no grant: the pack stays behind the ordinary boundary.
+      return [];
+    }
   }
 
   private getAppliedSkillApplication(skillId: string): SkillApplication | null {
@@ -18749,11 +18836,52 @@ ${transcript}
     });
   }
 
+  /** Sets userAuthoredTaskText from the task as it is now; the constructor calls it once. */
+  private captureUserAuthoredTaskText(): void {
+    // Positive provenance only (task-prompt-provenance.ts): the task must be marked as typed by
+    // the user where it was created. Mail commitments, planner issues, orchestration and
+    // workflow steps and remote agents create "manual"/"api" tasks from text the user did not
+    // write, so excluding known automation sources let them through. Tasks created before the
+    // marker existed are unmarked and do not count; the user's next typed message still does.
+    // The composer appends the text of attached files to a typed prompt; a document's words are
+    // not the user's, so everything from the attachment block on is dropped.
+    this.userAuthoredTaskText = isTaskPromptFromUser(this.task)
+      ? [this.task.title, this.getContractPrompt()]
+          .map((part) => textBeforeAttachedFiles(String(part || "")).trim())
+          .filter(Boolean)
+          .join("\n")
+      : "";
+  }
+
+  /**
+   * The user's own words for this task, for the tool lanes only the user may open (the admin
+   * lane: persona, behavioral rules, heartbeat, integration setup). Unlike the task text the
+   * adaptive filter reads, it leaves out the agent's last output, the current plan step, and
+   * every follow-up the user did not type (lastUserTypedText).
+   */
+  private getUserAuthoredToolIntentText(): string {
+    return [this.userAuthoredTaskText, this.lastUserTypedText]
+      .map((part) => String(part || "").trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+
   private applyAdaptiveToolAvailabilityFilter<
     T extends { name: string; runtime?: RuntimeToolMetadata },
   >(tools: T[]): T[] {
     if (tools.length === 0) return tools;
-    if (this.hasTaskToolAllowlistConfigured()) return tools;
+    if (this.hasTaskToolAllowlistConfigured()) {
+      // An allowlist (the caller's, or one a skill supplies) says which tools the task may use,
+      // not that the user asked for the admin lane: its admin tools still need the user's words.
+      const userText = this.getUserAuthoredToolIntentText();
+      const policyContext = this.getToolPolicyContext();
+      return tools.filter(
+        (tool) =>
+          !isUserIntentOnlyTool(tool.name, tool.runtime) ||
+          evaluateToolAvailability(tool.name, { ...policyContext, userText }, tool.runtime)
+            .decision === "allow",
+      );
+    }
 
     const currentStep =
       this.currentStepId && this.plan?.steps
@@ -18771,7 +18899,11 @@ ${transcript}
       .join("\n")
       .trim();
 
-    if (!taskText) return tools;
+    // Both fallbacks below keep tools the filter did not pick, but never the admin lane: with
+    // no user text there is nothing that could have asked for it.
+    const withoutUserIntentOnlyTools = () =>
+      tools.filter((tool) => !isUserIntentOnlyTool(tool.name, tool.runtime));
+    if (!taskText) return withoutUserIntentOnlyTools();
 
     const usageCounts =
       this.toolUsageCounts instanceof Map ? this.toolUsageCounts : new Map<string, number>();
@@ -18779,6 +18911,7 @@ ${transcript}
       .filter(([, count]) => count > 0)
       .map(([name]) => name);
     const requiredTools = stepContract ? Array.from(stepContract.requiredTools.values()) : [];
+    const userText = this.getUserAuthoredToolIntentText();
     const policyContext = this.getToolPolicyContext();
     let deferredCount = 0;
     const filtered = tools.filter((tool) => {
@@ -18790,6 +18923,7 @@ ${transcript}
         {
           ...policyContext,
           taskText,
+          userText,
           recentlyUsedTools,
           requiredTools,
         },
@@ -18808,7 +18942,7 @@ ${transcript}
       });
     }
 
-    return filtered.length > 0 ? filtered : tools;
+    return filtered.length > 0 ? filtered : withoutUserIntentOnlyTools();
   }
 
   private getEffectiveExecutionModeSource(): ExecutionModeSource {
@@ -22932,7 +23066,9 @@ You are continuing a previous conversation. The context from the previous conver
       const resolved = path.isAbsolute(entry.candidate)
         ? path.resolve(entry.candidate)
         : path.resolve(this.workspace.path, entry.candidate);
-      if (path.isAbsolute(entry.candidate) && !this.isPathInsideWorkspace(resolved)) {
+      // Never write a stub outside the workspace, whether the path is absolute
+      // or escapes it ("../notes.md").
+      if (!this.isPathInsideWorkspace(resolved)) {
         continue;
       }
       const likelyDirectory = this.isLikelyDirectoryMutationCandidate(entry.candidate);
@@ -41118,6 +41254,7 @@ Return ONLY a JSON object:
     inReplyToMessageId?: TaskFollowUpInput["inReplyToMessageId"],
     inReplyToTaskId?: TaskFollowUpInput["inReplyToTaskId"],
     surfaceOrigin?: TaskFollowUpInput["surfaceOrigin"],
+    textProvenance?: TaskFollowUpInput["textProvenance"],
   ): void {
     if (this.shutdownRequested) {
       throw new Error("Task executor is shutting down; follow-up was not queued.");
@@ -41137,6 +41274,7 @@ Return ONLY a JSON object:
       inReplyToMessageId,
       inReplyToTaskId,
       surfaceOrigin,
+      textProvenance,
     );
     logger.info(
       `${this.logTag} Follow-up queued for injection into running execution (queue size: ${this.pendingFollowUps.length})`,
@@ -41894,7 +42032,9 @@ Return ONLY a JSON object:
         | "inReplyToMessageId"
         | "inReplyToTaskId"
         | "surfaceOrigin"
-      >;
+        | "textProvenance"
+      > &
+        Pick<TaskExecutorFollowUpOptions, "typedText">;
       onAccepted?: () => void | Promise<void>;
       onExecutionAccepted?: () => void | Promise<void>;
       onProviderDispatchStarted?: () => void | Promise<void>;
@@ -42009,6 +42149,13 @@ Return ONLY a JSON object:
     this.waitingForUserInput = false;
     this.paused = false;
     this.lastUserMessage = message;
+    // Every follow-up arrives here looking like a user message: automation and heartbeat
+    // prompts, another agent's handoff, answer buttons and page code included. Only a message
+    // its send path marked "user_typed" counts as the user's words for the admin lane.
+    this.lastUserTypedText = userTypedFollowUpText(
+      opts?.messageContext?.typedText ?? message,
+      opts?.messageContext,
+    );
     // Resuming a paused plan continues the same turn, so per-turn budgets such
     // as "use write_file exactly once" must survive the user's reply.
     if (!recoveredFromTurnLimit && !shouldResumeAfterFollowup) {

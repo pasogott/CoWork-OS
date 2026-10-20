@@ -20,7 +20,10 @@ import {
   type ResponsibilityActionReviewOutcome,
   type ResponsibilityActionReviewPayload,
 } from "../automation/responsibility-task-policy";
-import { RESPONSIBILITY_ACTION_REVIEW_DECISION_QUESTION_ID } from "../../shared/approval-draft-presentation";
+import {
+  ASSISTANT_APPROVAL_QUESTION_ID,
+  RESPONSIBILITY_ACTION_REVIEW_DECISION_QUESTION_ID,
+} from "../../shared/approval-draft-presentation";
 import { isCodexComputerUseServer } from "../mcp/codex-computer-use";
 import { MCPSettingsManager } from "../mcp/settings";
 import { CanvasManager } from "../canvas/canvas-manager";
@@ -136,6 +139,8 @@ import {
 } from "./llm/usage-telemetry";
 import type { LlmCallRow } from "../database/llm-call-events";
 import { TaskMutationLedger } from "./task-mutation-ledger";
+import { USER_TYPED_FOLLOW_UP } from "./follow-up-provenance";
+import { USER_TYPED_TASK_PROMPT, forkedTaskPromptProvenance } from "./task-prompt-provenance";
 import { LLMProviderFactory } from "./llm/provider-factory";
 import { createConfiguredJevProvider, isJevActiveHarnessEnabled } from "./jev";
 import { routeModelWithJev } from "./jev/model-routing";
@@ -185,6 +190,7 @@ import {
   AnnotationCreateInput,
   QuotedAssistantMessage,
   TaskFollowUpInput,
+  TaskPromptProvenance,
   AgentMessageDeliveryStatus,
   AgentMessageSendResult,
   AgentTeamRun,
@@ -745,6 +751,7 @@ type DaemonFollowUpOptions = Pick<
   | "inReplyToMessageId"
   | "inReplyToTaskId"
   | "surfaceOrigin"
+  | "textProvenance"
 > & {
   /** Return to the renderer once the follow-up is durably admitted, not after provider completion. */
   returnOnAccepted?: boolean;
@@ -4479,6 +4486,12 @@ export class AgentDaemon extends EventEmitter {
     fromEventId?: string;
     sideChat?: boolean;
     initialMessage?: string;
+    /**
+     * True only when the owner asked for the fork (the desktop app, the verified owner on a
+     * channel): the fork's title carries the caller's branch label, so only then may it keep
+     * the source task's Task.promptProvenance.
+     */
+    keepPromptProvenance?: boolean;
   }): Promise<Task> {
     const sourceTask = this.taskRepo.findById(params.taskId);
     if (!sourceTask) {
@@ -4507,6 +4520,13 @@ export class AgentDaemon extends EventEmitter {
       sourceTask.userPrompt ||
       sourceTask.rawPrompt ||
       sourceTask.prompt;
+    // The fork's title and prompt are the user's only when the owner asked for the fork and it
+    // reuses the source task's own prompt, which the user wrote; a message picked from the
+    // history may have been injected.
+    const forkProvenance = forkedTaskPromptProvenance(
+      sourceTask,
+      params.keepPromptProvenance === true && !explicitPrompt && !forkHistory.prefillPrompt,
+    );
 
     const sideChatAgentConfig: AgentConfig | undefined = params.sideChat
       ? {
@@ -4536,6 +4556,7 @@ export class AgentDaemon extends EventEmitter {
       workspaceId: sourceTask.workspaceId,
       agentConfig: sideChatAgentConfig,
       source: params.sideChat ? "side_chat" : sourceTask.source || "manual",
+      ...forkProvenance,
       taskOverrides: {
         sessionId: crypto.randomUUID(),
         branchFromTaskId: sourceTask.id,
@@ -4562,7 +4583,14 @@ export class AgentDaemon extends EventEmitter {
     });
     this.logTaskIntentRouted(forkedTask.id, derived);
     if (params.sideChat && initialMessage) {
-      void this.sendMessage(forkedTask.id, initialMessage).catch((error) => {
+      // The user typed the side chat's first message in the desktop app.
+      void this.sendMessage(
+        forkedTask.id,
+        initialMessage,
+        undefined,
+        undefined,
+        USER_TYPED_FOLLOW_UP,
+      ).catch((error) => {
         log.error(`[AgentDaemon] Failed to start sidechat ${forkedTask.id}:`, error);
         this.logEvent(forkedTask.id, "log", {
           message: "Side conversation failed to start",
@@ -4884,6 +4912,8 @@ export class AgentDaemon extends EventEmitter {
     budgetCost?: number;
     source?: Task["source"];
     taskOverrides?: Partial<Task>;
+    /** Only for a title and prompt a person typed; see Task.promptProvenance. */
+    promptProvenance?: TaskPromptProvenance;
     autoStart?: boolean;
     graphAdmission?: GraphTaskAdmission;
   }): Promise<Task> {
@@ -4913,6 +4943,8 @@ export class AgentDaemon extends EventEmitter {
     source?: Task["source"];
     taskOverrides?: Partial<Task>;
     boardColumn?: Task["boardColumn"];
+    /** Only for a title and prompt a person typed; see Task.promptProvenance. */
+    promptProvenance?: TaskPromptProvenance;
     requestIdentity?: unknown;
     capturedAttachments?: QueuedAttachmentBytes[];
     autoStart?: boolean;
@@ -5077,6 +5109,7 @@ export class AgentDaemon extends EventEmitter {
     budgetCost?: number;
     source?: Task["source"];
     taskOverrides?: Partial<Task>;
+    promptProvenance?: TaskPromptProvenance;
     graphAdmission?: GraphTaskAdmission;
   }) {
     const { input, derived } = this.prepareTaskCreation(params);
@@ -5108,6 +5141,7 @@ export class AgentDaemon extends EventEmitter {
     source?: Task["source"];
     taskOverrides?: Partial<Task>;
     boardColumn?: Task["boardColumn"];
+    promptProvenance?: TaskPromptProvenance;
   }) {
     const botTeamAgentConfig = normalizeBotConversationAgentConfig(params.agentConfig);
     const taskAgentConfig = applyDefaultAccessProfile(
@@ -5159,6 +5193,10 @@ export class AgentDaemon extends EventEmitter {
       ...safeTaskOverrides,
       ...(params.boardColumn ? { boardColumn: params.boardColumn } : {}),
       ...(sessionId ? { sessionId } : {}),
+      // Only the caller's explicit argument marks the prompt as typed: neither taskOverrides
+      // (TASK_OVERRIDE_ALLOWLIST) nor agentConfig can carry it, so a copied config or a
+      // remote client's overrides cannot make someone else's text count as the user's.
+      ...(params.promptProvenance === "user_typed" ? USER_TYPED_TASK_PROMPT : {}),
       resumeStrategy,
     };
     return { input, derived };
@@ -8798,7 +8836,8 @@ export class AgentDaemon extends EventEmitter {
       `Reply to your permission request (the operation was not run): ${reply}`,
       undefined,
       undefined,
-      { deliveryMode: "follow_up", messageSource: "user" },
+      // The person answering this task's approval card typed the reply.
+      { deliveryMode: "follow_up", messageSource: "user", ...USER_TYPED_FOLLOW_UP },
     ).catch((error) => {
       log.warn(`Could not deliver the approval reply to task ${taskId}:`, error);
     });
@@ -10052,6 +10091,25 @@ export class AgentDaemon extends EventEmitter {
     }
 
     try {
+      const findLinkedInputId = (this.inputRequestRepo as Any)?.findLinkedInputId;
+      const linkedInputId: string | undefined =
+        typeof findLinkedInputId === "function"
+          ? await findLinkedInputId.call(this.inputRequestRepo, approvalId)
+          : undefined;
+      if (linkedInputId) {
+        const status = await this.respondToApprovalThroughLinkedInput(
+          approvalId,
+          linkedInputId,
+          requestedAction,
+          attribution,
+          channelResolutionGuard,
+        );
+        // A refused answer changes nothing; a corrected retry must still reach the card.
+        if (status === "handled")
+          approvalIdempotency.complete(idempotencyKey, { success: true, status });
+        else approvalIdempotency.remove(idempotencyKey);
+        return status;
+      }
       const pending = this.pendingApprovals.get(approvalId);
       if (pending && !pending.resolved) {
         const approvalForDecision: ApprovalRequest =
@@ -10391,6 +10449,78 @@ export class AgentDaemon extends EventEmitter {
       approvalIdempotency.fail(idempotencyKey, error);
       throw error;
     }
+  }
+
+  /**
+   * An inline approval keeps its approval row for queue surfaces (`approval.list`,
+   * `cowork approvals`), but the tool waits on the linked input card. Answer that card so the
+   * waiter's own validation records the decision. The restart-recovery path would record a grant
+   * the waiting tool never sees, and the card would then time out as a denial.
+   */
+  private async respondToApprovalThroughLinkedInput(
+    approvalId: string,
+    inputId: string,
+    action: ApprovalResponseAction,
+    attribution?: SessionActionAttribution,
+    channelResolutionGuard?: ChannelDecisionResolutionGuard,
+  ): Promise<"handled" | "duplicate" | "not_found" | "in_progress"> {
+    // Channels answer only the approvals they displayed; inline cards are never sent to one.
+    if (channelResolutionGuard) return "not_found";
+    const [approval, request, binding] = await Promise.all([
+      this.approvalRepo.findById(approvalId),
+      this.inputRequestRepo.findById(inputId),
+      this.inputRequestRepo.getApprovalBinding(inputId),
+    ]);
+    // A card answered, dismissed or timed out elsewhere decided this approval already.
+    if (
+      !approval ||
+      !request ||
+      binding?.approvalId !== approvalId ||
+      binding.taskId !== approval.taskId ||
+      request.taskId !== approval.taskId ||
+      request.status !== "pending" ||
+      approval.status !== "pending" ||
+      binding.revisionHash !== approvalRequestRevisionHash(approval)
+    )
+      return "not_found";
+    const liveWaiter = this.pendingInputRequests.get(inputId);
+    // Without a waiter only a reviewed write can resume (from its card); any other card is stale.
+    if (
+      (!liveWaiter || liveWaiter.resolved) &&
+      !AgentDaemon.isResponsibilityActionReviewApproval(approval)
+    )
+      return "not_found";
+    const question = request.questions.find(
+      (candidate) =>
+        candidate.id === ASSISTANT_APPROVAL_QUESTION_ID ||
+        candidate.id === RESPONSIBILITY_ACTION_REVIEW_DECISION_QUESTION_ID,
+    );
+    const allow = action.startsWith("allow_");
+    // The card offers one allow scope; a broader requested scope is answered with it.
+    const option = question?.options?.find((candidate) =>
+      candidate.label
+        .trim()
+        .toLowerCase()
+        .startsWith(allow ? "allow" : "deny"),
+    );
+    if (!question || !option) return "not_found";
+    const { status } = await this.respondToInputRequest({
+      requestId: inputId,
+      status: "submitted",
+      answers: { [question.id]: { optionLabel: option.label } },
+    });
+    if (status === "handled") {
+      this.logEvent(approval.taskId, "log", {
+        type: "approval_response",
+        approvalId,
+        requestId: inputId,
+        action,
+        answer: option.label,
+        ...(attribution ? { decidedBy: attribution } : {}),
+      });
+    }
+    // "duplicate" means another answer won the card, not this one.
+    return status === "duplicate" ? "not_found" : status;
   }
 
   /**
@@ -17416,6 +17546,9 @@ export class AgentDaemon extends EventEmitter {
         effectiveOptions?.inReplyToMessageId,
         effectiveOptions?.inReplyToTaskId,
         effectiveOptions?.surfaceOrigin,
+        // The queued item keeps only the text with annotation context added, which quotes
+        // result text the user did not type; such an item does not carry their provenance.
+        effectiveMessage === message ? effectiveOptions?.textProvenance : undefined,
       );
       // queueFollowUp snapshots the pending item; include that row in the return
       // boundary so the accepted queue item survives an immediate restart.
@@ -17641,6 +17774,9 @@ export class AgentDaemon extends EventEmitter {
           inReplyToMessageId: effectiveOptions?.inReplyToMessageId,
           inReplyToTaskId: effectiveOptions?.inReplyToTaskId,
           surfaceOrigin: effectiveOptions?.surfaceOrigin,
+          textProvenance: effectiveOptions?.textProvenance,
+          // Open annotations add the result text they point at, which the user did not type.
+          typedText: message,
           onAccepted: onAgentMessageAccepted ?? onQueuedUserFollowUpAccepted,
           onProviderDispatchStarted: onQueuedUserFollowUpProviderDispatchStarted,
           onProviderDispatchCompleted: onQueuedUserFollowUpProviderDispatchCompleted,
@@ -19708,6 +19844,7 @@ export class AgentDaemon extends EventEmitter {
               senderLabel: followUp.senderLabel,
               inReplyToMessageId: followUp.inReplyToMessageId,
               inReplyToTaskId: followUp.inReplyToTaskId,
+              textProvenance: followUp.textProvenance,
               requestFingerprint: followUpMessageId
                 ? this.getDurableTaskFollowUpRequestFingerprint(taskId, followUpMessageId)
                 : undefined,

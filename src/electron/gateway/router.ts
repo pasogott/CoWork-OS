@@ -84,6 +84,7 @@ import {
 import { formatTimelineActivityLabel } from "../../shared/timeline-v2";
 import { DEFAULT_QUIRKS } from "../../shared/types";
 import { botIconText } from "../../shared/bot-mascots";
+import { CHANNEL_ATTACHMENTS_SAVED_HEADER } from "../../shared/attachment-summary";
 import { formatChatTranscriptForPrompt, prefetchTranscriptUsers } from "./chat-transcript";
 import { evaluateWorkspaceRouterRules } from "./router-rules";
 import { applyResearchChatRouting } from "./router-research-routing";
@@ -136,6 +137,8 @@ import {
 } from "./remote-command-registry";
 import { normalizeRemoteIncomingCommand } from "./remote-command-normalizer";
 import { gatewaySenderAgentConfig } from "./gateway-sender-identity";
+import { USER_TYPED_FOLLOW_UP } from "../agent/follow-up-provenance";
+import { USER_TYPED_TASK_PROMPT } from "../agent/task-prompt-provenance";
 import {
   createBackgroundKitPathGuard,
   evaluateConfinedInternalWrite,
@@ -1246,6 +1249,25 @@ export class MessageRouter {
         ownerUserIds: (channel?.config as Record<string, unknown> | undefined)?.ownerUserIds,
       },
     );
+  }
+
+  /**
+   * Follow-up provenance for a channel message. Only the verified owner's own words count as
+   * typed by the user (see gateway-sender-identity.ts); a paired or allowlisted contact and
+   * anyone in a group are someone else, and their text must not expose the admin-lane tools.
+   */
+  private async channelFollowUpProvenance(
+    adapter: ChannelAdapter,
+    message: IncomingMessage,
+    isGroup: boolean,
+  ): Promise<typeof USER_TYPED_FOLLOW_UP | undefined> {
+    const sender = this.gatewaySenderConfig(
+      adapter,
+      message,
+      isGroup,
+      await this.getChannelForAdapter(adapter),
+    );
+    return sender.gatewaySenderIsOwner === true ? USER_TYPED_FOLLOW_UP : undefined;
   }
 
   private async getChannelForAdapter(adapter: ChannelAdapter): Promise<Channel | undefined> {
@@ -6813,7 +6835,7 @@ export class MessageRouter {
     const savedAttachments = await this.persistInboundAttachments(adapter.type, message, workspace);
     if (savedAttachments.length > 0) {
       const lines: string[] = [];
-      lines.push("Attachments saved to workspace:");
+      lines.push(CHANNEL_ATTACHMENTS_SAVED_HEADER);
       for (const att of savedAttachments) {
         lines.push(`- ${att.type}: ${att.relPath}`);
       }
@@ -6893,7 +6915,13 @@ export class MessageRouter {
                 sessionGeneration: this.getRemoteSessionGeneration(sessionId),
               });
 
-              await this.agentDaemon.sendMessage(session!.taskId!, message.text);
+              await this.agentDaemon.sendMessage(
+                session!.taskId!,
+                message.text,
+                undefined,
+                undefined,
+                await this.channelFollowUpProvenance(adapter, message, contextType === "group"),
+              );
             } catch (error) {
               console.error("Error sending follow-up message:", error);
               await this.sendAdapterMessage(adapter, {
@@ -6960,12 +6988,22 @@ export class MessageRouter {
       (typeof routedChannel?.config?.defaultAgentRoleId === "string"
         ? routedChannel.config.defaultAgentRoleId
         : undefined);
+    const senderConfig = this.gatewaySenderConfig(
+      adapter,
+      message,
+      contextType === "group",
+      routedChannel,
+    );
 
     const task = await this.taskRepo.create({
       workspaceId: workspace.id,
       title: taskTitle,
       prompt: taskPrompt,
       status: "pending",
+      // Only the verified owner's own message is the user's prompt (gateway-sender-identity.ts);
+      // a paired contact or anyone in a group is someone else, and must not expose the
+      // admin-lane tools (Task.promptProvenance).
+      ...(senderConfig.gatewaySenderIsOwner === true ? USER_TYPED_TASK_PROMPT : {}),
       agentConfig: taskAgentConfigForCreation(
         {
           gatewayContext,
@@ -6975,7 +7013,7 @@ export class MessageRouter {
             ? { channelSpecializationId: securityContext.channelSpecialization.id }
             : {}),
           originChannel: adapter.type,
-          ...this.gatewaySenderConfig(adapter, message, contextType === "group", routedChannel),
+          ...senderConfig,
           ...(securityContext?.researchWorkflowPreset
             ? {
                 researchWorkflow: {
@@ -8047,6 +8085,8 @@ export class MessageRouter {
     lastChannelMessageId?: string;
     text: string;
     statusText?: string;
+    /** Set only when the verified owner typed `text` (channelFollowUpProvenance). */
+    provenance?: typeof USER_TYPED_FOLLOW_UP;
   }): Promise<void> {
     if (!this.agentDaemon) {
       await opts.adapter.sendMessage({
@@ -8087,7 +8127,7 @@ export class MessageRouter {
       });
     }
 
-    await this.agentDaemon.sendMessage(opts.taskId, trimmed);
+    await this.agentDaemon.sendMessage(opts.taskId, trimmed, undefined, undefined, opts.provenance);
   }
 
   private async sendCommandFollowupToCurrentTask(
@@ -8142,6 +8182,8 @@ export class MessageRouter {
       lastChannelMessageId: requester.lastChannelMessageId ?? message.messageId,
       statusText,
       text,
+      // /steer and /queue carry the sender's own words.
+      provenance: await this.channelFollowUpProvenance(adapter, message, message.isGroup === true),
     });
     return true;
   }
@@ -8745,6 +8787,11 @@ ${status.queuedCount > 0 ? `Queued task IDs: ${status.queuedTaskIds.join(", ")}`
     const forkedTask = await this.agentDaemon.forkTaskSession({
       taskId: session.taskId,
       branchLabel: args.join(" ").trim() || undefined,
+      // The label becomes part of the fork's title. Only the verified owner's fork keeps the
+      // source task's prompt provenance; a contact's words must not expose the admin-lane tools.
+      keepPromptProvenance:
+        (await this.channelFollowUpProvenance(adapter, message, message.isGroup === true)) !==
+        undefined,
     });
     await this.sessionManager.linkSessionToTask(sessionId, forkedTask.id);
     await adapter.sendMessage({
