@@ -257,7 +257,11 @@ import { sanitizeTimelinePayloadForStorage } from "./timeline-payload-sanitizer"
 import { deriveCanonicalTaskStatus, isTerminalTaskStatus } from "../../shared/task-status";
 import { createTimelineEmitter } from "./timeline-emitter";
 import { TaskExecutor } from "./executor";
-import { APPROVAL_REQUEST_TIMEOUT_MS } from "./approval-timeouts";
+import {
+  APPROVAL_GRANT_TTL_MS,
+  APPROVAL_REQUEST_TIMEOUT_MS,
+  formatApprovalWindow,
+} from "./approval-timeouts";
 import { approvalPromptsDisabled, canAnswerInlineApproval } from "./approval-policy";
 import { isExplicitExportConsentRequest } from "./visual-consent-policy";
 import { isHeadlessMode } from "../utils/runtime-mode";
@@ -844,7 +848,22 @@ const INLINE_APPROVAL_UNAVAILABLE_MESSAGE =
   "(CLI, headless, sub-agent, automated, or no-human-input task).";
 const INLINE_APPROVAL_TIMEOUT_MESSAGE =
   "Approval denied: no response to the approval request within " +
-  `${Math.round(APPROVAL_REQUEST_TIMEOUT_MS / 60_000)} minutes.`;
+  `${formatApprovalWindow(APPROVAL_REQUEST_TIMEOUT_MS)}.`;
+
+/** True when a bot runs this task, directly or through a task it delegated. */
+export function isBotOwnedTask(
+  taskRepo:
+    | { findById(id: string): Pick<Task, "assignedAgentRoleId" | "parentTaskId"> | undefined }
+    | undefined,
+  taskId: string,
+): boolean {
+  let task = taskRepo?.findById(taskId);
+  for (let depth = 0; task && depth < 16; depth += 1) {
+    if (task.assignedAgentRoleId) return true;
+    task = task.parentTaskId ? taskRepo?.findById(task.parentTaskId) : undefined;
+  }
+  return false;
+}
 
 /**
  * AgentDaemon is the core orchestrator that manages task execution
@@ -1056,6 +1075,7 @@ export class AgentDaemon extends EventEmitter {
       updateTaskStatus: (taskId: string, status: TaskStatus) =>
         this.taskRepo.update(taskId, { status }),
       onTaskTimeout: (taskId: string) => this.handleTaskTimeout(taskId),
+      isWaitingForUser: (taskId: string) => this.hasPendingUserDecisionForTask(taskId),
     });
     this.verificationOutcomeV2Enabled =
       parseBooleanEnv("COWORK_VERIFICATION_OUTCOME_V2", false) ||
@@ -8175,7 +8195,7 @@ export class AgentDaemon extends EventEmitter {
     if (!grant) return undefined;
     taskGrants.delete(trackingKey);
     if (taskGrants.size === 0) grants.delete(taskId);
-    if (Date.now() - grant.grantedAt > APPROVAL_REQUEST_TIMEOUT_MS || !grant.revisionHash)
+    if (Date.now() - grant.grantedAt > APPROVAL_GRANT_TTL_MS || !grant.revisionHash)
       return undefined;
     try {
       const approval = await this.approvalRepo.findById(grant.approvalId);
@@ -8701,7 +8721,8 @@ export class AgentDaemon extends EventEmitter {
         buildAssistantApprovalRequest(type, description, details),
         ...(approvalBinding ? [approvalBinding] : []),
       );
-      // An unanswered card must not block the tool forever. It times out like
+      // An unanswered card waits for the person (the tool and task deadlines are
+      // paused meanwhile), but not forever: after the answer window it lapses like
       // a queued approval and resolves as a denial.
       const waiters: Promise<InputRequestResponse>[] = [
         responsePromise,
@@ -9397,9 +9418,14 @@ export class AgentDaemon extends EventEmitter {
       (type !== "workspace_write" || !this.isValidResponsibilityActionReviewDetails(details))
     )
       return false;
-    const allowAutoApprove = isResponsibilityActionReview
-      ? false
-      : opts?.allowAutoApprove !== false;
+    // A bot's tasks often run unattended (gateway, heartbeat), so reaching a
+    // file outside its workspace always waits for a person: no allow rule,
+    // auto-reviewer or session-wide auto-approve answers for them.
+    const allowAutoApprove =
+      isResponsibilityActionReview ||
+      (type === "external_file_access" && isBotOwnedTask(this.taskRepo, taskId))
+        ? false
+        : opts?.allowAutoApprove !== false;
     const enrichedDetails =
       details && typeof details === "object" && !Array.isArray(details)
         ? { ...details }
@@ -9883,7 +9909,7 @@ export class AgentDaemon extends EventEmitter {
 
     // Wait for user response, then revalidate captured files at the resumption boundary.
     const approved = await new Promise<boolean>((resolve, reject) => {
-      // Timeout after 5 minutes
+      // Lapse once the answer window has passed without a decision.
       const timeoutHandle = setTimeout(() => {
         const pending = this.pendingApprovals.get(approval.id);
         if (pending && !pending.resolved) {
@@ -13538,7 +13564,7 @@ export class AgentDaemon extends EventEmitter {
     operation: AccessFilesystemOperation = "write",
   ): void {
     const key = this.getExternalFileApprovalKey(taskId, rawPath, operation);
-    if (key) this.externalFileApprovalGrants.set(key, Date.now() + 5 * 60 * 1000);
+    if (key) this.externalFileApprovalGrants.set(key, Date.now() + APPROVAL_GRANT_TTL_MS);
   }
 
   consumeExternalFileApproval(
