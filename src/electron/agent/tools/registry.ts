@@ -12,9 +12,9 @@ import {
   type BotWorksOn,
 } from "../../../shared/bot-computer";
 import {
-  BOT_CONTAINED_DENIED_TOOL_NAMES,
-  BOT_DESKTOP_HOST_SHELL_TOOL_NAMES,
-} from "../../../shared/bot-containment";
+  isToolBoundaryAllowedForContainedRun,
+  toolBoundaryClass,
+} from "../../../shared/tool-boundaries";
 import { AgentRoleRepository } from "../../agents/agent-repository-facades";
 import { ChannelStore } from "../../database/repositories";
 import {
@@ -1135,7 +1135,7 @@ export class ToolRegistry {
     }
 
     if (visibleToolSet.has("Skill")) {
-      const skillLoader = getCustomSkillLoader();
+      const skillLoader = this.getSkillLoader();
       const availableToolNames = new Set(orderedVisibleTools.map((tool) => tool.name));
       const resolvedSkillShortlistSize =
         typeof options?.skillShortlistSize === "number" &&
@@ -1499,27 +1499,74 @@ export class ToolRegistry {
     return isComputerToolBlocked(worksOn, kind);
   }
 
-  /** A run in a bot's own folder; fails closed if the task cannot be read. */
+  private botContainedCache: { value: boolean } | null = null;
+
+  /**
+   * A run in a bot's own folder; fails closed if the task cannot be read. Every tool the
+   * registry lists is checked against it, so the answer is cached: "contained" for good (a
+   * task never leaves its bot's folder), "not contained" only until the current synchronous
+   * pass ends, since the daemon can contain a running task at any time. A task that could not
+   * be read counts as contained for that pass only.
+   */
   private isBotContainedTask(): boolean {
+    if (this.botContainedCache) return this.botContainedCache.value;
+    let value: boolean;
+    let readContained = false;
     try {
-      return this.daemon.getTask?.(this.taskId)?.agentConfig?.botContained === true;
+      value = this.daemon.getTask?.(this.taskId)?.agentConfig?.botContained === true;
+      readContained = value;
+    } catch {
+      value = true;
+    }
+    const cache = { value };
+    this.botContainedCache = cache;
+    if (!readContained) {
+      queueMicrotask(() => {
+        if (this.botContainedCache === cache) this.botContainedCache = null;
+      });
+    }
+    return value;
+  }
+
+  /**
+   * Whether an MCP tool's connector runs as a program on this computer (stdio) rather than as
+   * a remote service. Fails closed: a tool whose server cannot be found counts as local.
+   */
+  private isLocalConnectorTool(toolName: string, prefix: string): boolean {
+    try {
+      const rawName = toolName.slice(prefix.length);
+      const id = MCPClientManager.getInstance().getServerIdForTool(rawName);
+      const server = MCPSettingsManager.loadSettings().servers?.find((entry) => entry.id === id);
+      return !server || server.transport === "stdio";
     } catch {
       return true;
     }
+  }
+
+  /**
+   * The boundary of a run in a bot's own folder, by the tool's class (shared/tool-boundaries):
+   * a tool nobody classified, or one that reaches past the bot's folder, is refused.
+   */
+  private isBlockedByBotContainment(toolName: string): boolean {
+    if (!this.isBotContainedTask()) return false;
+    let prefix = "mcp_";
+    try {
+      prefix = MCPSettingsManager.loadSettings().toolNamePrefix || prefix;
+    } catch {
+      // Settings unavailable: the default prefix still classifies connector tools.
+    }
+    const boundary = toolBoundaryClass(toolName, { mcpToolNamePrefix: prefix });
+    return !isToolBoundaryAllowedForContainedRun(boundary, {
+      worksOn: this.currentBotWorksOn(),
+      localConnector: boundary === "connector" && this.isLocalConnectorTool(toolName, prefix),
+    });
   }
 
   /** Denied by this task's own restrictions (agent config, skills or the task's wording). */
   private isDeniedByTaskRestrictions(toolName: string): boolean {
     if (this.denyAllTools || this.deniedTools.has(toolName)) return true;
     if (this.isBlockedByBotWorksOn(toolName)) return true;
-    if (BOT_CONTAINED_DENIED_TOOL_NAMES.has(toolName) && this.isBotContainedTask()) return true;
-    if (
-      BOT_DESKTOP_HOST_SHELL_TOOL_NAMES.has(toolName) &&
-      this.currentBotWorksOn() === "own_desktop" &&
-      this.isBotContainedTask()
-    ) {
-      return true;
-    }
+    if (this.isBlockedByBotContainment(toolName)) return true;
     if (TERMINAL_TAB_TOOL_NAMES.has(toolName) && this.isTerminalTabReadDenied()) return true;
     for (const groupName of this.deniedGroups) {
       const tools = TOOL_GROUPS[groupName] as readonly string[] | undefined;
@@ -2223,11 +2270,11 @@ export class ToolRegistry {
   ): Array<{ value: unknown; operation: "read" | "write" | "delete" }> {
     if (!SKILL_MUTATION_TOOLS.has(toolName)) return [];
 
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const candidates: Array<{ value: unknown; operation: "read" | "write" | "delete" }> = [];
     if (toolName === "skill_create") {
       const id = typeof input?.id === "string" ? input.id.trim() : "";
-      const directory = skillLoader.getWorkspaceSkillsDir() || skillLoader.getManagedSkillsDir();
+      const directory = this.getSkillCreationDir();
       if (id && /^[a-z0-9-]+$/.test(id)) {
         candidates.push({ value: path.join(directory, `${id}.json`), operation: "write" });
       }
@@ -2239,7 +2286,7 @@ export class ToolRegistry {
       if (sourceSkill?.filePath && sourceSkill.source !== "bundled") {
         candidates.push({ value: sourceSkill.filePath, operation: "read" });
       }
-      const directory = skillLoader.getWorkspaceSkillsDir() || skillLoader.getManagedSkillsDir();
+      const directory = this.getSkillCreationDir();
       if (newId && /^[a-z0-9-]+$/.test(newId)) {
         candidates.push({ value: path.join(directory, `${newId}.json`), operation: "write" });
       }
@@ -5223,7 +5270,7 @@ Channel Message Log (Local Gateway):
 - set_user_name: Store the user's name when they introduce themselves (e.g., "I'm Alice", "My name is Bob").`;
 
     // Add skills available through the Skill tool
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const availableToolNames = new Set(this.getTools().map((tool) => tool.name));
     const resolvedSkillShortlistSize =
       typeof options?.skillShortlistSize === "number" && Number.isFinite(options.skillShortlistSize)
@@ -6774,8 +6821,23 @@ ${skillDescriptions}`;
     return application;
   }
 
+  /** Skills as this task sees them: shared skills plus this workspace's `skills/` folder. */
+  private getSkillLoader() {
+    return getCustomSkillLoader().forWorkspace(this.workspace?.path);
+  }
+
+  /**
+   * Where skill_create and skill_duplicate save new skills: the shared loader's folder
+   * (the managed skills folder), so a skill the agent creates is available in every
+   * workspace as before. Workspace skills are saved through approved skill proposals.
+   */
+  private getSkillCreationDir(): string {
+    const sharedLoader = getCustomSkillLoader();
+    return sharedLoader.getWorkspaceSkillsDir() || sharedLoader.getManagedSkillsDir();
+  }
+
   private buildSkillRuntimeDescriptor(skill: CustomSkill) {
-    return getCustomSkillLoader().getRuntimeSkillDescriptor(skill);
+    return this.getSkillLoader().getRuntimeSkillDescriptor(skill);
   }
 
   private resolveSkillArgsToParameters(
@@ -6909,7 +6971,7 @@ ${skillDescriptions}`;
     const isManualInvocation = trigger === "slash";
     const isAutomaticInvocation = !isManualInvocation;
 
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     // A model that knows a skill only from its description often guesses the ID
     // ("unity-in-app-purchases" for "unity:implement-in-app-purchases"). When the guess
     // matches exactly one skill on every meaningful word, load that skill instead of failing.
@@ -7343,7 +7405,7 @@ ${skillDescriptions}`;
       return skill.invocation?.userInvocable !== false;
     }
 
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     try {
       const task = await this.daemon.getTaskById(this.taskId);
       const prompt =
@@ -7363,7 +7425,7 @@ ${skillDescriptions}`;
     include_disabled?: boolean;
   }): Promise<Any> {
     const { source = "all", include_disabled = true } = input;
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
 
     let skills = skillLoader.listSkills();
 
@@ -7412,7 +7474,7 @@ ${skillDescriptions}`;
    */
   private async executeSkillGet(input: { skill_id: string }): Promise<Any> {
     const { skill_id } = input;
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const skill = skillLoader.getSkill(skill_id);
 
     if (!skill) {
@@ -7471,7 +7533,7 @@ ${skillDescriptions}`;
     }>;
     enabled?: boolean;
   }): Promise<Any> {
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
 
     // Check if skill with this ID already exists
     const existing = skillLoader.getSkill(input.id);
@@ -7498,13 +7560,12 @@ ${skillDescriptions}`;
     }
 
     try {
-      const storageDirectory =
-        skillLoader.getWorkspaceSkillsDir() || skillLoader.getManagedSkillsDir();
+      const storageDirectory = this.getSkillCreationDir();
       await this.assertSkillFilesystemAccess(
         path.join(storageDirectory, `${input.id}.json`),
         "write",
       );
-      const newSkill = await skillLoader.createSkill({
+      const newSkill = await getCustomSkillLoader().createSkill({
         id: input.id,
         name: input.name,
         description: input.description,
@@ -7554,7 +7615,7 @@ ${skillDescriptions}`;
     };
   }): Promise<Any> {
     const { source_skill_id, new_id, modifications = {} } = input;
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
 
     // Get the source skill
     const sourceSkill = skillLoader.getSkill(source_skill_id);
@@ -7589,14 +7650,13 @@ ${skillDescriptions}`;
       if (sourceSkill.filePath && sourceSkill.source !== "bundled") {
         await this.assertSkillFilesystemAccess(sourceSkill.filePath, "read", "source skill");
       }
-      const storageDirectory =
-        skillLoader.getWorkspaceSkillsDir() || skillLoader.getManagedSkillsDir();
+      const storageDirectory = this.getSkillCreationDir();
       await this.assertSkillFilesystemAccess(
         path.join(storageDirectory, `${new_id}.json`),
         "write",
       );
       // Create the duplicated skill with modifications
-      const newSkill = await skillLoader.createSkill({
+      const newSkill = await getCustomSkillLoader().createSkill({
         id: new_id,
         name: modifications.name || `${sourceSkill.name} (Copy)`,
         description: modifications.description || sourceSkill.description,
@@ -7653,7 +7713,7 @@ ${skillDescriptions}`;
     };
   }): Promise<Any> {
     const { skill_id, updates } = input;
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
 
     const skill = skillLoader.getSkill(skill_id);
     if (!skill) {
@@ -7716,7 +7776,7 @@ ${skillDescriptions}`;
    */
   private async executeSkillDelete(input: { skill_id: string }): Promise<Any> {
     const { skill_id } = input;
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
 
     const skill = skillLoader.getSkill(skill_id);
     if (!skill) {
@@ -8037,11 +8097,11 @@ ${skillDescriptions}`;
         };
       }
 
-      const skillLoader = getCustomSkillLoader();
+      const skillLoader = this.getSkillLoader();
       const existing = skillLoader.getSkill(proposal.draftSkill.id);
-      // Approved proposals materialize in this workspace's skill folder, the one
-      // setWorkspaceSkillsDir points the loader at. The loader is switched only after the
-      // user approves, so a declined request leaves the loaded skill set unchanged.
+      // Approved proposals materialize in this workspace's skill folder, the one this
+      // task's workspace view of the loader reads. Nothing is written until the user
+      // approves, and other workspaces never see the saved skill.
       const materializationPath =
         existing?.filePath ||
         path.join(this.workspace.path, "skills", `${proposal.draftSkill.id}.json`);
@@ -8093,8 +8153,6 @@ ${skillDescriptions}`;
         };
       }
 
-      // Enforce workspace-scoped materialization for approved proposals.
-      skillLoader.setWorkspaceSkillsDir(this.workspace.path);
       let materializedSkill: Any;
       if (existing) {
         materializedSkill = await skillLoader.updateSkill(existing.id, {

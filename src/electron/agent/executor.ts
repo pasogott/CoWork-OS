@@ -140,7 +140,6 @@ function withSurfaceOriginNote(
 import { hasAnswerSurfaceBlock } from "../../shared/answer-surfaces/blocks";
 import { AnswerSurfaceStateStore } from "../answer-surfaces/AnswerSurfaceStateStore";
 import { buildUserMessageAttachmentMetadata } from "../../shared/user-message-attachments";
-import { textBeforeAttachedFiles } from "../../shared/attachment-summary";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -461,6 +460,7 @@ import {
   normalizeTaskDomain,
 } from "./tool-policy-engine";
 import { userTypedFollowUpText } from "./follow-up-provenance";
+import { userTypedWords } from "./user-typed-words";
 import { isTaskPromptFromUser } from "./task-prompt-provenance";
 
 const DEFAULT_FAILOVER_PRIMARY_RETRY_COOLDOWN_MS = 60_000;
@@ -1275,10 +1275,10 @@ export class TaskExecutor {
    */
   private lastUserTypedText = "";
   /**
-   * The task's title and prompt as the user wrote them, captured when the executor starts, or
-   * "" when they are not marked as typed by the user (Task.promptProvenance). Not read from
-   * task.prompt later: a follow-up that resumes a paused task is appended there as
-   * "USER UPDATE", whoever sent it.
+   * The task's prompt as the user wrote it, captured when the executor starts, or "" when it
+   * is not marked as typed by the user (Task.promptProvenance). Not read from task.prompt
+   * later: a follow-up that resumes a paused task is appended there as "USER UPDATE", whoever
+   * sent it. The title is left out: a model rewrites it (task-title-generator.ts).
    */
   private userAuthoredTaskText = "";
   /**
@@ -7209,6 +7209,11 @@ ${transcript}
     return this.workspace;
   }
 
+  /** Skills as this task sees them: shared skills plus this workspace's `skills/` folder. */
+  private getSkillLoader() {
+    return getCustomSkillLoader().forWorkspace(this.workspace?.path);
+  }
+
   get runtime(): SessionRuntime {
     return this.getSessionRuntime();
   }
@@ -8929,7 +8934,7 @@ ${transcript}
     // Hints are informational (injected into the planning prompt); the LLM still
     // decides whether to act on them. See selectSkillPlanningHints for the rule.
     try {
-      const skillLoader = getCustomSkillLoader();
+      const skillLoader = this.getSkillLoader();
       const availableToolNames = this.buildAvailableToolNameSet(this.getAvailableTools());
       if (!availableToolNames.has("Skill")) return "";
 
@@ -9616,6 +9621,7 @@ ${transcript}
     onIncorporated?: () => Promise<void>,
     onProviderDispatchCompleted?: () => Promise<void>,
     transcriptAlreadyContainsMessage = false,
+    onProviderDispatchStarted?: () => Promise<void>,
   ): Promise<void> {
     const personalityIdOverride = this.task.agentConfig?.personalityId;
     const contextMode = detectContextMode(
@@ -9700,6 +9706,9 @@ ${transcript}
       // incorporation must remain retryable without making a provider call.
       await onIncorporated();
     }
+    // Dispatch may be journaled only after the chat turn and acceptance receipt commit.
+    // Starting it in the caller refused still-started queued inputs before this callback ran.
+    await onProviderDispatchStarted?.();
 
     // A deterministic courtesy reply is only suitable for a social turn. An
     // empty answer to a substantive request must stay a visible failure.
@@ -16031,7 +16040,7 @@ ${transcript}
     const appliedSkills = Array.isArray(this.appliedSkills) ? this.appliedSkills : [];
     if (appliedSkills.length === 0) return [];
     try {
-      const loader = getCustomSkillLoader();
+      const loader = this.getSkillLoader();
       return appliedSkills
         .map((application) => resolveSkillPackReadGrant(loader.getSkill(application.skillId)))
         .filter((grant): grant is SkillPackReadGrant => grant !== null);
@@ -18879,13 +18888,12 @@ ${transcript}
     // workflow steps and remote agents create "manual"/"api" tasks from text the user did not
     // write, so excluding known automation sources let them through. Tasks created before the
     // marker existed are unmarked and do not count; the user's next typed message still does.
-    // The composer appends the text of attached files to a typed prompt; a document's words are
-    // not the user's, so everything from the attachment block on is dropped.
+    // The title does not count: the title generator replaces it with a model's summary of the
+    // whole prompt, attached files included, and an executor started after a restart reads that
+    // title from the store. Attached files' text and a channel's reply quote inside the prompt
+    // are not the user's words either (user-typed-words.ts).
     this.userAuthoredTaskText = isTaskPromptFromUser(this.task)
-      ? [this.task.title, this.getContractPrompt()]
-          .map((part) => textBeforeAttachedFiles(String(part || "")).trim())
-          .filter(Boolean)
-          .join("\n")
+      ? userTypedWords(this.getContractPrompt()).trim()
       : "";
   }
 
@@ -20870,7 +20878,7 @@ ${transcript}
     if (this.planningHintedSkillIds) return this.planningHintedSkillIds;
     // A task resumed after a restart skips planning; rebuild the hint from the same query.
     try {
-      const ranked = getCustomSkillLoader().rankModelInvocableSkillsForQuery(
+      const ranked = this.getSkillLoader().rankModelInvocableSkillsForQuery(
         this.getSkillRoutingQuery(),
         { includePrereqBlockedSkills: true },
       );
@@ -20888,7 +20896,7 @@ ${transcript}
     const normalizedText = this.normalizeSkillInvocationQuery(stepText);
     if (!normalizedText) return false;
     try {
-      const skillLoader = getCustomSkillLoader() as Any;
+      const skillLoader = this.getSkillLoader() as Any;
       if (typeof skillLoader?.listModelInvocableSkills !== "function") return false;
       const skills: Any[] = skillLoader.listModelInvocableSkills();
       return skills.some((skill) =>
@@ -29848,7 +29856,7 @@ You are continuing a previous conversation. The context from the previous conver
   private startNaturalLlmWikiObjectiveCollection(
     parsed: ReturnType<typeof parseNaturalLlmWikiPrompt>,
   ): void {
-    const skill = getCustomSkillLoader().getSkill("llm-wiki");
+    const skill = this.getSkillLoader().getSkill("llm-wiki");
     const parameters: Record<string, unknown> = {};
 
     if (parsed.mode && parsed.mode !== "auto") {
@@ -29950,7 +29958,7 @@ You are continuing a previous conversation. The context from the previous conver
   private getPendingSkillParameterDefinition(
     pending: PendingSkillParameterCollection,
   ): { skill: CustomSkill; parameter: SkillParameter } | null {
-    const skill = getCustomSkillLoader().getSkill(pending.skillId);
+    const skill = this.getSkillLoader().getSkill(pending.skillId);
     if (!skill) return null;
     const parameterName = pending.requiredParameterNames[pending.currentParameterIndex];
     if (!parameterName) return null;
@@ -30196,11 +30204,11 @@ You are continuing a previous conversation. The context from the previous conver
   }
 
   private resolveSkillSlashCommandName(commandName: string): string | null {
-    return resolveSkillSlashAlias(commandName);
+    return resolveSkillSlashAlias(commandName, this.getSkillLoader());
   }
 
   private getSkillForSlashCommand(skillId: string): CustomSkill | undefined {
-    return getCustomSkillLoader().getSkill(skillId);
+    return this.getSkillLoader().getSkill(skillId);
   }
 
   private escapeSkillInvocationPattern(text: string): string {
@@ -30393,7 +30401,7 @@ You are continuing a previous conversation. The context from the previous conver
       return null;
     }
 
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const candidates = skillLoader
       .listSkills()
       .filter((skill) => skill.type !== "guideline")
@@ -30498,7 +30506,7 @@ You are continuing a previous conversation. The context from the previous conver
     const normalizedSkillId = String(skillId || "").trim();
     if (!normalizedSkillId) return null;
 
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const currentSkill = skillLoader.getSkill(normalizedSkillId);
     if (!currentSkill) {
       return {
@@ -30524,7 +30532,7 @@ You are continuing a previous conversation. The context from the previous conver
     if (!rawQuery) return false;
 
     try {
-      const skillLoader = getCustomSkillLoader();
+      const skillLoader = this.getSkillLoader();
       const ranked = skillLoader.rankModelInvocableSkillsForQuery(rawQuery, {
         availableToolNames: new Set(this.getAvailableTools().map((tool) => tool.name)),
         includePrereqBlockedSkills: true,
@@ -32413,7 +32421,7 @@ You are continuing a previous conversation. The context from the previous conver
     });
 
     // Get enabled guidelines from custom skills
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const guidelinesPrompt = skillLoader.getEnabledGuidelinesPrompt();
     const personalityIdOverride = this.task.agentConfig?.personalityId;
     const contextMode = detectContextMode(
@@ -34560,7 +34568,7 @@ Return ONLY a JSON object:
     }
 
     // Get enabled guidelines from custom skills
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const guidelinesPrompt = skillLoader.getEnabledGuidelinesPrompt();
 
     // Get personality and identity prompts
@@ -42475,7 +42483,6 @@ Return ONLY a JSON object:
           quotedAssistantMessage,
         );
       }
-      await notifyProviderDispatchStarted();
       await this.respondInChatMode(
         followUpConversationMessage,
         previousStatus,
@@ -42483,6 +42490,7 @@ Return ONLY a JSON object:
         opts?.onAccepted ? acceptFollowUp : undefined,
         notifyProviderDispatchCompleted,
         opts?.transcriptAlreadyContainsMessage === true,
+        notifyProviderDispatchStarted,
       );
       return;
     }
@@ -42501,7 +42509,7 @@ Return ONLY a JSON object:
     }
 
     // Get enabled guidelines from custom skills
-    const skillLoader = getCustomSkillLoader();
+    const skillLoader = this.getSkillLoader();
     const guidelinesPrompt = skillLoader.getEnabledGuidelinesPrompt();
 
     // Get personality and identity prompts

@@ -3503,8 +3503,8 @@ export function isMessageSurfaceOrigin(value: unknown): value is MessageSurfaceO
 export type FollowUpTextProvenance = "user_typed";
 
 /**
- * Who wrote a task's title and prompt (Task.promptProvenance). "user_typed": a person typed
- * them. There is no other value: unset means CoWork or someone else wrote them.
+ * Who wrote a task's prompt (Task.promptProvenance). "user_typed": a person typed it. There
+ * is no other value: unset means CoWork or someone else wrote it.
  */
 export type TaskPromptProvenance = "user_typed";
 
@@ -8762,6 +8762,8 @@ export const IPC_CHANNELS = {
   TASK_LEARNING_PROGRESS: "task:learningProgress",
   TASK_LEARNING_EVENT: "task:learningEvent",
   TASK_SEND_MESSAGE: "task:sendMessage",
+  TASK_QUEUED_INPUTS: "task:queuedInputs",
+  TASK_EDIT_QUEUED_INPUT: "task:editQueuedInput",
   TASK_STEP_FEEDBACK: "task:stepFeedback", // Send feedback on an in-progress step
   TASK_SEND_STDIN: "task:sendStdin", // Send stdin input to running command
   TASK_KILL_COMMAND: "task:killCommand", // Kill running command (Ctrl+C)
@@ -11588,6 +11590,21 @@ export interface SkillStatusEntry extends CustomSkill {
   securityReport?: CapabilitySecurityReport;
 }
 
+/**
+ * A skill copy the loader did not use because another copy with the same id won.
+ * - `stale_bundled_copy`: a managed copy that matches a bundled version shipped earlier;
+ *   the current bundled skill is used instead.
+ * - `overridden_by_managed`: a bundled skill the user's own managed skill overrides.
+ */
+export interface ShadowedSkillCopy {
+  id: string;
+  name: string;
+  filePath: string;
+  source: SkillSource;
+  reason: "stale_bundled_copy" | "overridden_by_managed";
+  activeSource: SkillSource;
+}
+
 // Status report for all skills
 export interface SkillStatusReport {
   workspaceDir: string;
@@ -11595,6 +11612,7 @@ export interface SkillStatusReport {
   bundledSkillsDir: string;
   externalSkillDirs: string[];
   skills: SkillStatusEntry[];
+  shadowedSkills?: ShadowedSkillCopy[];
   summary: {
     total: number;
     eligible: number;
