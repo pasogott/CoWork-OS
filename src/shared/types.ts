@@ -3533,6 +3533,8 @@ export interface TaskFollowUpInput {
   deliveryMode?: "message" | "follow_up";
   /** Internal provenance for messages sent between parent and child tasks. */
   messageSource?: "user" | "agent";
+  /** Internal runtime notice; retains the current conversation instead of starting a bot handoff. */
+  notificationKind?: "background_process";
   /** Stable ID used to correlate an agent message with its delivery event. */
   messageId?: string;
   /** Parent/agent task that authored an agent message. */
@@ -8329,6 +8331,7 @@ export const IPC_CHANNELS = {
   TASK_EXPORT_JSON: "task:exportJSON",
   TASK_PIN: "task:pin",
   TASK_CANCEL: "task:cancel",
+  TASK_DISCARD_INTERRUPTED: "task:discardInterrupted",
   TASK_WRAP_UP: "task:wrapUp",
   TASK_PAUSE: "task:pause",
   TASK_RESUME: "task:resume",
