@@ -5,7 +5,12 @@ import type {
   SecureSettingsRepository,
   SettingsCategory,
 } from "../database/SecureSettingsRepository";
-import type { SafeStorageLike } from "./safe-storage";
+import {
+  decryptOsSealedAsync,
+  hasAsyncSafeStorage,
+  isDataKeySealed,
+  type SafeStorageLike,
+} from "./safe-storage";
 import {
   LEGACY_MAC_SAFE_STORAGE_APP_NAME,
   LEGACY_MAC_SAFE_STORAGE_APP_NAMES,
@@ -54,17 +59,37 @@ interface MigrationLogger {
 
 type SpawnProcess = typeof spawn;
 
+/**
+ * Whether the current identity can read a stored ciphertext. Data-key values always can;
+ * others are tried with the asynchronous OS call, so probing a value another keychain
+ * identity sealed never reaches the deprecated synchronous one.
+ */
+async function readableWithCurrentIdentity(
+  safeStorage: SafeStorageLike,
+  sealed: Buffer,
+): Promise<boolean> {
+  if (isDataKeySealed(sealed)) return true;
+  if (hasAsyncSafeStorage()) return (await decryptOsSealedAsync(sealed)) !== null;
+  try {
+    safeStorage.decryptString(sealed);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function checksum(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-/** Decrypts only valid, integrity-checked `os:` settings under the legacy Keychain identity. */
-export function decryptLegacyMacSafeStorageRows(
+/**
+ * Decrypts only valid, integrity-checked `os:` settings under the legacy Keychain identity.
+ * `decrypt` is the asynchronous OS call; it yields null for a row it cannot read.
+ */
+export async function decryptLegacyMacSafeStorageRows(
   rows: EncryptedSecureSettingRow[],
-  safeStorage: SafeStorageLike,
-): DecryptedSecureSetting[] {
-  if (!safeStorage.isEncryptionAvailable()) return [];
-
+  decrypt: (sealed: Buffer) => Promise<string | null>,
+): Promise<DecryptedSecureSetting[]> {
   const decryptedRows: DecryptedSecureSetting[] = [];
   for (const row of rows) {
     if (!row || typeof row.category !== "string" || !row.encrypted_data?.startsWith("os:")) {
@@ -72,9 +97,9 @@ export function decryptLegacyMacSafeStorageRows(
     }
 
     try {
-      const plaintext = safeStorage.decryptString(
-        Buffer.from(row.encrypted_data.slice(3), "base64"),
-      );
+      const plaintext = await decrypt(Buffer.from(row.encrypted_data.slice(3), "base64"));
+      // A row encrypted under another Keychain identity is expected to stay unreadable.
+      if (plaintext === null) continue;
       if (checksum(row.encrypted_data) !== row.checksum && checksum(plaintext) !== row.checksum) {
         continue;
       }
@@ -191,6 +216,58 @@ function runLegacyKeychainWorker(
  * Move settings readable with the former `cowork-os` Keychain identity into
  * the current `CoWork OS` identity. Existing current-keychain values win.
  */
+/**
+ * Unseal the secrets data key (utils/safe-storage) under a former macOS Keychain identity,
+ * for when the current identity cannot open it. Returns the key (hex) or null. The caller
+ * re-seals it with the current keychain, so nothing sealed with it has to be rewritten.
+ */
+export async function recoverDataKeyFromLegacyIdentity(options: {
+  platform: NodeJS.Platform;
+  sealedKey: string;
+  executable: string;
+  appPath: string;
+  logger: MigrationLogger;
+  legacyAppNames?: readonly string[];
+  spawnProcess?: SpawnProcess;
+  env?: NodeJS.ProcessEnv;
+}): Promise<string | null> {
+  if (options.platform !== "darwin") return null;
+  // The worker protocol carries it as a text row; nothing about it is a setting.
+  const encrypted_data = `os:${options.sealedKey}`;
+  const row: EncryptedSecureSettingRow = {
+    category: "data-key",
+    encrypted_data,
+    checksum: checksum(encrypted_data),
+    format: "text",
+  };
+  const legacyAppNames = [...new Set(options.legacyAppNames ?? LEGACY_MAC_SAFE_STORAGE_APP_NAMES)];
+  for (const legacyAppName of legacyAppNames) {
+    try {
+      const [opened] = await runLegacyKeychainWorker(
+        options.executable,
+        options.appPath,
+        [row],
+        options.spawnProcess,
+        options.env,
+        legacyAppName,
+      );
+      const text = opened?.settings?.text;
+      if (typeof text === "string" && /^[0-9a-f]{64}$/.test(text)) {
+        options.logger.info(
+          "Recovered the secrets data key from a legacy macOS Keychain identity.",
+          {
+            legacyAppName,
+          },
+        );
+        return text;
+      }
+    } catch {
+      // This identity cannot read it either; try the next.
+    }
+  }
+  return null;
+}
+
 export async function migrateLegacyMacSafeStorageSettings(options: {
   platform: NodeJS.Platform;
   database: MigrationDatabase;
@@ -277,6 +354,33 @@ export async function migrateLegacyMacSafeStorageSettings(options: {
 }
 
 /**
+ * Encrypted channel configs (`enc:` + base64) and their conditional rewrite, shared by the
+ * legacy-identity migration and the data key rewrap (safe-storage-rewrap.ts).
+ */
+export function encryptedChannelConfigs(database: ChannelMigrationDatabase): {
+  list(): Array<{ id: string; config: string }>;
+  /** Writes `next` only if the stored config is still `previous`; true when it wrote. */
+  replaceIfUnchanged(id: string, next: string, previous: string): boolean;
+} {
+  return {
+    list: () =>
+      (
+        database.prepare("SELECT id, config FROM channels WHERE config LIKE 'enc:%'") as {
+          all(): unknown[];
+        }
+      ).all() as Array<{ id: string; config: string }>,
+    replaceIfUnchanged: (id, next, previous) => {
+      const result = (
+        database.prepare(
+          "UPDATE channels SET config = ?, updated_at = ? WHERE id = ? AND config = ?",
+        ) as { run(...params: unknown[]): { changes?: number } | void }
+      ).run(next, Date.now(), id, previous);
+      return !!result && typeof result.changes === "number" && result.changes > 0;
+    },
+  };
+}
+
+/**
  * Re-encrypt channel configs that are still readable only with the former
  * `cowork-os` Keychain identity. Writes are conditional on the original value
  * remaining unchanged, and unreadable rows are always preserved.
@@ -301,40 +405,23 @@ export async function migrateLegacyMacSafeStorageChannels(options: {
   }
   const safeStorage = options.safeStorage;
 
-  const rows = (
-    options.database.prepare("SELECT id, config FROM channels WHERE config LIKE 'enc:%'") as {
-      all(): unknown[];
-    }
-  ).all() as Array<{ id: string; config: string }>;
+  const channels = encryptedChannelConfigs(options.database);
+  const rows = channels.list();
   if (rows.length === 0) return 0;
 
-  const canDecryptWithCurrentIdentity = (config: string): boolean => {
-    try {
-      safeStorage.decryptString(Buffer.from(config.slice("enc:".length), "base64"));
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const encryptedRows: EncryptedSecureSettingRow[] = rows
-    .filter(
-      (row) =>
-        typeof row?.id === "string" &&
-        typeof row.config === "string" &&
-        row.config.startsWith("enc:") &&
-        !canDecryptWithCurrentIdentity(row.config),
-    )
-    .map((row) => {
-      const encrypted_data = `os:${row.config.slice("enc:".length)}`;
-      return { category: row.id, encrypted_data, checksum: checksum(encrypted_data) };
-    });
+  const unreadableRows: typeof rows = [];
+  for (const row of rows) {
+    if (typeof row?.id !== "string" || typeof row.config !== "string") continue;
+    if (!row.config.startsWith("enc:")) continue;
+    const sealed = Buffer.from(row.config.slice("enc:".length), "base64");
+    if (!(await readableWithCurrentIdentity(safeStorage, sealed))) unreadableRows.push(row);
+  }
+  const encryptedRows: EncryptedSecureSettingRow[] = unreadableRows.map((row) => {
+    const encrypted_data = `os:${row.config.slice("enc:".length)}`;
+    return { category: row.id, encrypted_data, checksum: checksum(encrypted_data) };
+  });
   if (encryptedRows.length === 0) return 0;
 
-  const update = options.database.prepare(
-    "UPDATE channels SET config = ?, updated_at = ? WHERE id = ? AND config = ?",
-  ) as {
-    run(...params: unknown[]): { changes?: number } | void;
-  };
   let migratedCount = 0;
   const legacyAppNames = [...new Set(options.legacyAppNames ?? LEGACY_MAC_SAFE_STORAGE_APP_NAMES)];
   for (const legacyAppName of legacyAppNames) {
@@ -365,8 +452,7 @@ export async function migrateLegacyMacSafeStorageChannels(options: {
         const currentCiphertext = safeStorage
           .encryptString(JSON.stringify(config))
           .toString("base64");
-        const result = update.run(`enc:${currentCiphertext}`, Date.now(), row.id, row.config);
-        if (result && typeof result.changes === "number" && result.changes > 0) {
+        if (channels.replaceIfUnchanged(row.id, `enc:${currentCiphertext}`, row.config)) {
           migratedCount += 1;
         }
       } catch {
@@ -456,16 +542,11 @@ export async function migrateLegacyMacSafeStorageMailbox<Target extends string>(
     return 0;
   }
   const safeStorage = options.safeStorage;
-  const canDecrypt = (value: string): boolean => {
-    try {
-      safeStorage.decryptString(
-        Buffer.from(value.slice(MAILBOX_OS_CIPHER_PREFIX.length), "base64"),
-      );
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const canDecrypt = (value: string): Promise<boolean> =>
+    readableWithCurrentIdentity(
+      safeStorage,
+      Buffer.from(value.slice(MAILBOX_OS_CIPHER_PREFIX.length), "base64"),
+    );
 
   type Pending = { target: Target; key: string; value: string; row: EncryptedSecureSettingRow };
   const pending = new Map<string, Pending>();
@@ -478,7 +559,7 @@ export async function migrateLegacyMacSafeStorageMailbox<Target extends string>(
     }
     for (const { key, value } of rows) {
       if (typeof key !== "string" || typeof value !== "string") continue;
-      if (!value.startsWith(MAILBOX_OS_CIPHER_PREFIX) || canDecrypt(value)) continue;
+      if (!value.startsWith(MAILBOX_OS_CIPHER_PREFIX) || (await canDecrypt(value))) continue;
       const encrypted_data = `os:${value.slice(MAILBOX_OS_CIPHER_PREFIX.length)}`;
       const id = JSON.stringify([target, key]);
       pending.set(id, {
@@ -570,7 +651,7 @@ export async function migrateLegacyMacSafeStorageMailbox<Target extends string>(
 
 export async function runMacSafeStorageMigrationWorker(options: {
   platform: NodeJS.Platform;
-  safeStorage: SafeStorageLike;
+  decrypt: (sealed: Buffer) => Promise<string | null>;
   readInput: () => Promise<string>;
   writeResult: (result: string) => void;
 }): Promise<void> {
@@ -589,6 +670,6 @@ export async function runMacSafeStorageMigrationWorker(options: {
       typeof item.checksum === "string" &&
       (item.format === undefined || item.format === "json" || item.format === "text"),
   );
-  const result = decryptLegacyMacSafeStorageRows(rows, options.safeStorage);
+  const result = await decryptLegacyMacSafeStorageRows(rows, options.decrypt);
   options.writeResult(`${MAC_SAFE_STORAGE_MIGRATION_RESULT_PREFIX}${JSON.stringify(result)}\n`);
 }

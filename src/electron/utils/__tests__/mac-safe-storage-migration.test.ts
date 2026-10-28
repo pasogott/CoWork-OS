@@ -9,6 +9,7 @@ import {
   migrateLegacyMacSafeStorageChannels,
   migrateLegacyMacSafeStorageMailbox,
   migrateLegacyMacSafeStorageSettings,
+  recoverDataKeyFromLegacyIdentity,
   runMacSafeStorageMigrationWorker,
   type DecryptedSecureSetting,
   type EncryptedSecureSettingRow,
@@ -25,24 +26,25 @@ function row(category: string): EncryptedSecureSettingRow {
 }
 
 describe("macOS safeStorage legacy migration", () => {
-  it("decrypts only checksum-valid os-encrypted object settings", () => {
+  it("decrypts only checksum-valid os-encrypted object settings", async () => {
     const valid = row("user-profile");
     const invalidChecksum = { ...valid, checksum: "invalid" };
     const nonOs = { ...valid, encrypted_data: "app:legacy" };
-    const decryptString = vi.fn((ciphertext: Buffer) => {
+    const decrypt = vi.fn(async (ciphertext: Buffer) => {
       const category = ciphertext.toString("utf8");
-      if (category === "bad") throw new Error("wrong Keychain identity");
+      // The async OS call yields null for a value another Keychain identity sealed.
+      if (category === "bad") return null;
       return JSON.stringify({ category });
     });
 
-    const result = decryptLegacyMacSafeStorageRows(
+    const result = await decryptLegacyMacSafeStorageRows(
       [
         { ...valid, encrypted_data: `os:${Buffer.from("user-profile").toString("base64")}` },
         invalidChecksum,
         nonOs,
         { ...valid, encrypted_data: `os:${Buffer.from("bad").toString("base64")}` },
       ],
-      { isEncryptionAvailable: () => true, encryptString: vi.fn(), decryptString },
+      decrypt,
     );
 
     expect(result).toEqual([{ category: "user-profile", settings: { category: "user-profile" } }]);
@@ -117,6 +119,47 @@ describe("macOS safeStorage legacy migration", () => {
       "Migrated encrypted settings from the legacy macOS Keychain identity.",
       expect.objectContaining({ migratedCount: 1 }),
     );
+  });
+
+  it("recovers the data key through the legacy worker, trying each former identity", async () => {
+    const keyHex = "ab".repeat(32);
+    const attemptedNames: string[] = [];
+    let sentRows: Array<{ encrypted_data: string; format?: string }> = [];
+    const spawnProcess = vi.fn((_executable: string, args: string[]) => {
+      const name = args.at(-1) || "";
+      attemptedNames.push(name);
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const child = new EventEmitter() as ChildProcess;
+      Object.assign(child, { stdin: input, stdout: output, kill: vi.fn() });
+      let received = "";
+      input.on("data", (chunk) => (received += chunk));
+      input.once("finish", () => {
+        sentRows = JSON.parse(received);
+        // Only the second identity sealed this key.
+        const result =
+          name === "cowork-os" ? [{ category: "data-key", settings: { text: keyHex } }] : [];
+        output.end(`${MAC_SAFE_STORAGE_MIGRATION_RESULT_PREFIX}${JSON.stringify(result)}\n`);
+        output.once("end", () => child.emit("close", 0));
+      });
+      return child;
+    });
+
+    await expect(
+      recoverDataKeyFromLegacyIdentity({
+        platform: "darwin",
+        sealedKey: "c2VhbGVk",
+        executable: "electron",
+        appPath: ".",
+        logger: { info: vi.fn(), warn: vi.fn() },
+        legacyAppNames: ["Electron", "cowork-os"],
+        spawnProcess: spawnProcess as never,
+      }),
+    ).resolves.toBe(keyHex);
+    expect(attemptedNames).toEqual(["Electron", "cowork-os"]);
+    expect(sentRows).toEqual([
+      expect.objectContaining({ encrypted_data: "os:c2VhbGVk", format: "text" }),
+    ]);
   });
 
   it("tries known legacy app names and migrates only data decrypted by a candidate", async () => {
@@ -211,6 +254,40 @@ describe("macOS safeStorage legacy migration", () => {
 
     expect(migratedCount).toBe(0);
     expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
+  it("probes channel configs with the async OS call, never the deprecated sync one", async () => {
+    const { setNativeSafeStorageForTests } = await import("../safe-storage");
+    // Only the async API answers; this config is readable by the current identity.
+    setNativeSafeStorageForTests({
+      decryptStringAsync: vi.fn(async () => ({ result: "{}" })),
+    });
+    const decryptString = vi.fn(() => "{}");
+    const spawnProcess = vi.fn();
+    try {
+      const migratedCount = await migrateLegacyMacSafeStorageChannels({
+        platform: "darwin",
+        database: {
+          prepare: vi.fn(() => ({
+            all: () => [
+              { id: "email-channel", config: `enc:${Buffer.from("x").toString("base64")}` },
+            ],
+            run: vi.fn(),
+          })),
+        },
+        safeStorage: { isEncryptionAvailable: () => true, encryptString: vi.fn(), decryptString },
+        executable: "electron",
+        appPath: ".",
+        logger: { info: vi.fn(), warn: vi.fn() },
+        spawnProcess: spawnProcess as never,
+      });
+
+      expect(migratedCount).toBe(0);
+      expect(spawnProcess).not.toHaveBeenCalled();
+      expect(decryptString).not.toHaveBeenCalled();
+    } finally {
+      setNativeSafeStorageForTests(undefined);
+    }
   });
 
   it("does not run or touch the database outside macOS", async () => {
@@ -365,11 +442,7 @@ describe("macOS safeStorage legacy migration", () => {
 
     await runMacSafeStorageMigrationWorker({
       platform: "darwin",
-      safeStorage: {
-        isEncryptionAvailable: () => true,
-        encryptString: vi.fn(),
-        decryptString: () => plaintext,
-      },
+      decrypt: async () => plaintext,
       readInput: async () => JSON.stringify([inputRow]),
       writeResult,
     });
@@ -447,15 +520,11 @@ describe("macOS safeStorage legacy migration: mailbox content", () => {
     legacyAppNames: ["Electron", "cowork-os"],
   };
 
-  it("returns text rows from the worker as { text } without parsing JSON", () => {
+  it("returns text rows from the worker as { text } without parsing JSON", async () => {
     const encrypted_data = `os:${b64("plain mail body")}`;
-    const result = decryptLegacyMacSafeStorageRows(
+    const result = await decryptLegacyMacSafeStorageRows(
       [{ category: "m1", encrypted_data, checksum: sha256(encrypted_data), format: "text" }],
-      {
-        isEncryptionAvailable: () => true,
-        encryptString: vi.fn(),
-        decryptString: (buffer: Buffer) => buffer.toString("utf8"),
-      },
+      async (buffer: Buffer) => buffer.toString("utf8"),
     );
     expect(result).toEqual([{ category: "m1", settings: { text: "plain mail body" } }]);
   });
