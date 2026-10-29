@@ -76,6 +76,7 @@ import type {
   AgentImportSource,
 } from "../shared/types";
 import type { BotOutcomeMetrics, BotOutcomeMetricsRequest } from "../shared/bot-outcome-metrics";
+import type { BotCapabilitiesRequest, BotCapabilitySummary } from "../shared/bot-capabilities";
 import type {
   ChannelHealthResponse,
   MeetingArtifactProvider,
@@ -3402,6 +3403,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.BOT_WORK_LIST, query) as Promise<BotWorkPage>,
   getBotMetricsSummary: (request: BotOutcomeMetricsRequest) =>
     ipcRenderer.invoke(IPC_CHANNELS.BOT_METRICS_SUMMARY, request) as Promise<BotOutcomeMetrics>,
+  getBotCapabilities: (request: BotCapabilitiesRequest) =>
+    ipcRenderer.invoke(IPC_CHANNELS.BOT_CAPABILITIES_GET, request) as Promise<BotCapabilitySummary>,
   listBotConversations: (query: BotConversationListQuery) =>
     invokeTaskIpcWithRendererTiming(IPC_CHANNELS.BOT_CONVERSATIONS_LIST, query),
   listBotMessages: (request: import("../shared/bot-messages").BotMessagePageRequest) =>
@@ -6119,8 +6122,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // File Hub
   listHubFiles: (options: Any) => ipcRenderer.invoke(IPC_CHANNELS.FILEHUB_LIST, options),
-  searchHubFiles: (query: string, sources?: string[]) =>
-    ipcRenderer.invoke(IPC_CHANNELS.FILEHUB_SEARCH, { query, sources }),
+  searchHubFiles: (query: string, sources?: string[], workspaceId?: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.FILEHUB_SEARCH, { query, sources, workspaceId }),
   getRecentHubFiles: (limit?: number) => ipcRenderer.invoke(IPC_CHANNELS.FILEHUB_RECENT, limit),
   getHubSources: () => ipcRenderer.invoke(IPC_CHANNELS.FILEHUB_SOURCES),
 
@@ -6639,6 +6642,7 @@ export interface ElectronAPI {
   searchHubFiles: (
     query: string,
     sources?: import("./file-hub/types").FileHubSource[],
+    workspaceId?: string,
   ) => Promise<import("./file-hub/types").FileHubSearchResult[]>;
   getRecentHubFiles: (limit?: number) => Promise<import("./file-hub/types").UnifiedFile[]>;
   getHubSources: () => Promise<import("./file-hub/types").FileHubSource[]>;
@@ -7322,6 +7326,8 @@ export interface ElectronAPI {
   ) => Promise<import("../shared/bot-work-result").BotWorkResult>;
   listBotWork: (query: BotWorkQuery) => Promise<BotWorkPage>;
   getBotMetricsSummary: (request: BotOutcomeMetricsRequest) => Promise<BotOutcomeMetrics>;
+  /** "What it can do" in a bot's details panel; read-only. */
+  getBotCapabilities: (request: BotCapabilitiesRequest) => Promise<BotCapabilitySummary>;
   activateBotResponsibility: (
     request: import("../shared/bot-responsibility").BotResponsibilityControl,
   ) => Promise<BotResponsibility>;
