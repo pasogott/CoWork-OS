@@ -156,7 +156,7 @@ function DesktopFileHub({ workspaceId: selectedWorkspaceId }: { workspaceId?: st
       if (searchQuery.trim()) {
         const results = await (window as Any).electronAPI.searchHubFiles(
           searchQuery,
-          [activeSource],
+          availableSources,
           workspaceId,
         );
         next = (results || []).map((r: Any) => r.file);
@@ -176,7 +176,7 @@ function DesktopFileHub({ workspaceId: selectedWorkspaceId }: { workspaceId?: st
     } catch {
       if (requestId === loadRequestSeqRef.current) setFiles([]);
     }
-  }, [activeSource, searchQuery, currentFolderPath, workspaceId]);
+  }, [activeSource, availableSources, searchQuery, currentFolderPath, workspaceId]);
 
   useEffect(() => {
     loadFiles();
@@ -224,6 +224,10 @@ function DesktopFileHub({ workspaceId: selectedWorkspaceId }: { workspaceId?: st
         listedRoot ? [listedRoot, ...workspaceRoots] : workspaceRoots,
       ),
     });
+    setRecentFiles((recent) =>
+      [file, ...recent.filter((item) => item.id !== file.id)].slice(0, 10),
+    );
+    void (window as Any).electronAPI.trackHubFileAccess(file).catch(() => undefined);
   };
 
   const visibleFiles = showRecent ? recentFiles : files;
@@ -250,7 +254,10 @@ function DesktopFileHub({ workspaceId: selectedWorkspaceId }: { workspaceId?: st
           <Search size={14} style={{ color: "var(--text-tertiary, #666)", flexShrink: 0 }} />
           <input
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => {
+              setSearchQuery(e.target.value);
+              if (e.target.value.trim()) setShowRecent(false);
+            }}
             placeholder="Search files across all sources..."
             style={{
               flex: 1,
@@ -275,7 +282,10 @@ function DesktopFileHub({ workspaceId: selectedWorkspaceId }: { workspaceId?: st
         }}
       >
         <button
-          onClick={() => setShowRecent(!showRecent)}
+          onClick={() => {
+            setSearchQuery("");
+            setShowRecent(!showRecent);
+          }}
           style={{
             display: "flex",
             alignItems: "center",
@@ -368,11 +378,21 @@ function DesktopFileHub({ workspaceId: selectedWorkspaceId }: { workspaceId?: st
           </div>
         ) : (
           visibleFiles.map((file) => (
-            <div
+            <button
               key={file.id}
+              type="button"
               onClick={() => handleFileClick(file)}
+              aria-label={`${file.isDirectory ? "Open folder" : "Open file"} ${file.name}`}
               title={file.isDirectory ? `Open folder ${file.name}` : undefined}
-              style={desktopFileRowStyle}
+              style={{
+                ...desktopFileRowStyle,
+                width: "100%",
+                border: "none",
+                background: "transparent",
+                color: "inherit",
+                font: "inherit",
+                textAlign: "left",
+              }}
               onMouseEnter={highlightDesktopRow}
               onMouseLeave={clearDesktopRowHighlight}
             >
@@ -391,7 +411,7 @@ function DesktopFileHub({ workspaceId: selectedWorkspaceId }: { workspaceId?: st
               <div style={{ fontSize: 11, color: "var(--text-tertiary, #666)", flexShrink: 0 }}>
                 {formatDate(file.modifiedAt)}
               </div>
-            </div>
+            </button>
           ))
         )}
       </div>
@@ -625,7 +645,10 @@ function BrowserFileHub({ workspaceId }: { workspaceId?: string }) {
           <input
             aria-label="Search workspace files"
             value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
+            onChange={(event) => {
+              setSearchQuery(event.target.value);
+              if (event.target.value.trim()) setShowRecent(false);
+            }}
             placeholder={
               activeSource === "artifacts"
                 ? "Search task artifacts..."
@@ -662,7 +685,13 @@ function BrowserFileHub({ workspaceId }: { workspaceId?: string }) {
           overflowX: "auto",
         }}
       >
-        <button onClick={() => setShowRecent((value) => !value)} style={tabStyle(showRecent)}>
+        <button
+          onClick={() => {
+            setSearchQuery("");
+            setShowRecent((value) => !value);
+          }}
+          style={tabStyle(showRecent)}
+        >
           <Clock size={12} /> Recent
         </button>
         <button
