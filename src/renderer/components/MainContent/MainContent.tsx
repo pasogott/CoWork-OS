@@ -556,7 +556,9 @@ interface MainContentProps {
   ) => void | boolean | Promise<void | boolean>;
   draftSnapshot?: ComposerDraft | null;
   onDraftPatch?: (
-    patch: Partial<Pick<ComposerDraft, "mentions" | "quotedAssistantMessage" | "attachments">>,
+    patch: Partial<
+      Pick<ComposerDraft, "interactionMode" | "mentions" | "quotedAssistantMessage" | "attachments">
+    >,
   ) => ComposerDraft | void;
   onStageDraftAttachment?: (attachment: {
     name: string;
@@ -1501,11 +1503,13 @@ function MainContentComponent({
   const [collaborativeModeEnabled, setCollaborativeModeEnabled] = useState(false);
   const [chronicleEnabledForTask, setChronicleEnabledForTask] = useState(true);
   const [modeDrafts, setModeDrafts] = useState<Record<string, InteractionModeSelection>>({});
-  const modeDraftKey = selectedTaskId ?? "new";
+  const modeDraftKey =
+    draftSnapshot?.draftKey ?? `${workspace?.id ?? "unscoped"}:${selectedTaskId ?? "new"}`;
   const activeModeDraftKeyRef = useRef(modeDraftKey);
   const modeSubmissionRevisionRef = useRef(0);
   activeModeDraftKeyRef.current = modeDraftKey;
   const selectedInteractionMode =
+    draftSnapshot?.interactionMode ??
     modeDrafts[modeDraftKey] ??
     getInteractionModeSelection(task?.agentConfig) ??
     (selectedTaskId ? undefined : ({ mode: "smart" } as const));
@@ -1522,6 +1526,7 @@ function MainContentComponent({
       : (displayedInteractionMode.executionOverride ?? "execute");
   const setInteractionMode = (selection: InteractionModeSelection) => {
     setModeDrafts((previous) => ({ ...previous, [modeDraftKey]: selection }));
+    recordDraftMutation(onDraftPatch?.({ interactionMode: selection }));
   };
   useEffect(() => {
     const accepted = getInteractionModeSelection(task?.agentConfig);
@@ -4047,7 +4052,7 @@ function MainContentComponent({
       if (effectiveType === "diagram_created") return true;
       // A document, sheet, deck or page artifact opens in the side panel from its title and
       // is listed on the turn's file line, so only other artifacts (images, PDFs, logs) expand.
-      if (event.type === "timeline_artifact_emitted" || effectiveType === "artifact_created") {
+      if (effectiveType === "artifact_created") {
         const artifactPath = typeof event.payload?.path === "string" ? event.payload.path : "";
         return Boolean(artifactPath) && !getSidePanelViewerKind(artifactPath);
       }
@@ -5391,7 +5396,7 @@ function MainContentComponent({
         }
         setModeDrafts((previous) => {
           const next = { ...previous };
-          delete next.new;
+          delete next[modeDraftKey];
           return next;
         });
         // Reset task mode state
