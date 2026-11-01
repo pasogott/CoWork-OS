@@ -1,5 +1,9 @@
 import { verifiedPhoneScreenshotPath } from "../phone/phone-screenshot-evidence";
-import { isFreshAgentHandoff } from "./background-process-notifications";
+import {
+  isFreshAgentHandoff,
+  isRuntimeNotice,
+  runningTurnUpdateText,
+} from "./background-process-notifications";
 import { narrowestBotWorksOn, type BotWorksOn } from "../../shared/bot-computer";
 import { COMPUTER_USE_WAIT_MS, isComputerUseToolName } from "../../shared/computer-use-contract";
 import { AGENT_DISPATCH_STEP_DESCRIPTION } from "../../shared/generated-plan-steps";
@@ -32601,7 +32605,9 @@ You are continuing a previous conversation. The context from the previous conver
     );
 
     let channelAdaptedPersonality = personalityPrompt;
-    const originChannel = this.task.agentConfig?.originChannel;
+    // A gateway channel, or GitHub for tasks started from a PR or issue thread.
+    const originChannel =
+      this.task.agentConfig?.originChannel ?? this.task.agentConfig?.replySurface;
     if (originChannel) {
       try {
         const { ChannelPersonaAdapter } = await import("../memory/ChannelPersonaAdapter");
@@ -34808,7 +34814,9 @@ Return ONLY a JSON object:
     const visualQAContext = this.getVisualQAContextPrompt();
     // Channel-specific persona adaptation (append to personality prompt)
     let channelAdaptedPersonality = personalityPrompt;
-    const originChannel = this.task.agentConfig?.originChannel;
+    // A gateway channel, or GitHub for tasks started from a PR or issue thread.
+    const originChannel =
+      this.task.agentConfig?.originChannel ?? this.task.agentConfig?.replySurface;
     if (originChannel) {
       try {
         const { ChannelPersonaAdapter } = await import("../memory/ChannelPersonaAdapter");
@@ -35705,7 +35713,7 @@ Return ONLY a JSON object:
                     },
                   )
                 : withSurfaceOriginNote(
-                    `USER UPDATE: ${pendingMsg.message}`,
+                    runningTurnUpdateText(pendingMsg),
                     pendingMsg.surfaceOrigin,
                   );
               const content = await this.buildUserContent(
@@ -35722,7 +35730,11 @@ Return ONLY a JSON object:
                 messages.pop();
                 throw error;
               }
-              if (!isPendingBotHandoff && pendingMsg.deliveryMode === "follow_up") {
+              if (
+                !isPendingBotHandoff &&
+                !isRuntimeNotice(pendingMsg.notificationKind) &&
+                pendingMsg.deliveryMode === "follow_up"
+              ) {
                 this.recordAcceptedRunUserUpdate(pendingMsg.message);
               }
               if (hasDurableFollowUpReceipt) {
@@ -42678,7 +42690,9 @@ Return ONLY a JSON object:
     const awarenessSnapshotBlock = this.buildAwarenessSnapshotBlock(memoryDecision);
     const roleContext = this.getRoleContextPrompt();
     let channelAdaptedPersonality = personalityPrompt;
-    const originChannel = this.task.agentConfig?.originChannel;
+    // A gateway channel, or GitHub for tasks started from a PR or issue thread.
+    const originChannel =
+      this.task.agentConfig?.originChannel ?? this.task.agentConfig?.replySurface;
     if (originChannel) {
       try {
         const { ChannelPersonaAdapter } = await import("../memory/ChannelPersonaAdapter");
@@ -42998,7 +43012,7 @@ Return ONLY a JSON object:
                     },
                   )
                 : withSurfaceOriginNote(
-                    `USER UPDATE: ${pendingMsg.message}`,
+                    runningTurnUpdateText(pendingMsg),
                     pendingMsg.surfaceOrigin,
                   );
               const content = await this.buildUserContent(
@@ -43010,7 +43024,11 @@ Return ONLY a JSON object:
               );
               // messages === this.conversationHistory here, so push persists automatically
               messages.push({ role: "user" as const, content });
-              if (!isPendingBotHandoff && pendingMsg.deliveryMode === "follow_up") {
+              if (
+                !isPendingBotHandoff &&
+                !isRuntimeNotice(pendingMsg.notificationKind) &&
+                pendingMsg.deliveryMode === "follow_up"
+              ) {
                 this.recordAcceptedRunUserUpdate(pendingMsg.message);
               }
               if (hasDurableFollowUpReceipt) {
