@@ -76,10 +76,15 @@ import {
   systemPreferences,
   webContents,
   WebContentsView,
+  powerMonitor,
   type BrowserWindowConstructorOptions,
 } from "electron";
 import mime from "mime-types";
 import { attachImageContextMenu } from "./utils/image-context-menu";
+import {
+  attachPowerMonitorSleepRecovery,
+  startAgentDaemonWatchdog,
+} from "./agent/watchdog/watchdog-runtime";
 import { closeWindowsForShutdown, installGracefulShutdown } from "./utils/graceful-shutdown";
 import { closeMontyPool } from "./sandbox/monty-engine";
 import { installStdioErrorGuards } from "./utils/stdio-error-guards";
@@ -324,6 +329,12 @@ import {
 } from "./triggers/event-routing-deps";
 import { channelMessageTriggerEvent } from "./triggers/gateway-message-event";
 import { setupTriggerHandlers } from "./ipc/trigger-handlers";
+import { createSpeculativeFixRuntime } from "./triggers/speculative-fix-runtime";
+import {
+  getActiveSpeculativeFixService,
+  setActiveSpeculativeFixService,
+} from "./triggers/SpeculativeFixService";
+import { setupSpeculativeRunHandlers } from "./ipc/speculative-run-handlers";
 import { setupRoutineHandlers } from "./ipc/routine-handlers";
 import { RoutineService } from "./routines/service";
 import { createRoutineWorkflowActionExecutor } from "./routines/workflow/action-executor";
@@ -565,6 +576,8 @@ let coreHarnessExperimentRunner: CoreHarnessExperimentRunner | null = null;
 let coreLearningsService: CoreLearningsService | null = null;
 let coreLearningPipelineService: CoreLearningPipelineService | null = null;
 let detachTaskLifecycleSync: (() => void) | null = null;
+/** Stops the watchdog control loop and detaches its powerMonitor sleep recovery. */
+let stopWatchdog: (() => void) | null = null;
 let tempWorkspacePruneTimer: NodeJS.Timeout | null = null;
 let memoryRetentionService: MemoryRetentionService | null = null;
 /** Stops the memory engine's deferred jobs (lane migration, read-side syncs). */
@@ -2883,6 +2896,27 @@ if (isMacSafeStorageMigrationWorker) {
         db: dbManager.getDatabase(),
         log: (...args) => logger.warn(...args),
       });
+      // Watchdog control loop (off until enabled in Settings) and sleep recovery (always on).
+      try {
+        const watchdog = startAgentDaemonWatchdog(agentDaemon, {
+          notify: async (notification) => {
+            await getNotificationService()?.add({
+              type: "warning",
+              title: notification.title,
+              message: notification.message,
+              taskId: notification.taskId,
+              ...(notification.workspaceId ? { workspaceId: notification.workspaceId } : {}),
+            });
+          },
+        });
+        const detachSleepRecovery = attachPowerMonitorSleepRecovery(powerMonitor, watchdog.service);
+        stopWatchdog = () => {
+          detachSleepRecovery();
+          watchdog.stop();
+        };
+      } catch (error) {
+        logger.warn("Failed to start the watchdog:", error);
+      }
 
       // Optional: bootstrap a default workspace on startup for headless/server deployments.
       // This makes a fresh VPS instance usable without first opening the desktop UI.
@@ -4197,6 +4231,14 @@ if (isMacSafeStorageMigrationWorker) {
             workspaces[0]
           );
         };
+        // Speculative reproduce-and-fix runs for `speculate_fix` triggers (off unless one exists).
+        const speculativeFix = createSpeculativeFixRuntime({
+          db,
+          agentDaemon,
+          channelGateway,
+          automationRuntime,
+          userDataDir: getUserDataDir(),
+        });
         // Event Triggers
         eventTriggerService = new EventTriggerService(
           {
@@ -4255,6 +4297,7 @@ if (isMacSafeStorageMigrationWorker) {
               if (result.status === "error")
                 throw new Error(result.error || "Agent wake was not accepted");
             },
+            speculateFix: (request) => speculativeFix.start(request),
             getDefaultWorkspaceId: () => "",
             getActiveTaskCount: () => agentDaemon.getQueueStatus().runningTaskIds.length,
             log: (...args: unknown[]) => console.log("[EventTriggers]", ...args),
@@ -4337,6 +4380,7 @@ if (isMacSafeStorageMigrationWorker) {
         });
         void syncMcpTriggerSubscriptions();
         setupTriggerHandlers(currentTriggerService, syncMcpTriggerSubscriptions, mcpEventService);
+        setupSpeculativeRunHandlers(getActiveSpeculativeFixService);
         const managedSessionService = new ManagedSessionService(db, agentDaemon, {
           workContextService: new WorkContextService(db),
         });
@@ -5195,6 +5239,8 @@ if (isMacSafeStorageMigrationWorker) {
           run: async () => {
             await automationRuntime.stop("event_triggers");
             eventTriggerService = null;
+            getActiveSpeculativeFixService()?.dispose();
+            setActiveSpeculativeFixService(null);
           },
         },
         { name: "channel gateway", run: () => channelGateway?.shutdown() },
@@ -5216,6 +5262,13 @@ if (isMacSafeStorageMigrationWorker) {
         { name: "automation ownership", run: () => automationRuntime.shutdown() },
         // Keep lifecycle listeners, MCP, memory, and storage alive until tasks settle.
         { name: "private browser prompts", run: () => getBrowserCredentialService()?.dispose() },
+        {
+          name: "watchdog",
+          run: () => {
+            stopWatchdog?.();
+            stopWatchdog = null;
+          },
+        },
         { name: "agent daemon", run: () => agentDaemon?.shutdown() },
         {
           name: "task lifecycle sync",

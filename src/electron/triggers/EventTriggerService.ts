@@ -23,6 +23,7 @@ import {
 } from "./types";
 import { evaluateConditions, substituteEventVariables } from "./condition-evaluator";
 import { ensureResponsibilitySnapshotColumn, ensureTriggerHistoryGateColumns } from "./trigger-sql";
+import { buildTriggerOriginRefs, withOriginRefs } from "../../shared/task-origin-refs";
 import {
   isEngineDeliveredThreadEvent,
   threadDeliveryIdentity,
@@ -697,9 +698,14 @@ export class EventTriggerService implements EventTriggerRegistry {
               prompt,
               workspaceId:
                 cfg.workspaceId || trigger.workspaceId || this.deps.getDefaultWorkspaceId(),
-              agentConfig: withThreadReplySurface(
-                prepared?.agentConfig ?? cfg.agentConfig,
-                threadKey,
+              // The task keeps the IDs of the event that created it (Chain of Recall).
+              agentConfig: withOriginRefs(
+                withThreadReplySurface(prepared?.agentConfig ?? cfg.agentConfig, threadKey),
+                buildTriggerOriginRefs({
+                  triggerId: trigger.id,
+                  occurrenceId: String(row.id),
+                  event,
+                }),
               ),
             });
             historyEntry.taskId = result.id;
@@ -733,6 +739,22 @@ export class EventTriggerService implements EventTriggerRegistry {
           await this.deps.wakeAgent(cfg.agentRoleId, renderTriggerPrompt(cfg.prompt || "", event));
           historyEntry.actionResult = "agent_woken";
           receipt = { kind: "agent_wake", accepted: true };
+          break;
+        }
+        case "speculate_fix": {
+          if (!this.deps.speculateFix)
+            throw new Error("Speculative fix is not available in this runtime");
+          const result = await this.deps.speculateFix({
+            trigger,
+            event,
+            idempotencyKey: String(row.id),
+            agentConfig: prepared?.agentConfig,
+          });
+          if (result.taskId) historyEntry.taskId = result.taskId;
+          historyEntry.actionResult = result.started
+            ? "speculation_started"
+            : `speculation_skipped: ${result.reason || "unavailable"}`;
+          receipt = { kind: "speculative_run", ...result };
           break;
         }
         default:
@@ -959,9 +981,9 @@ export class EventTriggerService implements EventTriggerRegistry {
               prompt,
               workspaceId:
                 cfg.workspaceId || trigger.workspaceId || this.deps.getDefaultWorkspaceId(),
-              agentConfig: withThreadReplySurface(
-                prepared?.agentConfig ?? cfg.agentConfig,
-                threadKey,
+              agentConfig: withOriginRefs(
+                withThreadReplySurface(prepared?.agentConfig ?? cfg.agentConfig, threadKey),
+                buildTriggerOriginRefs({ triggerId: trigger.id, event }),
               ),
             });
             historyEntry.taskId = result.id;
@@ -992,6 +1014,22 @@ export class EventTriggerService implements EventTriggerRegistry {
             const prompt = renderTriggerPrompt(cfg.prompt || "", event);
             await this.deps.wakeAgent(cfg.agentRoleId, prompt);
             historyEntry.actionResult = "agent_woken";
+          }
+          break;
+        }
+
+        case "speculate_fix": {
+          if (this.deps.speculateFix) {
+            const result = await this.deps.speculateFix({
+              trigger,
+              event,
+              idempotencyKey: historyEntry.id,
+              agentConfig: prepared?.agentConfig,
+            });
+            if (result.taskId) historyEntry.taskId = result.taskId;
+            historyEntry.actionResult = result.started
+              ? "speculation_started"
+              : `speculation_skipped: ${result.reason || "unavailable"}`;
           }
           break;
         }

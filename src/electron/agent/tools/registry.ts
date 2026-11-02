@@ -85,6 +85,8 @@ import { MeetingArtifactTools } from "./meeting-artifact-tools";
 import { VisionTools } from "./vision-tools";
 import { SystemTools } from "./system-tools";
 import { EventWaitTools } from "./event-wait-tools";
+import { SpeculativeRunTools } from "./speculative-run-tools";
+import { WatchdogTools } from "./watchdog-tools";
 import { ThreadTools } from "./thread-tools";
 import { CronTools } from "./cron-tools";
 import { CanvasTools } from "./canvas-tools";
@@ -196,6 +198,8 @@ import { NativeAppTools, NATIVE_APP_TOOL } from "./native-app-tools";
 import { AndroidPhoneTools, ANDROID_PHONE_TOOLS } from "./android-phone-tools";
 import { BatchImageTools } from "./batch-image-tools";
 import { ScratchpadTools } from "./scratchpad-tools";
+import { SpillTools } from "./spill-tools";
+import { getTaskForRecall, withTaskGetHints } from "./task-get";
 import { TERMINAL_TAB_TOOL_NAMES, TerminalTabTools } from "./terminal-tab-tools";
 import { ComputerHandoffTools } from "./computer-handoff-tools";
 import { BotDesktopTools } from "./bot-desktop-tools";
@@ -756,6 +760,8 @@ export class ToolRegistry {
   private batchImageTools: BatchImageTools;
   private cronTools: CronTools;
   private eventWaitTools: EventWaitTools;
+  private speculativeRunTools: SpeculativeRunTools;
+  private watchdogTools: WatchdogTools;
   private threadTools: ThreadTools;
   private canvasTools: CanvasTools;
   private visualTools: VisualTools;
@@ -785,6 +791,7 @@ export class ToolRegistry {
   private swarmToolsAvailable = false;
   private documentTools: DocumentTools;
   private scratchpadTools: ScratchpadTools;
+  private spillTools: SpillTools;
   private terminalTabTools: TerminalTabTools;
   private computerHandoffTools: ComputerHandoffTools;
   private botDesktopTools: BotDesktopTools;
@@ -850,6 +857,8 @@ export class ToolRegistry {
     this.batchImageTools = new BatchImageTools(workspace, daemon, taskId);
     this.cronTools = new CronTools(workspace, daemon, taskId);
     this.eventWaitTools = new EventWaitTools(daemon, taskId);
+    this.speculativeRunTools = new SpeculativeRunTools(() => this.workspace);
+    this.watchdogTools = new WatchdogTools(daemon, taskId);
     this.threadTools = new ThreadTools(daemon, taskId);
     this.canvasTools = new CanvasTools(workspace, daemon, taskId);
     this.visualTools = new VisualTools(workspace, daemon, taskId);
@@ -881,6 +890,7 @@ export class ToolRegistry {
       (tid, filePath, operation) => daemon.consumeExternalFileApproval(tid, filePath, operation),
     );
     this.scratchpadTools = new ScratchpadTools(taskId, workspace);
+    this.spillTools = new SpillTools(taskId);
     this.terminalTabTools = new TerminalTabTools(workspace, daemon, taskId);
     this.computerHandoffTools = new ComputerHandoffTools(taskId, daemon as Any);
     this.botDesktopTools = new BotDesktopTools(daemon as Any, taskId, () => this.workspace);
@@ -1814,6 +1824,12 @@ export class ToolRegistry {
     if (this.daemon.hasEventWaitSupport?.()) {
       allTools.push(...EventWaitTools.getToolDefinitions());
     }
+    // Read-only history of speculate_fix runs; only where that runtime is running.
+    if (SpeculativeRunTools.isAvailable()) {
+      allTools.push(...SpeculativeRunTools.getToolDefinitions());
+    }
+    // Read-only explanation of the watchdog control loop's decisions for a task.
+    allTools.push(...WatchdogTools.getToolDefinitions());
     // Follow or leave a conversation thread's later events (thread subscriptions).
     allTools.push(...ThreadTools.getToolDefinitions());
     if (MCPEventService.getActive()) {
@@ -1898,6 +1914,9 @@ export class ToolRegistry {
 
     // Session scratchpad tools (agent self-notes during long runs)
     allTools.push(...ScratchpadTools.getToolDefinitions());
+
+    // Pages of tool results that were shortened to fit the context window
+    allTools.push(...SpillTools.getToolDefinitions());
 
     // Hand a step to the person (passwords, codes, payments) instead of doing it
     allTools.push(...ComputerHandoffTools.getToolDefinitions());
@@ -2004,6 +2023,8 @@ export class ToolRegistry {
           "task_list_update",
           "task_list_list",
           "task_history",
+          "task_get",
+          "tool_result_read",
           "set_personality",
           "set_persona",
           "set_agent_name",
@@ -3649,6 +3670,7 @@ export class ToolRegistry {
     );
     register("scratchpad_write", async ({ request }) => this.scratchpadTools.write(request.input));
     register("scratchpad_read", async ({ request }) => this.scratchpadTools.read(request.input));
+    register("tool_result_read", async ({ request }) => this.spillTools.read(request.input));
     register("request_takeover", async ({ request }) =>
       this.computerHandoffTools.requestTakeover(request.input),
     );
@@ -3976,6 +3998,11 @@ export class ToolRegistry {
       serialSchedulerSpec,
     );
     register(
+      "speculative_runs",
+      async ({ request }) => this.speculativeRunTools.listRuns(request.input),
+      readParallelSchedulerSpec,
+    );
+    register(
       "thread_subscribe",
       async ({ request }) => this.threadTools.subscribe(request.input),
       serialSchedulerSpec,
@@ -4180,6 +4207,10 @@ export class ToolRegistry {
     });
     register("task_history", async ({ request }) => this.taskHistory(request.input));
     register("task_events", async ({ request }) => this.taskEvents(request.input));
+    register("watchdog_status", async ({ request }) =>
+      this.watchdogTools.watchdogStatus(request.input),
+    );
+    register("task_get", async ({ request }) => this.taskGet(request.input));
     register("request_user_input", async ({ request }) => this.requestUserInput(request.input));
     register(
       "application_operation",
@@ -4710,14 +4741,38 @@ export class ToolRegistry {
       throw new Error(`Invalid period. Expected one of: ${allowed.join(", ")}`);
     }
 
-    return this.daemon.queryTaskHistory({
-      period,
-      from: input.from,
-      to: input.to,
-      limit: input.limit,
-      workspaceId: input.workspace_id,
-      query: input.query,
-      includeMessages: input.include_messages,
+    return withTaskGetHints(
+      this.daemon.queryTaskHistory({
+        period,
+        from: input.from,
+        to: input.to,
+        limit: input.limit,
+        workspaceId: input.workspace_id,
+        query: input.query,
+        includeMessages: input.include_messages,
+      }),
+    );
+  }
+
+  /**
+   * Recall one task by ID with its linked task IDs inlined (parent, children, branch,
+   * origin, related). Privacy-sensitive like task_history; blocked in shared gateway contexts.
+   */
+  private async taskGet(input: { taskId?: string; task_id?: string; id?: string }): Promise<Any> {
+    return getTaskForRecall(input?.taskId ?? input?.task_id ?? input?.id, {
+      getTask: (id) => this.daemon.getTaskById(id),
+      getChildTasks: (id) => this.daemon.getChildTasks(id),
+      getTaskEvents: (id, options) => this.daemon.getTaskEvents(id, options),
+      listRecentWorkspaceTasks: (workspaceId, limit) => {
+        const recent = this.daemon.queryTaskHistory({
+          period: "last_30_days",
+          workspaceId,
+          limit,
+          includeMessages: false,
+        });
+        return recent.success ? recent.tasks : [];
+      },
+      getWorkspaceName: (workspaceId) => this.daemon.getWorkspaceById(workspaceId)?.name,
     });
   }
 
@@ -5848,6 +5903,7 @@ ${skillDescriptions}`;
     if (name === "swarm_note") return await this.swarmTools.note(input);
     if (name === "scratchpad_write") return this.scratchpadTools.write(input);
     if (name === "scratchpad_read") return this.scratchpadTools.read(input);
+    if (name === "tool_result_read") return this.spillTools.read(input);
     if (name === "request_takeover") return this.computerHandoffTools.requestTakeover(input);
     if (name.startsWith("desktop_")) return this.botDesktopTools.execute(name, input);
     if (name === "read_clipboard") return await this.systemTools.readClipboard();
@@ -5905,6 +5961,7 @@ ${skillDescriptions}`;
     // Cron/scheduling tools
     if (name === "schedule_task") return await this.cronTools.executeAction(input);
     if (name === "wait_for_event") return await this.eventWaitTools.waitForEvent(input);
+    if (name === "speculative_runs") return await this.speculativeRunTools.listRuns(input);
     if (name === "thread_subscribe") return await this.threadTools.subscribe(input);
     if (name === "thread_unsubscribe") return await this.threadTools.unsubscribe(input);
     if (name === "manage_connector_events") return await this.manageConnectorEvents(input);
@@ -6054,6 +6111,10 @@ ${skillDescriptions}`;
     }
     if (name === "task_events") {
       return this.taskEvents(input);
+    }
+    if (name === "watchdog_status") return this.watchdogTools.watchdogStatus(input);
+    if (name === "task_get") {
+      return this.taskGet(input);
     }
     if (name === "request_user_input") {
       return await this.requestUserInput(input);
@@ -6915,6 +6976,12 @@ ${skillDescriptions}`;
       await computer.close();
     }
     await this._codeExecTools?.cleanup().catch(() => undefined);
+    // Shortened tool results are kept only while the task runs.
+    try {
+      this.spillTools.expireIfTaskFinished(this.daemon.getTask?.(this.taskId)?.status);
+    } catch {
+      // The 24-hour sweep removes them instead.
+    }
     this.codexConsentClosed = true;
     this.codexTaskConsents?.clear();
     await this.browserTools.cleanup();
@@ -14999,6 +15066,25 @@ ${skillDescriptions}`;
             },
           },
           required: ["period"],
+        },
+      },
+      {
+        name: "task_get",
+        description:
+          "Recall one task by its id: title, status, workspace, a short summary of its outcome, and the ids " +
+          "it links to (parent task, child tasks, branch source, originating trigger event or chat thread, " +
+          "and recent related tasks in the same workspace). Use it when you have a task id (from " +
+          "task_history, a memory_recall hit's provenance, or this task's references line) and need that " +
+          "task's context; call it again on a linked id to follow the chain.",
+        input_schema: {
+          type: "object",
+          properties: {
+            taskId: {
+              type: "string",
+              description: "The task id to recall.",
+            },
+          },
+          required: ["taskId"],
         },
       },
       {
