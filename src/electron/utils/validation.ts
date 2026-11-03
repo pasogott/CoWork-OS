@@ -1,4 +1,5 @@
 import { ExecutionEnvironmentSelectionSchema } from "../../shared/execution-environment";
+import { TASK_PROPOSAL_LIMITS } from "../../shared/task-proposals";
 /**
  * Input validation schemas for IPC handlers using Zod
  * Provides type-safe validation to prevent malformed input attacks
@@ -638,6 +639,37 @@ export const StepFeedbackSchema = z.object({
   message: z.string().max(MAX_PROMPT_LENGTH).optional(),
 });
 
+/** Suggested tasks (task-proposals.ts): the person's actions on a proposal card. */
+export const TaskProposalListSchema = z.object({ taskId: z.string().uuid() }).strict();
+
+export const TaskProposalActionSchema = z.object({ proposalId: z.string().uuid() }).strict();
+
+export const TaskProposalStartSchema = z
+  .object({
+    proposalId: z.string().uuid(),
+    options: z
+      .object({
+        workspaceId: WorkspaceIdSchema.optional(),
+        worktreeMode: z.enum(["local", "worktree"]).optional(),
+        providerType: z.enum(LLM_PROVIDER_TYPES).optional(),
+        modelKey: z.string().trim().min(1).max(200).optional(),
+        reasoningEffort: z
+          .enum(["none", "low", "medium", "high", "xhigh", "max", "ultra", "extra_high"])
+          .optional(),
+        accessProfileId: AccessProfileIdSchema.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+export const TaskProposalStartAllSchema = z
+  .object({
+    taskId: z.string().uuid(),
+    proposalIds: z.array(z.string().uuid()).min(1).max(TASK_PROPOSAL_LIMITS.pendingPerTask),
+  })
+  .strict();
+
 export const ForkSessionSchema = z.object({
   taskId: z.string().uuid(),
   prompt: z.string().max(MAX_PROMPT_LENGTH).optional(),
@@ -1262,6 +1294,18 @@ export const CuaSpaceSettingsSchema = z
     url: z.string().max(2000).optional(),
     // null clears the stored token; omitted keeps it.
     token: z.string().max(4000).nullable().optional(),
+  })
+  .strict();
+
+export const CamofoxSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    serverUrl: z.string().max(200).optional(),
+    proxyPort: z.number().int().min(1024).max(65535).optional(),
+    persistentIdentity: z.boolean().optional(),
+    // null clears a stored key; omitted keeps it.
+    accessKey: z.string().max(512).nullable().optional(),
+    apiKey: z.string().max(512).nullable().optional(),
   })
   .strict();
 

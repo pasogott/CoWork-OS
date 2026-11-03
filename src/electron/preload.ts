@@ -6,6 +6,7 @@ import {
 } from "../shared/browser-toolbar-menu";
 import {
   BROWSER_VAULT_IPC,
+  type BrowserCookieJarListing,
   type BrowserVaultItem,
   type BrowserVaultAnswer,
   type BrowserVaultCommand,
@@ -33,6 +34,11 @@ import type {
   CuaSpaceDisplaySettings,
   CuaSpaceSettingsUpdate,
 } from "../shared/cua-space";
+import type {
+  CamofoxConnectionResult,
+  CamofoxDisplaySettings,
+  CamofoxSettingsUpdate,
+} from "../shared/camofox";
 import type {
   ApprovalDraftPreview,
   InlineApprovalDraftReview,
@@ -81,6 +87,7 @@ import type {
   AgentImportSource,
 } from "../shared/types";
 import type { BotOutcomeMetrics, BotOutcomeMetricsRequest } from "../shared/bot-outcome-metrics";
+import type { TaskProposal, TaskProposalStartOptions } from "../shared/task-proposals";
 import type { BotCapabilitiesRequest, BotCapabilitySummary } from "../shared/bot-capabilities";
 import type {
   ChannelHealthResponse,
@@ -2510,6 +2517,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     token: string;
     cookies?: boolean;
     passwords?: boolean;
+    saveToVault?: boolean;
+    applyToBrowser?: boolean;
   }) =>
     ipcRenderer.invoke(
       IPC_CHANNELS.BROWSER_IMPORT_COMMIT,
@@ -2575,6 +2584,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke(IPC_CHANNELS.BROWSER_VAULT_FOR_PAGE, data) as Promise<BrowserLoginsResult>,
   removeBrowserLogin: (data: { workspaceId: string; id: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.BROWSER_VAULT_REMOVE, data) as Promise<{ success: boolean }>,
+  removeBrowserCookieJar: (data: { workspaceId: string; id: string }) =>
+    ipcRenderer.invoke(IPC_CHANNELS.BROWSER_VAULT_REMOVE, {
+      workspaceId: data.workspaceId,
+      id: data.id,
+      kind: "cookie_jar",
+    }) as Promise<{ success: boolean }>,
   clearBrowserLogins: (data: { workspaceId: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.BROWSER_VAULT_CLEAR, data) as Promise<{
       success: boolean;
@@ -2599,6 +2614,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
       success: boolean;
       settings?: BrowserSettingsState;
     }>,
+  getCamofoxSettings: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.CAMOFOX_SETTINGS_GET) as Promise<CamofoxDisplaySettings>,
+  saveCamofoxSettings: (update: CamofoxSettingsUpdate) =>
+    ipcRenderer.invoke(
+      IPC_CHANNELS.CAMOFOX_SETTINGS_SAVE,
+      update,
+    ) as Promise<CamofoxDisplaySettings>,
+  testCamofoxConnection: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.CAMOFOX_TEST_CONNECTION) as Promise<CamofoxConnectionResult>,
+  copyCamofoxStartCommand: () =>
+    ipcRenderer.invoke(IPC_CHANNELS.CAMOFOX_COPY_START_COMMAND) as Promise<void>,
   resolveWorktreeBaseCommit: (data: { workspaceId: string; branch?: string }) =>
     ipcRenderer.invoke(IPC_CHANNELS.WORKTREE_RESOLVE_BASE_COMMIT, data) as Promise<{
       commit: string;
@@ -3458,6 +3484,19 @@ contextBridge.exposeInMainWorld("electronAPI", {
     sideChat?: boolean;
     initialMessage?: string;
   }) => ipcRenderer.invoke(IPC_CHANNELS.TASK_FORK_SESSION, data),
+  listTaskProposals: (taskId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_PROPOSAL_LIST, { taskId }),
+  startTaskProposal: (proposalId: string, options?: TaskProposalStartOptions) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_PROPOSAL_START, {
+      proposalId,
+      ...(options ? { options } : {}),
+    }),
+  startAllTaskProposals: (taskId: string, proposalIds: string[]) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_PROPOSAL_START_ALL, { taskId, proposalIds }),
+  doTaskProposalHere: (proposalId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_PROPOSAL_DO_HERE, { proposalId }),
+  dismissTaskProposal: (proposalId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_PROPOSAL_DISMISS, { proposalId }),
   sendStdin: (taskId: string, input: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.TASK_SEND_STDIN, { taskId, input }),
   killCommand: (taskId: string, force?: boolean) =>
@@ -4022,8 +4061,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getPiModels: (piProvider?: string) =>
     ipcRenderer.invoke(IPC_CHANNELS.LLM_GET_PI_MODELS, piProvider),
   getPiProviders: () => ipcRenderer.invoke(IPC_CHANNELS.LLM_GET_PI_PROVIDERS),
-  getOpenAICompatibleModels: (baseUrl: string, apiKey?: string) =>
-    ipcRenderer.invoke(IPC_CHANNELS.LLM_GET_OPENAI_COMPATIBLE_MODELS, baseUrl, apiKey),
+  getOpenAICompatibleModels: (
+    baseUrl: string,
+    apiKey?: string,
+    options?: { cacheModels?: boolean },
+  ) => ipcRenderer.invoke(IPC_CHANNELS.LLM_GET_OPENAI_COMPATIBLE_MODELS, baseUrl, apiKey, options),
   // Local AI (MLX-LM + hf-agents + llama.cpp)
   checkHf: () => ipcRenderer.invoke(IPC_CHANNELS.LOCAL_AI_CHECK_HF),
   detectHardware: () => ipcRenderer.invoke(IPC_CHANNELS.LOCAL_AI_DETECT_HARDWARE),
@@ -6429,6 +6471,7 @@ export interface BrowserImportDetectResult {
 }
 export type BrowserImportPrepareRequest =
   | { workspaceId: string; kind: "csv" }
+  | { workspaceId: string; kind: "cookies_txt" }
   | {
       workspaceId: string;
       kind: "browser";
@@ -6441,6 +6484,7 @@ export type BrowserImportPrepareResult =
   | {
       success: true;
       token: string;
+      kind: "browser" | "csv" | "cookies_txt";
       source: string;
       cookies: number;
       logins: number;
@@ -6453,6 +6497,8 @@ export type BrowserImportCommitResult =
       success: true;
       cookies: number;
       cookiesRejected: number;
+      /** Cookies saved as an encrypted jar for Camofox. */
+      cookiesSaved: number;
       logins: number;
       loginsUpdated: number;
       canDeleteFile: boolean;
@@ -6469,6 +6515,8 @@ export interface BrowserLoginsResult {
   items?: BrowserVaultItem[];
   success: boolean;
   logins: BrowserSavedLogin[];
+  /** Saved cookies.txt jars; metadata only. */
+  cookieJars?: BrowserCookieJarListing[];
   canStore?: boolean;
 }
 
@@ -6816,6 +6864,10 @@ export interface ElectronAPI {
     token: string;
     cookies?: boolean;
     passwords?: boolean;
+    /** cookies.txt imports: save an encrypted cookie jar for Camofox (default true). */
+    saveToVault?: boolean;
+    /** cookies.txt imports: also add the cookies to the in-app browser (default false). */
+    applyToBrowser?: boolean;
   }) => Promise<BrowserImportCommitResult>;
   browserImportCancel: (data: { token: string }) => Promise<{ success: boolean }>;
   browserImportDeleteFile: (data: {
@@ -6855,6 +6907,10 @@ export interface ElectronAPI {
     url: string;
   }) => Promise<BrowserLoginsResult>;
   removeBrowserLogin: (data: { workspaceId: string; id: string }) => Promise<{ success: boolean }>;
+  removeBrowserCookieJar: (data: {
+    workspaceId: string;
+    id: string;
+  }) => Promise<{ success: boolean }>;
   clearBrowserLogins: (data: {
     workspaceId: string;
   }) => Promise<{ success: boolean; removed: number }>;
@@ -6868,6 +6924,11 @@ export interface ElectronAPI {
   saveBrowserSettings: (
     settings: Partial<BrowserSettings>,
   ) => Promise<{ success: boolean; settings?: BrowserSettingsState }>;
+  getCamofoxSettings: () => Promise<CamofoxDisplaySettings>;
+  saveCamofoxSettings: (update: CamofoxSettingsUpdate) => Promise<CamofoxDisplaySettings>;
+  testCamofoxConnection: () => Promise<CamofoxConnectionResult>;
+  /** Copies the start command, proxy password filled in, without it reaching the renderer. */
+  copyCamofoxStartCommand: () => Promise<void>;
   /** Build Compare: the commit a branch points to now, so every variant starts from it. */
   resolveWorktreeBaseCommit: (data: {
     workspaceId: string;
@@ -7454,6 +7515,14 @@ export interface ElectronAPI {
     sideChat?: boolean;
     initialMessage?: string;
   }) => Promise<Any>;
+  listTaskProposals: (taskId: string) => Promise<TaskProposal[]>;
+  startTaskProposal: (proposalId: string, options?: TaskProposalStartOptions) => Promise<Task>;
+  startAllTaskProposals: (
+    taskId: string,
+    proposalIds: string[],
+  ) => Promise<Array<{ proposalId: string; taskId?: string; error?: string }>>;
+  doTaskProposalHere: (proposalId: string) => Promise<void>;
+  dismissTaskProposal: (proposalId: string) => Promise<void>;
   sendStdin: (taskId: string, input: string) => Promise<boolean>;
   killCommand: (taskId: string, force?: boolean) => Promise<boolean>;
   renameTask: (id: string, title: string) => Promise<void>;
@@ -7929,6 +7998,7 @@ export interface ElectronAPI {
   getOpenAICompatibleModels: (
     baseUrl: string,
     apiKey?: string,
+    options?: { cacheModels?: boolean },
   ) => Promise<Array<{ key: string; displayName: string; description: string }>>;
   // Local AI (MLX-LM + hf-agents + llama.cpp)
   checkHf?: () => Promise<{

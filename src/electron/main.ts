@@ -49,6 +49,7 @@ import {
 import { ChannelRepository, ChannelUserRepository } from "./database/repository-facades";
 import {
   AnnotationRepository,
+  ArtifactRepository,
   ChannelMessageRepository,
   TaskEventReplayRepository,
   TaskRepository,
@@ -1962,7 +1963,7 @@ if (isMacSafeStorageMigrationWorker) {
     if (!ACTIVE_FOREGROUND_TASK_STATUSES.has(task.status)) return false;
     if (isAutomatedTaskLike(task)) return false;
     const source = task.source || "manual";
-    return source === "manual" || source === "api";
+    return source === "manual" || source === "api" || source === "suggested_task";
   }
   if (!gotTheLock) {
     if (process.env.NODE_ENV === "development") {
@@ -4740,6 +4741,7 @@ if (isMacSafeStorageMigrationWorker) {
         }
 
         // File Hub
+        const fileHubArtifacts = new ArtifactRepository(db);
         const fileHubService = new FileHubService(
           {
             getWorkspacePath: (wsId) => {
@@ -4756,7 +4758,7 @@ if (isMacSafeStorageMigrationWorker) {
                 return "";
               }
             },
-            getArtifacts: () => [],
+            getArtifacts: ({ limit }) => fileHubArtifacts.findRecent(limit),
             getConnectedSources: () => [],
           },
           db,
@@ -5828,6 +5830,18 @@ if (isMacSafeStorageMigrationWorker) {
           title: "Choose a password export",
           properties: ["openFile" as const],
           filters: [{ name: "CSV", extensions: ["csv"] }],
+        };
+        const result =
+          mainWindow && !mainWindow.isDestroyed()
+            ? await dialog.showOpenDialog(mainWindow, options)
+            : await dialog.showOpenDialog(options);
+        return result.canceled ? null : (result.filePaths[0] ?? null);
+      },
+      pickCookiesFile: async () => {
+        const options = {
+          title: "Choose a cookies.txt file",
+          properties: ["openFile" as const],
+          filters: [{ name: "cookies.txt", extensions: ["txt"] }],
         };
         const result =
           mainWindow && !mainWindow.isDestroyed()
