@@ -11,7 +11,7 @@ import { isApprovalDecisionQuestionId } from "./approval-draft-presentation";
 import type { CalendarProposal } from "./calendar-proposals";
 import type { MailReplyDraftCard } from "./mail-reply-drafts";
 import type { MemoryCurationChange } from "./memory-review-types";
-import { deriveCanonicalTaskStatus } from "./task-status";
+import { deriveCanonicalTaskStatus, isIdleFork } from "./task-status";
 import { LOCAL_MANAGED_DEVICE_NODE_ID } from "./types";
 import type {
   ApprovalRequest,
@@ -178,6 +178,7 @@ export function classifyTaskActivity(task: Task): TaskActivity | null {
   }
   if (status === "planning") return { category: "running", label: "Planning" };
   if (status === "executing") return { category: "running", label: "Running" };
+  if (isIdleFork(task)) return null;
   if (status === "pending" || status === "queued") return { category: null, label: "Queued" };
   return null;
 }
