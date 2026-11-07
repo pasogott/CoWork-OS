@@ -273,7 +273,7 @@ surface-level contract on top of it. Playbook capture uses the same task gate.
   `(imported)` or `(observed)` when the user did not state it. Blocks list their refs.
 - **Budgets** (`agent/content/prompt-budgets.ts`): `MEMORY_L0_TOKENS` 600,
   `MEMORY_L1_ITEMS_TOKENS` 400 (plan steps, inside `memory_context`), `MEMORY_L1_COMPACT_TOKENS`
-  250 (planning, chat, follow-up system prompt).
+  250 (pre-flight, planning, chat, follow-up system prompt).
 
 Where each layer lands:
 
@@ -281,13 +281,28 @@ Where each layer lands:
 |---|---|---|---|
 | Plan step | pinned `<cowork_user_profile>` block | `memory_context`, in the synthesizer's former hot-memory slot | kit slice without DESIGN.md, the generated USER.md / MEMORY.md blocks and the three shared-context files; playbook and summaries |
 | Follow-up | pinned block | system prompt `memory_context` | |
+| Pre-flight framing | system prompt (`<cowork_hot_memory>`) | system prompt (`<cowork_relevant_memory>`) | selected `<cowork_memory_repo>` block; same memory policy as planning |
 | Planning, chat, companion | system prompt (`<cowork_hot_memory>`) | system prompt (`<cowork_relevant_memory>`) | |
 | All | | | awareness snapshot without `user_*` beliefs |
 
 `task.prompt` no longer carries relationship memory. Retrieval queries use the undecorated
 prompt (`rawPrompt`, with any strategy block stripped).
 
-**Attribution.** Each surface emits a `memory_used` task event once per turn (chat turn, plan,
+Pre-flight framing uses the shared policy and context builder before describing assumptions.
+It treats memory as contextual evidence, preserves source-change and review warnings, and
+gives the current user request precedence. Missing or withheld context does not establish
+that no prior agreement exists. If policy resolution fails, framing is skipped and normal
+execution continues.
+
+Framing requests allow 4,096 output tokens so hidden reasoning does not consume a tiny
+answer allowance. The prompt still asks for at most 180 words. A `max_tokens` response gets
+at most one fresh retry with 8,192 tokens, under the existing task/context ceilings and
+budget/cancellation checks. Each call has a bounded 60-second timeout for the larger reasoning allowance. Usage from both calls
+is counted; streaming is suppressed and truncated drafts are never published as complete
+framing. If the retry has no additional headroom, remains truncated, or fails, normal
+execution continues with a diagnostic log instead of partial framing.
+
+**Attribution.** Each surface emits a `memory_used` task event once per turn (pre-flight, chat turn, plan,
 step, follow-up; `resetMemoryUsedAttribution`) and again when its set of injected refs changes
 within the turn: `{ surface, refs, source }` with `memory:<id>`, `archive:<id>` and
 `external:<provider>`. The event is hidden from the main timeline, is not indexed as
@@ -663,9 +678,14 @@ can be linked; a source that cannot be linked never fails the save.
   the `memory_items` lines tag it "(source may have changed)", and the folder block's header
   says to check that source before relying on it.
 - **Clearing it:** saving the memory again from the same source, the source returning to its
-  saved content, or a dream that saw the entry next to its current source
-  ([Dreaming](dreaming.md#source-changes)). A link whose folder entry was rewritten or removed
-  is dropped at the next dream. Flags on `memory_items` rows are not rechecked by dreams.
+  saved content, or an explicit dream confirmation supported by a quote from the supplied
+  source excerpt ([Dreaming](dreaming.md#source-changes)). A confirmation clears only an
+  unchanged entry with no proposed edit, against the exact file snapshot shown to the dream;
+  the file hash and source-row revision must still match when the confirmation is recorded.
+  Contradicted or insufficient-evidence verdicts, unavailable connector/file content, and
+  pending or rejected corrections keep the warning. Confirming one source never clears
+  another source's warning for the same memory. A link whose folder entry was rewritten or
+  removed is dropped at the next dream. Flags on `memory_items` rows are not rechecked by dreams.
 
 ## 6. The archive (`memories`) and its future
 
