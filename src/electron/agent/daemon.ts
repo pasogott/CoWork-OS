@@ -3,6 +3,11 @@ import { buildApprovalReplyMessage } from "../../shared/approval-reply-message";
 import { describeToolApprovalRequest } from "./tool-approval-description";
 import { narrowestBotWorksOn } from "../../shared/bot-computer";
 import {
+  connectorsOffField,
+  mergeConnectorsOff,
+  withConnectorOff,
+} from "../../shared/connectors-off";
+import {
   agentCompletionNoticeId,
   backgroundCompletionDropReason,
   buildAgentCompletionNotice,
@@ -291,6 +296,7 @@ import {
 import { approvalPromptsDisabled, canAnswerInlineApproval } from "./approval-policy";
 import { isExplicitExportConsentRequest } from "./visual-consent-policy";
 import { isHeadlessMode } from "../utils/runtime-mode";
+import { normalizeApprovalActionCard } from "../../shared/approval-action-card";
 import {
   buildAssistantApprovalMessage,
   buildAssistantApprovalRequest,
@@ -6477,6 +6483,14 @@ export class AgentDaemon extends EventEmitter {
       if (parentWorksOn && parentWorksOn !== "auto") next.inheritedBotWorksOn = parentWorksOn;
       const inheritedCeilings = inheritableAccessCeilings(parent?.agentConfig);
       if (inheritedCeilings.length > 0) next.inheritedAccessCeilingProfileIds = inheritedCeilings;
+      // Connectors the user turned off for the parent conversation stay off for every child;
+      // a caller may add to the list, never shorten it.
+      const childConnectorsOff = mergeConnectorsOff(
+        parent?.agentConfig?.connectorsOff,
+        next.connectorsOff,
+      );
+      if (childConnectorsOff.length > 0) next.connectorsOff = childConnectorsOff;
+      else delete next.connectorsOff;
       // ACP has its own execution and consent boundary. A native CoWork
       // profile must not silently promote the adapter to approve-all.
       return Object.keys(next).length > 0 ? next : undefined;
@@ -8936,13 +8950,15 @@ export class AgentDaemon extends EventEmitter {
         typeof details === "object" &&
         typeof details.responsibilityActionReview === "object" &&
         details.responsibilityActionReview?.version === 1;
-      let action: ApprovalResponseAction =
+      const requestedAction =
         response.status === "submitted"
           ? parseAssistantApprovalAction(response.answers, isResponsibilityActionReview)
           : "deny_once";
       // Answers come from the renderer: an "Always allow" the card never offered is refused.
-      if (action === "allow_workspace" && !canOfferAssistantAlwaysAllow(details))
-        action = "deny_once";
+      const action =
+        requestedAction === "allow_workspace" && !canOfferAssistantAlwaysAllow(details)
+          ? "deny_once"
+          : requestedAction;
       let approved = action !== "deny_once";
       if (validateDecision) approved = await validateDecision(approved, action);
       if (signal?.aborted) {
@@ -8964,6 +8980,7 @@ export class AgentDaemon extends EventEmitter {
           assistantInput: true,
           approvalType: type,
           reason: "assistant_input_denied",
+          userDeclined: requestedAction === "deny_once",
         });
         AgentDaemon.prototype["relayApprovalReply"].call(this, taskId, response);
       }
@@ -10523,6 +10540,7 @@ export class AgentDaemon extends EventEmitter {
           approvalId,
           action: normalizedAction,
           persistence: persistenceResult,
+          ...(!didApprove ? { userDeclined: !authorityChanged } : {}),
         });
 
         if (didApprove) {
@@ -10676,6 +10694,7 @@ export class AgentDaemon extends EventEmitter {
         action: normalizedAction,
         persistence: persistenceResult,
         recoveredAfterRestart: true,
+        ...(!didApprove ? { userDeclined: !authorityChanged } : {}),
       });
 
       if (didApprove) {
@@ -10959,10 +10978,37 @@ export class AgentDaemon extends EventEmitter {
       }
 
       if (response.status === "submitted") {
+        // An answered action card stays in the transcript as its receipt: the event it covered
+        // and the decision, taken from the stored card, never from the renderer's answer.
+        const cardQuestion = request.questions.find(
+          (question) => question.id === ASSISTANT_APPROVAL_QUESTION_ID && question.actionCard,
+        );
+        const actionCard = normalizeApprovalActionCard(cardQuestion?.actionCard);
+        const actionCardReply = (() => {
+          const reply = response.answers?.[ASSISTANT_APPROVAL_QUESTION_ID]?.otherText;
+          const clean = typeof reply === "string" ? reply.replace(/\s+/g, " ").trim() : "";
+          return clean.length > 220 ? `${clean.slice(0, 219)}…` : clean;
+        })();
         this.logEvent(request.taskId, "assistant_message", {
           message: buildStructuredInputSelectionMessage(request, response.answers),
           requestId: response.requestId,
           source: "structured_input_selection",
+          ...(actionCard
+            ? {
+                actionCard,
+                // Only an allow the card actually offered counts, as in the approval waiter.
+                actionCardApproved:
+                  parseAssistantApprovalAction(response.answers) !== "deny_once" &&
+                  Boolean(
+                    cardQuestion?.options.some(
+                      (option) =>
+                        option.label ===
+                        response.answers?.[ASSISTANT_APPROVAL_QUESTION_ID]?.optionLabel,
+                    ),
+                  ),
+                ...(actionCardReply ? { actionCardReply } : {}),
+              }
+            : {}),
         });
       }
 
@@ -13994,6 +14040,8 @@ export class AgentDaemon extends EventEmitter {
       agentConfig: {
         ...task.agentConfig,
         ...override,
+        // A turn override never turns back on a connector the user turned off.
+        ...connectorsOffField(task.agentConfig?.connectorsOff, override.connectorsOff),
       },
     };
   }
@@ -14871,6 +14919,51 @@ export class AgentDaemon extends EventEmitter {
    * Pins the model the person picked for one conversation. The next turn switches to it and
    * keeps the conversation; the global default and the bot's own model stay unchanged.
    */
+  /**
+   * Turns one connector off (or back on) for one conversation. Only configured MCP servers,
+   * never for a bot conversation. It only narrows what the task may call, and a running
+   * executor picks it up at once.
+   */
+  setTaskConnectorOff(taskId: string, connectorId: string, off: boolean): Task {
+    const task = this.taskRepo.findById(taskId);
+    if (!task) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+    const servers = MCPSettingsManager.loadSettings().servers || [];
+    const names = new Map(servers.map((server) => [server.id, server.name]));
+    if (!names.has(connectorId)) {
+      throw new Error("Unknown connector");
+    }
+    if (task.agentConfig?.botConversation) {
+      // A bot's reach is set on the bot itself, not per conversation.
+      throw new Error("Connectors for a bot are set in the bot's settings");
+    }
+    // One change at a time against the saved list, so two windows cannot undo each other.
+    const previousOff = task.agentConfig?.connectorsOff || [];
+    const nextOff = withConnectorOff(previousOff, connectorId, off);
+    const { connectorsOff: _previous, ...rest } = task.agentConfig || {};
+    this.taskRepo.update(taskId, {
+      agentConfig: nextOff.length > 0 ? { ...rest, connectorsOff: nextOff } : rest,
+    });
+    const updatedTask = this.taskRepo.findById(taskId);
+    if (!updatedTask) {
+      throw new Error(`Task ${taskId} not found after connector update`);
+    }
+    const cached = this.activeTasks.get(taskId);
+    if (cached) {
+      cached.executor.updateTaskAgentConfig(updatedTask.agentConfig);
+      cached.lastAccessed = Date.now();
+    }
+    const changed = previousOff.includes(connectorId) !== off;
+    if (changed) {
+      this.logEvent(taskId, "log", {
+        message: `Turned ${names.get(connectorId)} ${off ? "off" : "back on"} for this conversation.`,
+        connectorsOff: nextOff,
+      });
+    }
+    return updatedTask;
+  }
+
   setTaskModelSelection(
     taskId: string,
     selection: { providerType: LLMProviderType; modelKey: string },
@@ -16348,6 +16441,7 @@ export class AgentDaemon extends EventEmitter {
       failureClass?: Task["failureClass"];
       budgetUsage?: Task["budgetUsage"];
       outputSummary?: TaskOutputSummary;
+      answerCitations?: import("../../shared/answer-citations").AnswerCitationSource[];
       waiveFailedStepIds?: string[];
       failedMutationRequiredStepIds?: string[];
       waivedVerificationStepIds?: string[];
@@ -17362,6 +17456,9 @@ export class AgentDaemon extends EventEmitter {
       message: terminalStatusMessage,
       lastRunDurationMs,
       ...(updates.resultSummary ? { resultSummary: updates.resultSummary } : {}),
+      ...(isCompletedOutcome && metadata?.answerCitations
+        ? { answerCitations: metadata.answerCitations }
+        : {}),
       ...(resolvedOutcome.status !== "completed" ? { status: resolvedOutcome.status } : {}),
       terminalStatus,
       ...(memoryExecutionReceipt ? { memoryExecutionReceipt } : {}),
@@ -17887,6 +17984,11 @@ export class AgentDaemon extends EventEmitter {
             inheritedBotWorksOn: persistentWorkerRoleBoundary.task.agentConfig?.inheritedBotWorksOn,
             // Nor the bot's-own-folder limit.
             botContained: persistentWorkerRoleBoundary.task.agentConfig?.botContained,
+            // Nor turn a connector back on that the user turned off for this conversation.
+            ...connectorsOffField(
+              persistentWorkerRoleBoundary.task.agentConfig?.connectorsOff,
+              effectiveOptions.agentConfigOverride.connectorsOff,
+            ),
           },
         }
       : persistentWorkerRoleBoundary.task;

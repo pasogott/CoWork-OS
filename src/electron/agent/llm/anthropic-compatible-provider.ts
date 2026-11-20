@@ -1,3 +1,8 @@
+import {
+  GEMINI_NEON_MODEL,
+  isGeminiNeonModel,
+  isQwen4MaxModel,
+} from "../../../shared/llm-provider-catalog";
 import type { ProviderDiagnosticFetch } from "./provider-diagnostic-fetch";
 import {
   LLMProvider,
@@ -109,6 +114,8 @@ export interface AnthropicCompatibleProviderOptions {
    */
   sendThinkingConfig?: boolean;
   reasoningEffort?: string;
+  /** Added to every request this provider sends (messages and /models). */
+  extraHeaders?: Record<string, string>;
 }
 
 interface ThinkingRequestOptions {
@@ -129,6 +136,7 @@ export class AnthropicCompatibleProvider implements LLMProvider {
   private managedPromptCacheSupported = true;
   private readonly sendThinkingConfig: boolean;
   private readonly reasoningEffort?: string;
+  private readonly extraHeaders?: Record<string, string>;
   /** Models whose endpoint rejected thinking/effort parameters (sticky per instance). */
   private readonly thinkingConfigRejectedModels = new Set<string>();
   private readonly turnContextRejectedModels = new Set<string>();
@@ -144,6 +152,7 @@ export class AnthropicCompatibleProvider implements LLMProvider {
     this.managedPromptCacheSupported = !isNanoGptBaseUrl(options.baseUrl);
     this.sendThinkingConfig = options.sendThinkingConfig === true;
     this.reasoningEffort = options.reasoningEffort;
+    this.extraHeaders = options.extraHeaders;
   }
 
   private normalizeModelForEndpoint(model: string): string {
@@ -253,7 +262,7 @@ export class AnthropicCompatibleProvider implements LLMProvider {
         headers: this.getMessageHeaders(),
         body: JSON.stringify({
           model,
-          max_tokens: 10,
+          max_tokens: isGeminiNeonModel(model) || isQwen4MaxModel(model) ? 1_024 : 10,
           messages: [{ role: "user", content: "Hi" }],
         }),
       });
@@ -279,6 +288,7 @@ export class AnthropicCompatibleProvider implements LLMProvider {
   private getMessageHeaders(usesTurnContext = false): Record<string, string> {
     const isOpenRouter = this.type === "openrouter";
     return {
+      ...this.extraHeaders,
       "Content-Type": "application/json",
       "anthropic-version": ANTHROPIC_VERSION,
       ...(isOpenRouter ? getOpenRouterAttributionHeaders() : {}),
@@ -295,6 +305,7 @@ export class AnthropicCompatibleProvider implements LLMProvider {
   async getAvailableModels(): Promise<Array<{ id: string; name: string }>> {
     try {
       const headers: Record<string, string> = {
+        ...this.extraHeaders,
         "anthropic-version": ANTHROPIC_VERSION,
       };
       if (this.apiKey) {
@@ -451,7 +462,10 @@ export class AnthropicCompatibleProvider implements LLMProvider {
       headers: this.getMessageHeaders(replay.usesTurnContext),
       body: JSON.stringify({
         model: args.model,
-        max_tokens: plan.maxTokens,
+        max_tokens:
+          this.type === "vercel-ai-gateway" && isGeminiNeonModel(args.model)
+            ? Math.min(plan.maxTokens, GEMINI_NEON_MODEL.maxOutputTokens)
+            : plan.maxTokens,
         system: this.buildSystemPayload(replay.systemRequest, args.promptCache),
         messages,
         ...(args.tools && { tools: args.tools }),

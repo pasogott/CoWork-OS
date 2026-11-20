@@ -4,6 +4,7 @@ import type {
 } from "./execution-environment";
 import type { UiTimelineEvent } from "./timeline-events";
 import type { ChatInlineFrame } from "./mailbox";
+import type { ApprovalActionCard } from "./approval-action-card";
 import type { AccessProfileDefinition, AccessProfileId } from "./access-profiles";
 import type { BotDesktopNetwork, BotWorksOn } from "./bot-computer";
 import type { BotFileAccess } from "./bot-containment";
@@ -1499,6 +1500,11 @@ export interface EvidenceRef {
   sourceUrlOrPath: string;
   snippet?: string;
   capturedAt: number;
+  /** For a citation: its [N], title, the tool that read it and the connector it came from. */
+  citationIndex?: number;
+  title?: string;
+  sourceTool?: string;
+  sourceLabel?: string;
 }
 
 export type ToolType =
@@ -2470,6 +2476,11 @@ export interface AgentConfig {
   cli?: CliTaskOwnership;
   /** User-selected integration mentions for soft tool-routing guidance. */
   integrationMentions?: IntegrationMentionSelection[];
+  /**
+   * Connected MCP servers (by id) the user turned off for this conversation from the
+   * Workspace section. Their tools are denied like tool restrictions; it only narrows.
+   */
+  connectorsOff?: string[];
   /** Optional origin channel that created the task (used for channel-aware gating) */
   originChannel?: ChannelType;
   /**
@@ -5182,6 +5193,12 @@ export interface RequestUserInputQuestion {
    * never carry one.
    */
   preview?: RequestUserInputPreview;
+  /**
+   * The change an approval covers, drawn as the thing itself (a calendar event) with buttons
+   * named for the effect. Set only by the main process from the reviewed request; presentation
+   * only, and the answer is still one of `options`.
+   */
+  actionCard?: ApprovalActionCard;
 }
 
 export interface RequestUserInputPreview {
@@ -8353,6 +8370,7 @@ export const IPC_CHANNELS = {
   TASK_KILL_COMMAND: "task:killCommand", // Kill running command (Ctrl+C)
   TASK_UPDATE_WORKSPACE: "task:updateWorkspace",
   TASK_SET_MODEL: "task:setModel",
+  TASK_SET_CONNECTOR_OFF: "task:setConnectorOff",
   UNIFIED_RECALL_QUERY: "recall:query",
   LLM_ROUTING_STATUS: "llm:routingStatus",
   LLM_ROUTING_EVENT: "llm:routingEvent",
@@ -9203,6 +9221,7 @@ export const CUSTOM_LLM_PROVIDER_TYPES = [
   "mistral",
   "github-copilot",
   "nano-gpt",
+  "qwencloud",
   "qwen-portal",
   "minimax",
   "minimax-portal",
@@ -10461,12 +10480,22 @@ export interface SharePointConnectionTestResult {
   userId?: string;
 }
 
+/** A provider whose upstream service is closing. */
+export interface SearchProviderRetirement {
+  /** ISO date the upstream service stops working. */
+  endsOn: string;
+  /** Plain-English notice shown to users who still have it set up. */
+  notice: string;
+}
+
 export interface SearchProviderInfo {
   type: SearchProviderType;
   name: string;
   description: string;
   configured: boolean;
   supportedTypes: SearchType[];
+  /** Set when the provider is closing: hidden from new setups, kept for existing ones. */
+  retirement?: SearchProviderRetirement;
 }
 
 export interface SearchConfigStatus {

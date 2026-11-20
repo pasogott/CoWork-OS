@@ -4,11 +4,11 @@ import {
   SearchProvider,
   SearchProviderConfig,
   SearchProviderType,
-  SearchType,
   SearchQuery,
   SearchResponse,
   SEARCH_PROVIDER_INFO,
 } from "./types";
+import type { SearchProviderInfo } from "../../../shared/types";
 import { TavilyProvider } from "./tavily-provider";
 import { ExaProvider } from "./exa-provider";
 import { BraveProvider } from "./brave-provider";
@@ -408,7 +408,11 @@ export class SearchProviderFactory {
         serpapi: settings.serpapi?.apiKey ? settings.serpapi : existingSettings.serpapi,
         google:
           settings.google?.apiKey || settings.google?.searchEngineId
-            ? { ...existingSettings.google, ...settings.google }
+            ? {
+                apiKey: settings.google.apiKey || existingSettings.google?.apiKey,
+                searchEngineId:
+                  settings.google.searchEngineId || existingSettings.google?.searchEngineId,
+              }
             : existingSettings.google,
         searxng: Object.prototype.hasOwnProperty.call(settings, "searxng")
           ? settings.searxng?.baseUrl
@@ -629,13 +633,7 @@ export class SearchProviderFactory {
    * Get available providers based on saved configuration
    * Note: Environment variables are no longer checked for security reasons.
    */
-  static getAvailableProviders(): Array<{
-    type: SearchProviderType;
-    name: string;
-    description: string;
-    configured: boolean;
-    supportedTypes: SearchType[];
-  }> {
+  static getAvailableProviders(): SearchProviderInfo[] {
     const settings = this.loadSettings();
     return [
       {
@@ -672,6 +670,7 @@ export class SearchProviderFactory {
         description: SEARCH_PROVIDER_INFO.google.description,
         configured: !!(settings.google?.apiKey && settings.google?.searchEngineId),
         supportedTypes: [...SEARCH_PROVIDER_INFO.google.supportedTypes],
+        retirement: { ...SEARCH_PROVIDER_INFO.google.retirement },
       },
       {
         type: "searxng",
@@ -737,13 +736,7 @@ export class SearchProviderFactory {
   static getConfigStatus(): {
     primaryProvider: SearchProviderType | null;
     fallbackProvider: SearchProviderType | null;
-    providers: Array<{
-      type: SearchProviderType;
-      name: string;
-      description: string;
-      configured: boolean;
-      supportedTypes: SearchType[];
-    }>;
+    providers: SearchProviderInfo[];
     isConfigured: boolean;
     searxng: { baseUrl?: string; allowPrivate: boolean };
   } {

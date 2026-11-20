@@ -16,7 +16,11 @@ import typescript from "highlight.js/lib/languages/typescript";
 import xml from "highlight.js/lib/languages/xml";
 import yaml from "highlight.js/lib/languages/yaml";
 import { FileViewerResult } from "../../electron/preload";
-import { buildFileViewerMarkdownComponents } from "./file-viewer-markdown";
+import {
+  addFilePreviewHeadingFragments,
+  buildFileViewerMarkdownComponents,
+  focusFilePreviewFragment,
+} from "./file-viewer-markdown";
 
 if (!hljs.getLanguage("typescript")) {
   hljs.registerLanguage("bash", bash);
@@ -58,6 +62,8 @@ interface FileViewerProps {
   workspacePath?: string;
   onClose: () => void;
 }
+
+type FilePreviewLocation = { path: string; fragment?: string };
 
 const formatSize = (bytes: number): string => {
   if (!Number.isFinite(bytes) || bytes <= 0) return "";
@@ -268,12 +274,17 @@ function JsonNode({ value, name, depth, defaultOpen }: JsonNodeProps) {
 }
 
 export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }: FileViewerProps) {
-  const [fileHistory, setFileHistory] = useState([initialFilePath]);
-  const filePath = fileHistory[fileHistory.length - 1];
+  const [fileHistory, setFileHistory] = useState<FilePreviewLocation[]>([
+    { path: initialFilePath },
+  ]);
+  const { path: filePath, fragment } = fileHistory[fileHistory.length - 1];
   const [loading, setLoading] = useState(true);
-  const [fileData, setFileData] = useState<FileViewerData | null>(null);
+  const [loadedFile, setLoadedFile] = useState<{ path: string; data: FileViewerData } | null>(null);
+  const fileData = loadedFile?.path === filePath ? loadedFile.data : null;
   const [videoPlaybackUrl, setVideoPlaybackUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(
     null,
   );
@@ -282,9 +293,11 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
   const [copyFlash, setCopyFlash] = useState(false);
   const agentContext = useAgentContext();
   const copyTimerRef = useRef<number | null>(null);
+  const actionRequest = useRef(0);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setFileHistory([initialFilePath]);
+    setFileHistory([{ path: initialFilePath }]);
   }, [initialFilePath, workspacePath]);
 
   // Ignore stale reads when navigating quickly or closing the viewer.
@@ -292,15 +305,18 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
     let cancelled = false;
     const loadFile = async () => {
       setLoading(true);
-      setFileData(null);
+      setLoadedFile(null);
       setError(null);
+      setLinkError(null);
+      setActionError(null);
+      setCopyFlash(false);
       try {
         const result = await window.electronAPI.readFileForViewer(filePath, workspacePath, {
           includePdfBase64: true,
         });
         if (cancelled) return;
         if (result.success && result.data) {
-          setFileData(result.data);
+          setLoadedFile({ path: filePath, data: result.data });
         } else {
           setError(result.error || "Failed to load file");
         }
@@ -313,17 +329,35 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
     loadFile();
     return () => {
       cancelled = true;
+      actionRequest.current++;
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
     };
   }, [filePath, workspacePath]);
+
+  useEffect(() => {
+    if (fragment && fileData && contentRef.current) {
+      focusFilePreviewFragment(contentRef.current, fragment);
+    }
+  }, [fragment, fileData]);
 
   const markdownComponents = useMemo(
     () =>
       buildFileViewerMarkdownComponents({
         filePath: fileData?.path || filePath,
-        onOpenFile: (target) => setFileHistory((history) => [...history, target]),
-        onOpenExternal: (url) => window.electronAPI.openExternal(url),
+        onOpenFile: (path, fragment) => {
+          setLinkError(null);
+          setFileHistory((history) => [...history, { path, fragment }]);
+        },
+        onOpenFragment: (value) => {
+          setLinkError(null);
+          if (contentRef.current) focusFilePreviewFragment(contentRef.current, value);
+        },
+        onOpenExternal: (url) => {
+          setLinkError(null);
+          return window.electronAPI.openExternal(url);
+        },
         onError: (cause) =>
-          setError(cause instanceof Error ? cause.message : "Could not open this link."),
+          setLinkError(cause instanceof Error ? cause.message : "Could not open this link."),
       }),
     [fileData?.path, filePath],
   );
@@ -389,40 +423,41 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
     setJsonRaw(false);
   }, [fileData?.fileType, fileData?.path]);
 
-  // Cleanup copy-flash timer
-  useEffect(() => {
-    return () => {
-      if (copyTimerRef.current !== null) {
-        window.clearTimeout(copyTimerRef.current);
-      }
-    };
-  }, []);
-
-  const handleOpenExternal = async () => {
+  const runFileAction = async (action: () => Promise<string | void>, failure: string) => {
+    const request = ++actionRequest.current;
+    setActionError(null);
     try {
-      await window.electronAPI.openFile(filePath, workspacePath);
-    } catch (err) {
-      console.error("Failed to open file externally:", err);
+      const message = await action();
+      if (request !== actionRequest.current) return false;
+      if (message) setActionError(message);
+      return !message;
+    } catch {
+      if (request === actionRequest.current) setActionError(failure);
+      return false;
     }
   };
 
-  const handleShowInFinder = async () => {
-    try {
-      await window.electronAPI.showInFinder(filePath, workspacePath);
-    } catch (err) {
-      console.error("Failed to show file:", err);
-    }
-  };
+  const handleOpenExternal = () =>
+    runFileAction(
+      () => window.electronAPI.openFile(filePath, workspacePath),
+      "Could not open the file in an external app.",
+    );
+
+  const handleShowInFinder = () =>
+    runFileAction(
+      () => window.electronAPI.showInFinder(filePath, workspacePath),
+      "Could not show the file in its folder.",
+    );
+
+  const copyPath = () =>
+    runFileAction(() => navigator.clipboard.writeText(filePath), "Could not copy the file path.");
 
   const handleCopyPath = async () => {
-    try {
-      await navigator.clipboard.writeText(filePath);
-      setCopyFlash(true);
-      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
-      copyTimerRef.current = window.setTimeout(() => setCopyFlash(false), 1400);
-    } catch (err) {
-      console.error("Failed to copy path:", err);
-    }
+    setCopyFlash(false);
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    if (!(await copyPath())) return;
+    setCopyFlash(true);
+    copyTimerRef.current = window.setTimeout(() => setCopyFlash(false), 1400);
   };
 
   const getFileIcon = (type?: FileType): React.ReactNode => {
@@ -555,7 +590,11 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
       case "markdown":
         return (
           <div className="file-viewer-markdown markdown-content">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              rehypePlugins={[addFilePreviewHeadingFragments]}
+              components={markdownComponents}
+            >
               {fileData.content || ""}
             </ReactMarkdown>
           </div>
@@ -878,6 +917,7 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
         src={fileData?.content || undefined}
         fileName={fileData?.fileName || filePath.split("/").pop()}
         meta={subtitle || undefined}
+        actionError={actionError}
         onClose={onClose}
         onShowInFinder={handleShowInFinder}
         onOpenExternal={handleOpenExternal}
@@ -894,8 +934,9 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
         fileName={fileName}
         formatLabel={fileName?.split(".").pop()?.toUpperCase() || "Video"}
         sizeLabel={fileData ? formatSize(fileData.size) || undefined : undefined}
+        actionError={actionError}
         onClose={onClose}
-        onCopyPath={() => navigator.clipboard.writeText(filePath)}
+        onCopyPath={copyPath}
         onShowInFinder={handleShowInFinder}
         onOpenExternal={handleOpenExternal}
       />
@@ -989,7 +1030,12 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
           </div>
         </div>
 
-        <div className="file-viewer-content">
+        {actionError && (
+          <p className="file-viewer-action-error" role="alert">
+            {actionError}
+          </p>
+        )}
+        <div className="file-viewer-content" ref={contentRef}>
           {loading && (
             <div className="file-viewer-loading">
               <div className="file-viewer-spinner"></div>
@@ -1017,6 +1063,7 @@ export function FileViewer({ filePath: initialFilePath, workspacePath, onClose }
             </div>
           )}
 
+          {linkError && <p role="alert">{linkError}</p>}
           {!loading && !error && renderContent()}
         </div>
       </ModalDialog>
