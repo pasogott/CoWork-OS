@@ -7,8 +7,9 @@ import {
   SearchQuery,
   SearchResponse,
   SEARCH_PROVIDER_INFO,
+  isSearchProviderRetired,
 } from "./types";
-import type { SearchProviderInfo } from "../../../shared/types";
+import type { RetiredSearchProviderSwitch, SearchProviderInfo } from "../../../shared/types";
 import { TavilyProvider } from "./tavily-provider";
 import { ExaProvider } from "./exa-provider";
 import { BraveProvider } from "./brave-provider";
@@ -16,6 +17,7 @@ import { SerpApiProvider } from "./serpapi-provider";
 import { GoogleProvider } from "./google-provider";
 import { SearXngProvider } from "./searxng-provider";
 import { DuckDuckGoProvider } from "./duckduckgo-provider";
+import { KeenableProvider } from "./keenable-provider";
 import { SecureSettingsRepository } from "../../database/SecureSettingsRepository";
 import { getUserDataDir } from "../../utils/user-data-dir";
 
@@ -47,6 +49,13 @@ export interface SearchSettings {
     baseUrl?: string;
     allowPrivate?: boolean;
   };
+  /** Keenable is opt-in; the key is optional and only lifts the keyless rate limit. */
+  keenable?: {
+    enabled?: boolean;
+    apiKey?: string;
+  };
+  /** Set when search was moved off a provider whose service shut down (#914). */
+  retiredProviderSwitch?: RetiredSearchProviderSwitch;
 }
 
 const DEFAULT_SETTINGS: SearchSettings = {
@@ -68,6 +77,55 @@ export class SearchProviderFactory {
       failureClass: "provider_quota" | "provider_rate_limit";
     }
   > = new Map();
+
+  /** Clock used for provider retirement dates; tests replace it. */
+  static now(): number {
+    return Date.now();
+  }
+
+  private static isRetired(provider: SearchProviderType): boolean {
+    return isSearchProviderRetired(provider, this.now());
+  }
+
+  /**
+   * Once a provider's service has shut down, move a primary or fallback that still points at
+   * it to the next configured provider, or to DuckDuckGo. Saved credentials stay untouched so
+   * the settings file keeps reading. Returns true when the settings changed.
+   */
+  private static migrateRetiredProviders(settings: SearchSettings): boolean {
+    const primaryRetired = !!settings.primaryProvider && this.isRetired(settings.primaryProvider);
+    const fallbackRetired =
+      !!settings.fallbackProvider && this.isRetired(settings.fallbackProvider);
+    if (!primaryRetired && !fallbackRetired) return false;
+
+    const usable = this.getConfiguredProvidersFromSettings(settings);
+    if (primaryRetired) {
+      const from = settings.primaryProvider as SearchProviderType;
+      const fallback = settings.fallbackProvider;
+      const to: SearchProviderType =
+        fallback && !this.isRetired(fallback) && usable.includes(fallback)
+          ? fallback
+          : usable[0] || "duckduckgo";
+      settings.primaryProvider = to;
+      if (settings.fallbackProvider === to) settings.fallbackProvider = null;
+      settings.retiredProviderSwitch = {
+        from,
+        fromName: SEARCH_PROVIDER_INFO[from].displayName,
+        to,
+        toName: SEARCH_PROVIDER_INFO[to].displayName,
+        at: new Date(this.now()).toISOString(),
+      };
+      console.log(`[SearchProviderFactory] ${from} has shut down; primary provider is now ${to}`);
+    }
+    if (settings.fallbackProvider && this.isRetired(settings.fallbackProvider)) {
+      console.log(
+        `[SearchProviderFactory] ${settings.fallbackProvider} has shut down; fallback cleared`,
+      );
+      settings.fallbackProvider = null;
+    }
+    if (settings.primaryProvider === "searxng") settings.fallbackProvider = null;
+    return true;
+  }
 
   private static async sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -320,6 +378,9 @@ export class SearchProviderFactory {
         const stored = repository.load<SearchSettings>("search");
         if (stored) {
           settings = { ...DEFAULT_SETTINGS, ...stored };
+          if (this.migrateRetiredProviders(settings)) {
+            repository.save("search", settings);
+          }
         }
       }
     } catch (error) {
@@ -369,12 +430,15 @@ export class SearchProviderFactory {
     if (settings.serpapi?.apiKey) {
       configured.push("serpapi");
     }
-    // Check Google (requires both API key and Search Engine ID)
-    if (settings.google?.apiKey && settings.google?.searchEngineId) {
+    // Check Google (requires both API key and Search Engine ID; never after it shuts down)
+    if (settings.google?.apiKey && settings.google?.searchEngineId && !this.isRetired("google")) {
       configured.push("google");
     }
     if (settings.searxng?.baseUrl) {
       configured.push("searxng");
+    }
+    if (settings.keenable?.enabled === true) {
+      configured.push("keenable");
     }
 
     return configured;
@@ -419,6 +483,13 @@ export class SearchProviderFactory {
             ? { ...settings.searxng, baseUrl: settings.searxng.baseUrl.trim() }
             : undefined
           : existingSettings.searxng,
+        keenable: Object.prototype.hasOwnProperty.call(settings, "keenable")
+          ? {
+              enabled: settings.keenable?.enabled === true,
+              apiKey: settings.keenable?.apiKey?.trim() || existingSettings.keenable?.apiKey,
+            }
+          : existingSettings.keenable,
+        retiredProviderSwitch: existingSettings.retiredProviderSwitch,
       };
 
       const configuredProviders = this.getConfiguredProvidersFromSettings(settingsToSave);
@@ -474,6 +545,7 @@ export class SearchProviderFactory {
       googleSearchEngineId: settings.google?.searchEngineId,
       searxngBaseUrl: settings.searxng?.baseUrl,
       searxngAllowPrivate: settings.searxng?.allowPrivate,
+      keenableApiKey: settings.keenable?.apiKey,
     };
   }
 
@@ -496,6 +568,15 @@ export class SearchProviderFactory {
    * Create provider from explicit config
    */
   static createProviderFromConfig(config: SearchProviderConfig): SearchProvider {
+    if (this.isRetired(config.type)) {
+      const info = SEARCH_PROVIDER_INFO[config.type] as {
+        displayName: string;
+        retirement?: { endsOn: string };
+      };
+      throw new Error(
+        `${info.displayName} shut down on ${info.retirement?.endsOn}. Choose another search provider in Settings.`,
+      );
+    }
     switch (config.type) {
       case "tavily":
         return new TavilyProvider(config);
@@ -509,6 +590,8 @@ export class SearchProviderFactory {
         return new GoogleProvider(config);
       case "searxng":
         return new SearXngProvider(config);
+      case "keenable":
+        return new KeenableProvider(config);
       case "duckduckgo":
         return new DuckDuckGoProvider(config);
       default:
@@ -635,7 +718,7 @@ export class SearchProviderFactory {
    */
   static getAvailableProviders(): SearchProviderInfo[] {
     const settings = this.loadSettings();
-    return [
+    const providers: SearchProviderInfo[] = [
       {
         type: "tavily",
         name: SEARCH_PROVIDER_INFO.tavily.displayName,
@@ -680,6 +763,13 @@ export class SearchProviderFactory {
         supportedTypes: [...SEARCH_PROVIDER_INFO.searxng.supportedTypes],
       },
       {
+        type: "keenable",
+        name: SEARCH_PROVIDER_INFO.keenable.displayName,
+        description: SEARCH_PROVIDER_INFO.keenable.description,
+        configured: settings.keenable?.enabled === true,
+        supportedTypes: [...SEARCH_PROVIDER_INFO.keenable.supportedTypes],
+      },
+      {
         type: "duckduckgo",
         name: SEARCH_PROVIDER_INFO.duckduckgo.displayName,
         description: SEARCH_PROVIDER_INFO.duckduckgo.description,
@@ -687,6 +777,8 @@ export class SearchProviderFactory {
         supportedTypes: [...SEARCH_PROVIDER_INFO.duckduckgo.supportedTypes],
       },
     ];
+    // A provider whose service has shut down is no longer offered at all.
+    return providers.filter((provider) => !this.isRetired(provider.type));
   }
 
   /**
@@ -738,7 +830,9 @@ export class SearchProviderFactory {
     fallbackProvider: SearchProviderType | null;
     providers: SearchProviderInfo[];
     isConfigured: boolean;
+    retiredProviderSwitch?: RetiredSearchProviderSwitch;
     searxng: { baseUrl?: string; allowPrivate: boolean };
+    keenable: { enabled: boolean; hasApiKey: boolean };
   } {
     const settings = this.loadSettings();
     return {
@@ -746,9 +840,16 @@ export class SearchProviderFactory {
       fallbackProvider: settings.fallbackProvider,
       providers: this.getAvailableProviders(),
       isConfigured: this.isAnyProviderConfigured(),
+      ...(settings.retiredProviderSwitch
+        ? { retiredProviderSwitch: { ...settings.retiredProviderSwitch } }
+        : {}),
       searxng: {
         baseUrl: settings.searxng?.baseUrl,
         allowPrivate: settings.searxng?.allowPrivate === true,
+      },
+      keenable: {
+        enabled: settings.keenable?.enabled === true,
+        hasApiKey: !!settings.keenable?.apiKey,
       },
     };
   }

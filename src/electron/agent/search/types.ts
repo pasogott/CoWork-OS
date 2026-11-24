@@ -11,6 +11,7 @@ export type SearchProviderType =
   | "serpapi"
   | "google"
   | "searxng"
+  | "keenable"
   | "duckduckgo";
 
 export type SearchType = "web" | "news" | "images";
@@ -31,6 +32,8 @@ export interface SearchProviderConfig {
   // SearXNG-specific
   searxngBaseUrl?: string;
   searxngAllowPrivate?: boolean;
+  // Keenable-specific (optional: without a key the keyless endpoint is used)
+  keenableApiKey?: string;
 }
 
 export interface SearchQuery {
@@ -171,6 +174,13 @@ export const SEARCH_PROVIDER_INFO = {
     supportedTypes: ["web", "news", "images"] as SearchType[],
     signupUrl: "https://docs.searxng.org/admin/installation.html",
   },
+  keenable: {
+    displayName: "Keenable",
+    description: "Web search on Keenable's own index; works without an API key",
+    supportedTypes: ["web"] as SearchType[],
+    envVar: "KEENABLE_API_KEY",
+    signupUrl: "https://docs.keenable.ai/api-keys",
+  },
   duckduckgo: {
     displayName: "DuckDuckGo",
     description: "Free built-in web search — no API key required",
@@ -178,3 +188,17 @@ export const SEARCH_PROVIDER_INFO = {
     signupUrl: "https://duckduckgo.com/",
   },
 } as const;
+
+/**
+ * True once a provider's upstream service has shut down (its `retirement.endsOn` date
+ * has started, in local time). A retired provider gets no requests (#914).
+ */
+export function isSearchProviderRetired(
+  type: SearchProviderType,
+  nowMs: number = Date.now(),
+): boolean {
+  const info = SEARCH_PROVIDER_INFO[type] as { retirement?: { endsOn: string } };
+  if (!info.retirement) return false;
+  const endsAt = new Date(`${info.retirement.endsOn}T00:00:00`).getTime();
+  return Number.isFinite(endsAt) && nowMs >= endsAt;
+}

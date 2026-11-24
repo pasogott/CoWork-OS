@@ -9235,6 +9235,7 @@ export const CUSTOM_LLM_PROVIDER_TYPES = [
   "hf-agents",
   "mlx",
   "omlx",
+  "rapid-mlx",
 ] as const;
 
 export const LLM_PROVIDER_TYPES = [
@@ -9250,6 +9251,7 @@ export const LLM_PROVIDER_DISPLAY: Record<string, { name: string; icon: string; 
   bedrock: { name: "Bedrock", icon: "\u{2601}\uFE0F", color: "#ff9900" },
   ollama: { name: "Ollama", icon: "\u{1F999}", color: "#0ea5e9" },
   omlx: { name: "oMLX", icon: "\u{1F9E0}", color: "#14b8a6" },
+  "rapid-mlx": { name: "Rapid-MLX", icon: "\u{26A1}", color: "#f97316" },
   mlx: { name: "MLX (Apple Silicon)", icon: "\u{1F9E0}", color: "#8b5cf6" },
   gemini: { name: "Gemini", icon: "\u{2728}", color: "#6366f1" },
   openrouter: { name: "OpenRouter", icon: "\u{1F310}", color: "#8b5cf6" },
@@ -10189,6 +10191,7 @@ export type SearchProviderType =
   | "serpapi"
   | "google"
   | "searxng"
+  | "keenable"
   | "duckduckgo";
 export type SearchType = "web" | "news" | "images";
 export type WebSearchMode = "disabled" | "cached" | "live";
@@ -10498,14 +10501,33 @@ export interface SearchProviderInfo {
   retirement?: SearchProviderRetirement;
 }
 
+/** Recorded when web search was moved off a provider whose service shut down. */
+export interface RetiredSearchProviderSwitch {
+  /** The shut-down provider that was primary or fallback. */
+  from: SearchProviderType;
+  fromName: string;
+  /** The provider now used as primary. */
+  to: SearchProviderType;
+  toName: string;
+  /** ISO timestamp of the switch. */
+  at: string;
+}
+
 export interface SearchConfigStatus {
   primaryProvider: SearchProviderType | null;
   fallbackProvider: SearchProviderType | null;
   providers: SearchProviderInfo[];
   isConfigured: boolean;
+  /** Set once search was moved off a shut-down provider, so the UI can say so. */
+  retiredProviderSwitch?: RetiredSearchProviderSwitch;
   searxng: {
     baseUrl?: string;
     allowPrivate: boolean;
+  };
+  /** Keenable is opt-in; `hasApiKey` says a key is saved without exposing it. */
+  keenable?: {
+    enabled: boolean;
+    hasApiKey: boolean;
   };
 }
 
