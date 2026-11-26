@@ -21,6 +21,7 @@ CoWork OS is a free, open-source, GUI-first, CLI-capable local AI super app, eve
 - **Composer mention layer**: the renderer and Electron preload expose a grouped `@` autocomplete for Agents, configured Integrations, and Files. Integration mentions are resolved locally, render as rich chips, persist in task/session metadata, and inject soft routing guidance into the executor without changing permissions or `allowedTools`. See [Composer Mentions](composer-mentions.md).
 - **Composer prediction layer**: enabled-by-default renderer predictions request a bounded recent conversation through main-window-only Electron IPC after completion. The selected provider supplies its Cheap model when profile routing is enabled, or its default model otherwise; generation consumes tokens even when suggestions are dismissed. One cancellable provider call, a bounded queue, revision checks, and a successful-result cache fence stale work. The first usable prediction enables a persistent sidebar notice with a one-time tooltip and a link to the Appearance on/off setting. See [Composer Predictions](composer-predictions.md).
 - **Message shortcut layer**: the renderer exposes one `/` picker for deterministic app commands and skill-backed workflow shortcuts. Shared app command parsing handles `/schedule`, `/clear`, `/plan`, `/cost`, `/multitask`, `/compact`, `/doctor`, and `/undo`; plugin-pack aliases resolve to target skill IDs before generic skill slash execution. Skill-backed picker selections insert editable slash tokens before launch, and Claude-for-Legal workflows can surface structured main-view matter intake cards. See [Message Box Shortcuts](message-box-shortcuts.md) and [Claude-for-Legal Workflows](claude-for-legal.md).
+- **Command menu layer**: Cmd/Ctrl+K opens one renderer overlay (`src/renderer/components/CommandMenu`) over app actions and sidebar destinations, the sessions already loaded in the app, the Settings sections (the Settings sidebar list and its search terms, loaded with the Settings chunk) and message text through the existing `queryUnifiedRecall` IPC for the current workspace. It adds no IPC channel and no main-process code. See [Command menu](command-menu.md).
 - **Chronicle screen-context lane**: desktop-only passive recent-screen capture, local ranking/OCR enrichment, source resolution, provenance-aware `screen_context_resolve` tool exposure, and promotion of task-used observations into workspace-backed `screen_context` evidence plus optional linked background memory generation. See [Chronicle](chronicle.md).
 - **Managed resource layer**: first-class `ManagedAgent`, `ManagedEnvironment`, and `ManagedSession` resources package reusable execution definitions and durable run identities on top of existing `Task`, `AgentTeamRun`, and `SessionRuntime` primitives. The renderer exposes them through Workspace agents on the Bots page, but all manual agent actions create runtime managed sessions and open their backing tasks in the main task view rather than running in a separate agent-detail chat surface. See [Managed Agents](managed-agents.md).
 - **Persistent bot layer**: reusable `AgentRole` identities power the sidebar Bots roster and durable bot conversations. Bot transcripts reuse `Task` and `task_events` storage but are marked with `agentConfig.botConversation`, filtered out of Sessions, and queried by workspace plus role. Workspace-scoped persistent bot teams verify peer messages before waking teammate conversations. See [Bots, conversations, and tasks](bots-and-conversations.md).
@@ -526,3 +527,27 @@ task with a notification. It cancels only when the user allows it. Every decisio
 Electron `powerMonitor` suspend/resume (a wall-clock jump detector on the daemon) reclaims
 activity leases that expired while asleep, re-arms background-process completion delivery,
 excludes the slept time from the queue timeout, and resumes interrupted tasks.
+
+## Keep-awake, quit confirmation and completion alerts
+
+Three desktop behaviours follow the tray settings (Settings > System & Security > Menu Bar);
+all are on by default and none runs in headless mode.
+
+- **Keep-awake**: `KeepAwakeController` (`src/electron/power/keep-awake.ts`) holds an Electron
+  `powerSaveBlocker` of type `prevent-app-suspension` while `countWorkingTasks` finds a task
+  in `planning` or `executing`, and releases it otherwise. A task that holds a run slot while
+  it waits for an approval or an answer is not counted. This blocks idle system sleep only.
+- **Quit confirmation**: `createQuitConfirmation` (`src/electron/utils/quit-confirmation.ts`)
+  is asked by `installGracefulShutdown` before cleanup starts, and by the main window's
+  `close` event where closing the last window quits the app (not macOS, and not when the tray
+  hides the window). It asks only when a task is working, and never during a system shutdown
+  or a mock-keychain (test harness) launch.
+- **Completion alerts**: `attachCompletionAlerts`
+  (`src/electron/notifications/completion-alerts.ts`) listens for a finished or failed turn
+  and adds a `task_completed` or `task_failed` notification for a task a person started,
+  according to `completionNotifications` (`never`, `unfocused`, `always`). Sub-agents,
+  scheduled tasks, bots and channel tasks are excluded because they report on their own paths.
+
+Approval and question alerts are decided where the renderer adds the `input_required`
+notification: with the matching toggle off it passes `desktopAlert: false`, so the inbox item
+is stored and no banner is shown. The chosen alert sound is passed to `NativeNotificationCenter`.

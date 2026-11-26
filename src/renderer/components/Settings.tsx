@@ -279,7 +279,7 @@ const TaskTraceDebuggerPanel = lazySettingsPanel(
   () => import("./TaskTraceDebuggerPanel"),
   "TaskTraceDebuggerPanel",
 );
-type SettingsTab =
+export type SettingsTab =
   | "appearance"
   | "personality"
   | "system"
@@ -1051,6 +1051,12 @@ export const sidebarSearchEntries: Partial<Record<SettingsTab, SidebarSearchEntr
         "tray",
         "menu bar",
         "system settings",
+        "notifications",
+        "alerts",
+        "alert sound",
+        "keep awake",
+        "sleep",
+        "quit",
       ],
     },
   ],
