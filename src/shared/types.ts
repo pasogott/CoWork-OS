@@ -9139,6 +9139,11 @@ export const IPC_CHANNELS = {
   AGENT_IMPORT_DETECT: "agentImport:detect",
   AGENT_IMPORT_PREVIEW: "agentImport:preview",
   AGENT_IMPORT_APPLY: "agentImport:apply",
+  // Settings > Storage
+  STORAGE_GET_BREAKDOWN: "storage:getBreakdown",
+  STORAGE_CLEAR_CACHE: "storage:clearCache",
+  STORAGE_TRASH_DATABASE_COPIES: "storage:trashDatabaseCopies",
+  STORAGE_OPEN_FOLDER: "storage:openFolder",
   // PACT business agents (docs/pact.md). Sign-in links never reach the desktop renderer:
   // PACT_AUTHORIZATION_OPEN_SIGN_IN opens the business's login in the system browser from main.
   PACT_STATUS: "pact:status",
@@ -13758,10 +13763,18 @@ export interface StrategicPlannerRunRequest {
   trigger?: StrategicPlannerRun["trigger"];
 }
 
-// Importing another agent's home (docs/migrating-from-hermes.md, docs/migrating-from-openclaw.md)
+// Importing another agent's home (docs/migrating-from-hermes.md, docs/migrating-from-openclaw.md,
+// docs/migrating-from-claude-code-and-cursor.md)
 
-export const AGENT_IMPORT_SOURCES = ["hermes", "openclaw"] as const;
+export const AGENT_IMPORT_SOURCES = ["hermes", "openclaw", "claude-code", "cursor"] as const;
 export type AgentImportSource = (typeof AGENT_IMPORT_SOURCES)[number];
+
+export const AGENT_IMPORT_SOURCE_NAMES: Record<AgentImportSource, string> = {
+  hermes: "Hermes Agent",
+  openclaw: "OpenClaw",
+  "claude-code": "Claude Code",
+  cursor: "Cursor",
+};
 
 export type AgentImportCategory =
   | "persona"
@@ -13773,7 +13786,10 @@ export type AgentImportCategory =
   | "channel"
   | "command_rule"
   | "scheduled_task"
-  | "workspace_instructions";
+  | "workspace_instructions"
+  /** Standing guidance for every session (Settings > Personality > Response guidance). */
+  | "custom_instructions"
+  | "mcp_server";
 
 /** One thing an import would bring over. Never carries a secret value. */
 export interface AgentImportPreviewItem {
