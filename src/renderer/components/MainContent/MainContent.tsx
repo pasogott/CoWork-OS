@@ -115,6 +115,7 @@ import {
   Workspace,
   isTempWorkspaceId,
   type MessageSurfaceOrigin,
+  type RunningSendMode,
   type TerminalBlockRunResult,
 } from "../../../shared/types";
 import { parseUserMessageAttachmentMetadata } from "../../../shared/user-message-attachments";
@@ -396,6 +397,7 @@ import {
   type TaskTimelineItem,
   type TranscriptMode,
 } from "./task-feed-logic";
+import { pruneStaleMentionSpans } from "./effect-update-guards";
 import {
   isTurnThisIntoRoutinePrompt,
   taskCanBecomeRoutineFromFollowUp,
@@ -469,6 +471,13 @@ const SkillParameterModal = preloadableLazy(() =>
 
 import { useTaskProposals } from "../../hooks/useTaskProposals";
 import { SuggestedTasksContext, type SuggestedTasksContextValue } from "./suggested-tasks-context";
+import type { WindowCaptureRequest } from "../../utils/window-capture";
+import {
+  DEFAULT_RUNNING_SEND_MODE,
+  isAlternateSendChord,
+  runningSendHint,
+  shouldWaitForTurn,
+} from "../../utils/running-send";
 import type { SuggestedTaskOptionsContext } from "./SuggestedTaskOptionsPopover";
 
 const TaskConversationFlow = preloadableLazy(() =>
@@ -595,6 +604,7 @@ interface MainContentProps {
     options?: {
       interactionMode?: InteractionModeSelection;
       deliveryMode?: "message" | "follow_up";
+      waitForTurn?: boolean;
       messageId?: string;
       permissionMode?: PermissionMode;
       shellAccess?: boolean;
@@ -661,6 +671,11 @@ interface MainContentProps {
   homeNextActionsEnabled?: boolean;
   /** Open a finished turn's single new document, sheet, deck or page in the right panel. */
   autoOpenTurnOutput?: boolean;
+  /** What Enter does while the agent works; Cmd/Ctrl+Enter does the other. */
+  runningSendMode?: RunningSendMode;
+  /** A window captured with the global shortcut, to attach to this composer. */
+  windowCaptureRequest?: WindowCaptureRequest | null;
+  onWindowCaptureConsumed?: (id: number) => void;
   rendererPerfLoggingEnabled?: boolean;
   taskSwitchId?: string | null;
   hasMoreTimelineHistory?: boolean;
@@ -938,6 +953,9 @@ function MainContentComponent({
   homeResearchVaultEnabled = false,
   homeNextActionsEnabled = false,
   autoOpenTurnOutput = false,
+  runningSendMode = DEFAULT_RUNNING_SEND_MODE,
+  windowCaptureRequest = null,
+  onWindowCaptureConsumed,
   rendererPerfLoggingEnabled = false,
   taskSwitchId = null,
   hasMoreTimelineHistory = false,
@@ -2424,6 +2442,8 @@ function MainContentComponent({
     () => isTaskActivelyWorking(task, events, hasActiveChildren),
     [task, events, hasActiveChildren],
   );
+  const alternateSendRef = useRef(false);
+  const isMacPlatform = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
   const composerPredictionRevision = useMemo(() => predictionRevision(rawEvents), [rawEvents]);
   const composerPrediction = useComposerPrediction(
@@ -3278,18 +3298,14 @@ function MainContentComponent({
     return index;
   }, [integrationMentionOptions]);
 
+  // Drop mention chips whose text was edited away. Runs after every keystroke, so it sets
+  // state only when a chip is stale (see effect-update-guards).
   useEffect(() => {
-    setIntegrationMentionSpans((current) => {
-      const next = current.filter(
-        (span) =>
-          span.end <= inputValue.length &&
-          inputValue.slice(span.start, span.end) === `@${span.mention.label}`,
-      );
-      if (next.length === current.length) return current;
-      recordDraftMutation(onDraftPatch?.({ mentions: next }));
-      return next;
-    });
-  }, [inputValue, onDraftPatch]);
+    const next = pruneStaleMentionSpans(inputValue, integrationMentionSpans);
+    if (next === integrationMentionSpans) return;
+    setIntegrationMentionSpans(next);
+    recordDraftMutation(onDraftPatch?.({ mentions: next }));
+  }, [inputValue, integrationMentionSpans, onDraftPatch]);
 
   const selectedIntegrationMentions = useMemo<IntegrationMentionSelection[]>(() => {
     const byId = new Map<string, IntegrationMentionSelection>();
@@ -4557,6 +4573,20 @@ function MainContentComponent({
     });
   };
 
+  // Take a window captured with the global shortcut: attach it here, then focus the message
+  // box so the person can say what they want. Nothing is sent until they send.
+  const appendPendingAttachmentsRef = useRef(appendPendingAttachments);
+  appendPendingAttachmentsRef.current = appendPendingAttachments;
+  useEffect(() => {
+    if (!windowCaptureRequest) return;
+    appendPendingAttachmentsRef.current(
+      windowCaptureRequest.attachments,
+      attachmentOwnerFenceRef.current.capture(),
+    );
+    onWindowCaptureConsumed?.(windowCaptureRequest.id);
+    window.setTimeout(() => promptInputRef.current?.focus(), 0);
+  }, [windowCaptureRequest, onWindowCaptureConsumed]);
+
   const handleAttachFiles = async () => {
     const isCurrentOwner = attachmentOwnerFenceRef.current.capture();
     try {
@@ -4808,6 +4838,9 @@ function MainContentComponent({
   };
 
   const handleSend = async () => {
+    // Cmd/Ctrl+Enter sets this just before calling; read it once so a later send is plain.
+    const alternateSend = alternateSendRef.current;
+    alternateSendRef.current = false;
     if (!permissionSettingsLoaded) {
       setAttachmentError("Loading access profiles. Try again in a moment.");
       return;
@@ -5395,6 +5428,13 @@ function MainContentComponent({
             integrationMentions: selectedIntegrationMentions,
             returnOnAccepted: true,
             deliveryMode: "follow_up",
+            ...(shouldWaitForTurn({
+              working: isTaskWorking,
+              mode: runningSendMode,
+              alternate: alternateSend,
+            })
+              ? { waitForTurn: true }
+              : {}),
             messageId,
             ...(taskAccessProfileId ? { accessProfileId: taskAccessProfileId } : {}),
           },
@@ -6125,6 +6165,7 @@ function MainContentComponent({
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      alternateSendRef.current = isAlternateSendChord(e, isMacPlatform);
       void handleSend();
     }
   };
@@ -9993,6 +10034,11 @@ function MainContentComponent({
               )}
             </div>
           </div>
+          {isTaskWorking && !isBrowserHost && (
+            <div className="composer-running-send-hint">
+              {runningSendHint(runningSendMode, isMacPlatform)}
+            </div>
+          )}
           <div className="input-below-actions">
             {uiDensity !== "focused" && (
               <>
@@ -10303,6 +10349,9 @@ function areMainContentPropsEqual(prev: MainContentProps, next: MainContentProps
     prev.homeResearchVaultEnabled === next.homeResearchVaultEnabled &&
     prev.homeNextActionsEnabled === next.homeNextActionsEnabled &&
     prev.autoOpenTurnOutput === next.autoOpenTurnOutput &&
+    prev.runningSendMode === next.runningSendMode &&
+    prev.windowCaptureRequest === next.windowCaptureRequest &&
+    prev.onWindowCaptureConsumed === next.onWindowCaptureConsumed &&
     prev.rendererPerfLoggingEnabled === next.rendererPerfLoggingEnabled &&
     prev.taskSwitchId === next.taskSwitchId &&
     prev.hasMoreTimelineHistory === next.hasMoreTimelineHistory &&

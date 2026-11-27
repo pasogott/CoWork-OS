@@ -35,6 +35,13 @@ export type TimelineVerbosity = "summary" | "verbose";
 export const COMMAND_OUTPUT_STYLES = ["terminal", "minimal"] as const;
 export type CommandOutputStyle = (typeof COMMAND_OUTPUT_STYLES)[number];
 
+/**
+ * What Enter does with a message sent while the agent is working: "steer" gives it to the
+ * running loop at its next step, "queue" holds it until the run finishes. Cmd/Ctrl+Enter does
+ * the other one.
+ */
+export type RunningSendMode = "steer" | "queue";
+
 export interface AppearanceSettings {
   themeMode: ThemeMode;
   visualTheme: VisualTheme;
@@ -47,6 +54,7 @@ export interface AppearanceSettings {
   homeResearchVaultEnabled?: boolean;
   homeNextActionsEnabled?: boolean;
   costReceiptEnabled?: boolean; // Show the Cost section in the right panel (default: off)
+  runningSendMode?: RunningSendMode; // Enter while the agent works: steer now or send after the run (default: steer)
   autoOpenTurnOutput?: boolean; // Open a turn's single new document/sheet/deck/page in the right panel when the turn finishes (default: off)
   subAgentStatsEnabled?: boolean; // Show sub-agent totals in the right panel (default: off)
   language?: string; // Persisted language preference (e.g. 'en', 'ja', 'zh')
@@ -116,7 +124,33 @@ export interface TraySettings {
   preventSleepWhileRunning: boolean;
   /** Ask before quitting while tasks are still running. */
   confirmQuitWhileRunning: boolean;
+  /** macOS: Cmd+Shift+2 from any app attaches the window in front to the message box. */
+  windowCaptureShortcut: boolean;
 }
+
+/**
+ * What the window-capture shortcut sends to the renderer: the window's picture and a short
+ * text note (app, window title, page address, text read from the picture), to attach to the
+ * message box. Nothing is sent to a model until the person sends the message.
+ */
+export type WindowCaptureResult =
+  | {
+      ok: true;
+      appName: string;
+      windowTitle: string;
+      url?: string;
+      imageBase64: string;
+      imageWidth: number;
+      imageHeight: number;
+      /** Markdown note attached next to the picture. */
+      note: string;
+      capturedAt: number;
+    }
+  | {
+      ok: false;
+      reason: "self" | "screen_recording" | "not_found" | "failed";
+      message: string;
+    };
 
 /** Which toggle decides a desktop alert for a task that is waiting on the person. */
 export function wantsAttentionAlert(
@@ -3385,6 +3419,12 @@ export interface TaskFollowUpInput {
   message: string;
   /** Optional optimistic-concurrency guard for steering the active turn. */
   expectedTurnId?: string;
+  /**
+   * Sent while the task was working: hold it until the current run finishes and then start a
+   * new turn with it, instead of steering the running loop at its next step. Ignored when the
+   * task is idle. Later messages stay behind it, so the queue keeps the order they were sent.
+   */
+  waitForTurn?: boolean;
   images?: ImageAttachment[];
   quotedAssistantMessage?: QuotedAssistantMessage;
   permissionMode?: PermissionMode;
@@ -8801,6 +8841,8 @@ export const IPC_CHANNELS = {
   TRAY_OPEN_ABOUT: "tray:openAbout",
   QUICK_INPUT_SUBMIT: "quick-input:submit",
   QUICK_INPUT_CLOSE: "quick-input:close",
+  // Main -> renderer: the window-capture shortcut grabbed the window in front.
+  WINDOW_CAPTURE_RESULT: "window-capture:result",
 
   // Cron (Scheduled Tasks)
   CRON_GET_STATUS: "cron:getStatus",

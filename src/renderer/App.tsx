@@ -45,7 +45,17 @@ import {
   isCommandMenuShortcut,
   type CommandMenuAction,
   type CommandMenuActionSpec,
+  type CommandMenuScope,
 } from "./components/CommandMenu/command-menu-model";
+import {
+  buildKeyboardShortcuts,
+  isNextAttentionShortcut,
+  isShortcutListShortcut,
+  sessionPositionFromShortcut,
+} from "./components/CommandMenu/keyboard-shortcuts";
+import { nextAttentionSessionId, sessionIdAtPosition } from "./utils/session-navigation";
+import { DEFAULT_RUNNING_SEND_MODE, isRunningSendMode } from "./utils/running-send";
+import { windowCaptureAttachments, type WindowCaptureRequest } from "./utils/window-capture";
 import {
   EMPTY_HOME_SESSIONS,
   buildHomeSessions,
@@ -155,6 +165,7 @@ import {
   TaskEventDetailResult,
   BotNotificationPolicy,
   type MessageSurfaceOrigin,
+  type RunningSendMode,
   wantsAttentionAlert,
 } from "../shared/types";
 import type { ComposerDraft, DraftAttachmentRef } from "../shared/composer-drafts";
@@ -909,6 +920,9 @@ type SelectedTaskWorkspaceViewProps = {
   costReceiptEnabled: boolean;
   subAgentStatsEnabled: boolean;
   autoOpenTurnOutput: boolean;
+  runningSendMode: RunningSendMode;
+  windowCaptureRequest: WindowCaptureRequest | null;
+  onWindowCaptureConsumed: (id: number) => void;
   rendererPerfLoggingEnabled: boolean;
   taskSwitchId: string | null;
   hasMoreTimelineHistory: boolean;
@@ -954,6 +968,7 @@ type SelectedTaskWorkspaceViewProps = {
     options?: {
       interactionMode?: import("../shared/interaction-mode").InteractionModeSelection;
       deliveryMode?: "message" | "follow_up";
+      waitForTurn?: boolean;
       messageId?: string;
       permissionMode?: PermissionMode;
       shellAccess?: boolean;
@@ -1092,6 +1107,9 @@ const SelectedTaskWorkspaceView = memo(
     costReceiptEnabled,
     subAgentStatsEnabled,
     autoOpenTurnOutput,
+    runningSendMode,
+    windowCaptureRequest,
+    onWindowCaptureConsumed,
     rendererPerfLoggingEnabled,
     taskSwitchId,
     hasMoreTimelineHistory,
@@ -1823,6 +1841,9 @@ const SelectedTaskWorkspaceView = memo(
               <MainContent
                 key={task?.id || "empty"}
                 autoOpenTurnOutput={autoOpenTurnOutput}
+                runningSendMode={runningSendMode}
+                windowCaptureRequest={windowCaptureRequest}
+                onWindowCaptureConsumed={onWindowCaptureConsumed}
                 headerPlacement="title-bar"
                 rightPanelOpen={!effectiveRightCollapsed && !remoteTaskView}
                 task={task}
@@ -2108,6 +2129,9 @@ const SelectedTaskWorkspaceView = memo(
     prev.costReceiptEnabled === next.costReceiptEnabled &&
     prev.subAgentStatsEnabled === next.subAgentStatsEnabled &&
     prev.autoOpenTurnOutput === next.autoOpenTurnOutput &&
+    prev.runningSendMode === next.runningSendMode &&
+    prev.windowCaptureRequest === next.windowCaptureRequest &&
+    prev.onWindowCaptureConsumed === next.onWindowCaptureConsumed &&
     prev.subAgentsFocusRequest === next.subAgentsFocusRequest &&
     prev.rendererPerfLoggingEnabled === next.rendererPerfLoggingEnabled &&
     prev.effectiveRightCollapsed === next.effectiveRightCollapsed &&
@@ -2384,6 +2408,14 @@ export function App() {
   // Bumped to remount Settings on a new tab while it is already open; it reads the tab once.
   const [settingsNavKey, setSettingsNavKey] = useState(0);
   const [commandMenuOpen, setCommandMenuOpen] = useState(false);
+  // The scope the menu opens on, and a counter that remounts it on every open.
+  const [commandMenuScope, setCommandMenuScope] = useState<CommandMenuScope>("all");
+  const [commandMenuOpenCount, setCommandMenuOpenCount] = useState(0);
+  // Sessions in the sidebar list, top to bottom, for Ctrl/Alt+1–9 and "next that needs you".
+  const sidebarSessionOrderRef = useRef<readonly string[]>([]);
+  const handleSidebarSessionOrderChange = useCallback((taskIds: readonly string[]) => {
+    sidebarSessionOrderRef.current = taskIds;
+  }, []);
   const [homeAutomationFocusTick, setHomeAutomationFocusTick] = useState(0);
   const [focusAutomationRoutine, setFocusAutomationRoutine] = useState<{ id: string } | null>(null);
   const [focusAutomationOwner, setFocusAutomationOwner] = useState<{
@@ -2531,6 +2563,15 @@ export function App() {
   const [costReceiptEnabled, setCostReceiptEnabled] = useState(false);
   const [subAgentStatsEnabled, setSubAgentStatsEnabled] = useState(false);
   const [autoOpenTurnOutput, setAutoOpenTurnOutput] = useState(false);
+  const [runningSendMode, setRunningSendMode] =
+    useState<RunningSendMode>(DEFAULT_RUNNING_SEND_MODE);
+  // A window captured with the global shortcut, waiting for the open composer to take it.
+  const [windowCaptureRequest, setWindowCaptureRequest] = useState<WindowCaptureRequest | null>(
+    null,
+  );
+  const handleWindowCaptureConsumed = useCallback((id: number) => {
+    setWindowCaptureRequest((current) => (current?.id === id ? null : current));
+  }, []);
 
   // Queue state
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
@@ -3697,6 +3738,11 @@ export function App() {
         setCostReceiptEnabled(settings.costReceiptEnabled === true);
         setSubAgentStatsEnabled(settings.subAgentStatsEnabled === true);
         setAutoOpenTurnOutput(settings.autoOpenTurnOutput === true);
+        setRunningSendMode(
+          isRunningSendMode(settings.runningSendMode)
+            ? settings.runningSendMode
+            : DEFAULT_RUNNING_SEND_MODE,
+        );
         setDisclaimerAccepted(settings.disclaimerAccepted ?? false);
         setOnboardingCompleted(settings.onboardingCompleted ?? false);
         setOnboardingCompletedAt(settings.onboardingCompletedAt);
@@ -7092,6 +7138,8 @@ export function App() {
       integrationMentions?: IntegrationMentionSelection[];
       returnOnAccepted?: boolean;
       deliveryMode?: "message" | "follow_up";
+      /** Hold this message until the running turn finishes instead of steering it. */
+      waitForTurn?: boolean;
       messageId?: string;
       /** Send exactly this text (an approved answer action), never a rewritten reply. */
       verbatim?: boolean;
@@ -7361,6 +7409,22 @@ export function App() {
     const unsubscribers = [
       api?.onTrayNewTask?.(() => void handleNewSessionRef.current()),
       api?.onTrayOpenSettings?.(() => setCurrentView("settings")),
+      // The window-capture shortcut (macOS): attach the captured window to the open composer.
+      api?.onWindowCapture?.((result) => {
+        if (!result.ok) {
+          addToastRef.current({
+            type: result.reason === "self" ? "info" : "warning",
+            title: "Window not captured",
+            message: result.message,
+          });
+          return;
+        }
+        setCurrentView("main");
+        setWindowCaptureRequest({
+          id: result.capturedAt,
+          attachments: windowCaptureAttachments(result),
+        });
+      }),
       api?.onTraySelectWorkspace?.((_event, workspaceId) => {
         void (async () => {
           const workspaces = await window.electronAPI.listWorkspaces();
@@ -7543,6 +7607,11 @@ export function App() {
     void window.electronAPI?.saveAppearanceSettings?.({
       costReceiptEnabled: enabled,
     });
+  };
+
+  const handleRunningSendModeChange = (mode: RunningSendMode) => {
+    setRunningSendMode(mode);
+    void window.electronAPI?.saveAppearanceSettings?.({ runningSendMode: mode });
   };
 
   const handleAutoOpenTurnOutputChange = (enabled: boolean) => {
@@ -8136,20 +8205,76 @@ export function App() {
         keywords: ["open", "show", "navigate"],
         action: { type: "navigate" as const, destination: destination.id },
       })),
+      {
+        id: "next-attention-session",
+        title: "Next session that needs you",
+        keywords: ["unread", "attention", "waiting", "approval", "question", "finished"],
+        shortcut: isMac ? "⌘⇧U" : "Ctrl+Shift+U",
+        action: { type: "next-attention-session" },
+      },
+      {
+        id: "mark-all-read",
+        title: "Mark all sessions as read",
+        keywords: ["clear", "unread", "dots", "seen"],
+        action: { type: "mark-all-read" },
+      },
+      {
+        id: "show-shortcuts",
+        title: "Keyboard shortcuts",
+        keywords: ["keys", "hotkeys", "help"],
+        shortcut: isMac ? "⌘/" : "Ctrl+/",
+        action: { type: "show-shortcuts" },
+      },
     ];
   }, [sidebarDestinationContext]);
+  const keyboardShortcuts = useMemo(
+    () =>
+      buildKeyboardShortcuts(typeof navigator !== "undefined" && /Mac/i.test(navigator.platform)),
+    [],
+  );
   const commandMenuTasks = useMemo(
     () => tasks.filter((task) => !task.parentTaskId && shouldShowTaskInSidebarSessions(task)),
     [tasks],
   );
   const closeCommandMenu = useCallback(() => setCommandMenuOpen(false), []);
+  const openCommandMenu = useCallback((scope: CommandMenuScope) => {
+    setCommandMenuScope(scope);
+    setCommandMenuOpenCount((count) => count + 1);
+    setCommandMenuOpen(true);
+  }, []);
+  // Waiting sessions (approvals, questions) and finished ones not yet opened.
+  const attentionWaitingIdsRef = useRef<string[]>([]);
+  attentionWaitingIdsRef.current = [...attentionWaiting.keys(), ...unseenCompletedTaskIds];
+  const goToNextAttentionSession = useCallback(() => {
+    const next = nextAttentionSessionId(
+      sidebarSessionOrderRef.current,
+      attentionWaitingIdsRef.current,
+      currentViewRef.current === "main" ? selectedTaskIdRef.current : null,
+    );
+    if (next) {
+      void openTaskById(next);
+      return;
+    }
+    addToastRef.current({
+      type: "info",
+      title:
+        attentionWaitingIdsRef.current.length > 0
+          ? "No other session needs you"
+          : "No sessions need you",
+      durationMs: 2500,
+    });
+  }, [openTaskById]);
   const handleCommandMenuAction = useCallback(
     (action: CommandMenuAction) => {
       if (action.type === "new-session") void handleNewSessionRef.current();
       else if (action.type === "open-settings") setCurrentView("settings");
+      else if (action.type === "next-attention-session") goToNextAttentionSession();
+      else if (action.type === "mark-all-read") setUnseenCompletedTaskIds([]);
+      // The menu closes after running a row; reopen it on the shortcut list.
+      else if (action.type === "show-shortcuts") queueMicrotask(() => openCommandMenu("shortcuts"));
       else handleSidebarNavigate(action.destination as SidebarDestinationId);
     },
-    [handleSidebarNavigate],
+    [goToNextAttentionSession, handleSidebarNavigate, openCommandMenu],
   );
   const handleCommandMenuOpenSettingsTab = useCallback((tab: string) => {
     setSettingsTab(tab as SettingsTab);
@@ -8169,11 +8294,47 @@ export function App() {
         return;
       }
       event.preventDefault();
-      setCommandMenuOpen((open) => !open);
+      if (document.querySelector(".command-menu")) setCommandMenuOpen(false);
+      else openCommandMenu("all");
     };
     window.addEventListener("keydown", toggleCommandMenu);
     return () => window.removeEventListener("keydown", toggleCommandMenu);
-  }, []);
+  }, [openCommandMenu]);
+  // Cmd/Ctrl+/ shortcut list, Cmd/Ctrl+Shift+U next session that needs you, and
+  // Ctrl+1–9 (macOS) / Alt+1–9 (elsewhere) for the session at that place in the sidebar.
+  useEffect(() => {
+    const isMac = /Mac/i.test(navigator.platform);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing) return;
+      const menuOpen = !!document.querySelector(".command-menu");
+      if (isShortcutListShortcut(event)) {
+        if (
+          !menuOpen &&
+          document.querySelector('[aria-modal="true"], dialog[open], .modal-overlay')
+        ) {
+          return;
+        }
+        event.preventDefault();
+        openCommandMenu("shortcuts");
+        return;
+      }
+      // The rest act on the page behind, so a dialog (the menu included) blocks them.
+      if (document.querySelector('[aria-modal="true"], dialog[open], .modal-overlay')) return;
+      if (isNextAttentionShortcut(event, isMac)) {
+        event.preventDefault();
+        goToNextAttentionSession();
+        return;
+      }
+      const position = sessionPositionFromShortcut(event, isMac);
+      if (position === null) return;
+      const taskId = sessionIdAtPosition(sidebarSessionOrderRef.current, position);
+      if (!taskId) return;
+      event.preventDefault();
+      void openTaskById(taskId);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [goToNextAttentionSession, openCommandMenu, openTaskById]);
 
   const handleSelectBotConversation = useCallback(
     async (conversationId: string) => {
@@ -8883,6 +9044,7 @@ export function App() {
                 onTasksChanged={refreshTaskLists}
                 onLoadMoreTasks={loadMoreTasks}
                 onProjectWorkspaceIdsChange={handleSidebarProjectWorkspaceIdsChange}
+                onSessionOrderChange={handleSidebarSessionOrderChange}
                 hasMoreTasks={hasMoreTasks}
                 uiDensity={uiDensity}
               />
@@ -9208,6 +9370,9 @@ export function App() {
                   costReceiptEnabled={costReceiptEnabled}
                   subAgentStatsEnabled={subAgentStatsEnabled}
                   autoOpenTurnOutput={autoOpenTurnOutput}
+                  runningSendMode={runningSendMode}
+                  windowCaptureRequest={windowCaptureRequest}
+                  onWindowCaptureConsumed={handleWindowCaptureConsumed}
                   rendererPerfLoggingEnabled={rendererPerfLoggingEnabled}
                   taskSwitchId={selectedTaskSwitchId}
                   hasMoreTimelineHistory={selectedTaskTimelineHistory.hasMoreHistory}
@@ -9367,6 +9532,8 @@ export function App() {
               onSubAgentStatsEnabledChange={handleSubAgentStatsEnabledChange}
               autoOpenTurnOutput={autoOpenTurnOutput}
               onAutoOpenTurnOutputChange={handleAutoOpenTurnOutputChange}
+              runningSendMode={runningSendMode}
+              onRunningSendModeChange={handleRunningSendModeChange}
               initialTab={settingsTab}
               initialConnector={settingsConnector}
               memoryReviewRequest={memoryReviewRequest}
@@ -9395,6 +9562,9 @@ export function App() {
       {commandMenuOpen && (
         <Suspense fallback={null}>
           <CommandMenu
+            key={commandMenuOpenCount}
+            initialScope={commandMenuScope}
+            shortcuts={keyboardShortcuts}
             tasks={commandMenuTasks}
             workspaceId={currentWorkspace?.id}
             actions={commandMenuActions}
