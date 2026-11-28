@@ -159,15 +159,15 @@ Use `--from openclaw` for OpenClaw, `--from claude-code` or `--from cursor` for 
 
 | Signal | Current | All time |
 |---|---:|---:|
-| GitHub stars | 554 | n/a |
+| GitHub stars | 555 | n/a |
 | GitHub forks | 101 | n/a |
-| Installer/server downloads | 4,020 | 4,020 |
-| Download delta | +49 | n/a |
-| npm downloads | 135 (last week) | 11,281 |
-| GitHub views, last 14-ish days | 1,426 total / 775 unique | n/a |
-| GitHub clones, last 14-ish days | 4,058 total / 635 unique | n/a |
+| Installer/server downloads | 4,083 | 4,083 |
+| Download delta | +63 | n/a |
+| npm downloads | 138 (last week) | 11,295 |
+| GitHub views, last 14-ish days | 1,421 total / 766 unique | n/a |
+| GitHub clones, last 14-ish days | 4,170 total / 651 unique | n/a |
 
-Generated 2026-11-27T12:12:03.803Z. These are public GitHub/npm adoption signals, not active-user or in-app telemetry numbers. All-time values are shown only where the source API provides lifetime coverage. [Full report](docs/public-adoption-stats.md).
+Generated 2026-11-28T11:41:07.175Z. These are public GitHub/npm adoption signals, not active-user or in-app telemetry numbers. All-time values are shown only where the source API provides lifetime coverage. [Full report](docs/public-adoption-stats.md).
 <!-- COWORK_PUBLIC_ADOPTION_STATS_END -->
 
 ## License
